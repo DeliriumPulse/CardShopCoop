@@ -110,6 +110,8 @@ namespace CardShopCoop.Sync
                     if (!scanned) return "nothing left to scan - wait a moment";
 
                     // echo the landed scan (price = observed total delta, exact by construction)
+                    // and the authoritative per-customer running total, so the client's
+                    // checkout display is SET to the truth instead of accumulating forever
                     double after = FiTotalScanned?.GetValue(counter) is double a ? a : before;
                     using (var ms = new MemoryStream())
                     using (var bw = new BinaryWriter(ms))
@@ -117,6 +119,7 @@ namespace CardShopCoop.Sync
                         bw.Write((byte)counterIndex);
                         bw.Write(scannedCard != null);
                         bw.Write(after - before);
+                        bw.Write(after);
                         if (scannedCard != null) Net.Msg.WriteCard(bw, scannedCard);
                         else bw.Write((int)scannedType);
                         bw.Flush();
@@ -164,6 +167,27 @@ namespace CardShopCoop.Sync
                 default:
                     return "no customer ready at this register";
             }
+        }
+
+        /// <summary>Client: apply a scan echo. The counter's running total is SET to the
+        /// host's authoritative value (minus this scan, which AddScanned* re-adds), so the
+        /// checkout display can never drift or accumulate across customers.</summary>
+        public static void ApplyScanEcho(InteractableCashierCounter counter, bool isCard,
+            double price, double hostTotal, EItemType itemType, CardData card)
+        {
+            FiTotalScanned?.SetValue(counter, hostTotal - price);
+            if (isCard) counter.AddScannedCardCostTotal(price, card);
+            else counter.AddScannedItemCostTotal(price, itemType);
+        }
+
+        /// <summary>Client: zero every counter's running total (sale completed).</summary>
+        public static void ClientResetTotals()
+        {
+            var sm = Object.FindObjectOfType<ShelfManager>();
+            if (sm == null) return;
+            for (int i = 0; i < sm.m_CashierCounterList.Count; i++)
+                if (sm.m_CashierCounterList[i] != null)
+                    FiTotalScanned?.SetValue(sm.m_CashierCounterList[i], 0.0);
         }
 
         // ================= register state mirroring (host -> client) =================

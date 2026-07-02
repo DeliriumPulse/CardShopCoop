@@ -1337,8 +1337,10 @@ namespace CardShopCoop
                     }
                     if (RegisterLine == "sale complete!")
                     {
-                        // clear the vanilla checkout screen for the next customer
+                        // clear the vanilla checkout screen AND the counters' running
+                        // totals for the next customer
                         try { CSingleton<UI_CashCounterScreen>.Instance.ResetCounter(); } catch { }
+                        Guarded("reset-totals", Sync.RegisterServe.ClientResetTotals);
                     }
                     break;
                 }
@@ -1350,13 +1352,15 @@ namespace CardShopCoop
                         int counterIdx = br.ReadByte();
                         bool isCard = br.ReadBoolean();
                         double price = br.ReadDouble();
+                        double hostTotal = br.ReadDouble();
                         try
                         {
                             var sm = FindObjectOfType<ShelfManager>();
                             if (sm == null || counterIdx >= sm.m_CashierCounterList.Count) break;
                             var counter = sm.m_CashierCounterList[counterIdx];
-                            if (isCard) counter.AddScannedCardCostTotal(price, Msg.ReadCard(br));
-                            else counter.AddScannedItemCostTotal(price, (EItemType)br.ReadInt32());
+                            CardData card = isCard ? Msg.ReadCard(br) : null;
+                            EItemType itemType = isCard ? default : (EItemType)br.ReadInt32();
+                            Sync.RegisterServe.ApplyScanEcho(counter, isCard, price, hostTotal, itemType, card);
                         }
                         catch { } // vanilla UI not open on this side - totals still fine
                     }
