@@ -287,6 +287,27 @@ namespace CardShopCoop
             Send(1, MsgType.EconContrib, bw => { bw.Write(kind); bw.Write(value); });
         }
 
+        /// <summary>Both roles: mirror a collection change (pack pull, trash, sale) to the
+        /// other side so there is one shared binder.</summary>
+        public void ForwardCardDelta(CardData card, int amount, bool isAdd)
+        {
+            if (Role == CoopRole.None || _net == null || card == null || amount <= 0) return;
+            Broadcast(MsgType.CardDelta, bw =>
+            {
+                bw.Write(isAdd);
+                bw.Write(amount);
+                bw.Write((int)card.expansionType);
+                bw.Write((int)card.monsterType);
+                bw.Write((int)card.borderType);
+                bw.Write(card.isFoil);
+                bw.Write(card.isDestiny);
+                bw.Write(card.isChampionCard);
+                bw.Write(card.isNew);
+                bw.Write(card.cardGrade);
+                bw.Write(card.gradedCardIndex);
+            });
+        }
+
         private void Shutdown(string reason)
         {
             if (_net != null)
@@ -809,6 +830,34 @@ namespace CardShopCoop
                 case MsgType.Activity:
                 {
                     _avatars.ShowTag(msg.ConnId, "opening a pack!", 3f);
+                    break;
+                }
+                case MsgType.CardDelta:
+                {
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        bool isAdd = br.ReadBoolean();
+                        int amount = br.ReadInt32();
+                        var card = new CardData
+                        {
+                            expansionType = (ECardExpansionType)br.ReadInt32(),
+                            monsterType = (EMonsterType)br.ReadInt32(),
+                            borderType = (ECardBorderType)br.ReadInt32(),
+                            isFoil = br.ReadBoolean(),
+                            isDestiny = br.ReadBoolean(),
+                            isChampionCard = br.ReadBoolean(),
+                            isNew = br.ReadBoolean(),
+                            cardGrade = br.ReadInt32(),
+                            gradedCardIndex = br.ReadInt32(),
+                        };
+                        Patches.GamePatches.ApplyingRemoteCards = true;
+                        try
+                        {
+                            if (isAdd) CPlayerData.AddCard(card, amount);
+                            else CPlayerData.ReduceCard(card, amount);
+                        }
+                        finally { Patches.GamePatches.ApplyingRemoteCards = false; }
+                    }
                     break;
                 }
                 case MsgType.EconContrib:

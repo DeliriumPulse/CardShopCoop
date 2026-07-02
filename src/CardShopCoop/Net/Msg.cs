@@ -24,6 +24,7 @@ namespace CardShopCoop.Net
         ProgressSet = 17,  // host -> client: shop exp, shop level, fame
         Activity = 18,     // both ways: short activity ping ("opening a pack!")
         EconContrib = 19,  // client -> host: forwarded money/XP/fame earned by the joiner
+        CardDelta = 20,    // both ways: a card entered/left the shared collection
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>

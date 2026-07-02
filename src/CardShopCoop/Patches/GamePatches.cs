@@ -34,9 +34,33 @@ namespace CardShopCoop.Patches
             // The client's clock follows the host; its own day must never end.
             Try(h, typeof(CEventManager), "QueueEvent",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(DayEndBlockPrefix)));
+
+            // Shared card collection: every add/remove on either side mirrors to the other,
+            // so the joiner's pack pulls land in the real binder (and vice versa).
+            Try(h, typeof(CPlayerData), "AddCard",
+                prefix: null, postfix: new HarmonyMethod(typeof(GamePatches), nameof(AddCardPostfix)));
+            Try(h, typeof(CPlayerData), "ReduceCard",
+                prefix: null, postfix: new HarmonyMethod(typeof(GamePatches), nameof(ReduceCardPostfix)));
         }
 
-        private static void Try(Harmony h, Type type, string method, HarmonyMethod prefix)
+        /// <summary>True while we're applying a card delta that came over the network,
+        /// so the postfixes don't echo it back forever.</summary>
+        public static bool ApplyingRemoteCards;
+
+        public static void AddCardPostfix(CardData cardData, int addAmount)
+        {
+            if (!ApplyingRemoteCards && CoopCore.Role != CoopRole.None)
+                CoopCore.Instance?.ForwardCardDelta(cardData, addAmount, isAdd: true);
+        }
+
+        public static void ReduceCardPostfix(CardData cardData, int reduceAmount)
+        {
+            if (!ApplyingRemoteCards && CoopCore.Role != CoopRole.None)
+                CoopCore.Instance?.ForwardCardDelta(cardData, reduceAmount, isAdd: false);
+        }
+
+        private static void Try(Harmony h, Type type, string method,
+            HarmonyMethod prefix = null, HarmonyMethod postfix = null)
         {
             try
             {
@@ -46,7 +70,7 @@ namespace CardShopCoop.Patches
                     CoopPlugin.Log.LogWarning($"Patch target missing: {type.Name}.{method}");
                     return;
                 }
-                h.Patch(original, prefix: prefix);
+                h.Patch(original, prefix: prefix, postfix: postfix);
             }
             catch (Exception e)
             {
