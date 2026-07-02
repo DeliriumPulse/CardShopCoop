@@ -32,6 +32,7 @@ namespace CardShopCoop.Net
         CardShelfRequest = 25, // client -> host: joiner placed/removed a display card
         CardPriceSet = 26,     // both ways: a card's marked price changed
         RegisterState = 27,    // host -> client: per-counter checkout state + cart items
+        ScanEcho = 28,         // host -> client: a scan landed (fills the vanilla checkout UI)
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>

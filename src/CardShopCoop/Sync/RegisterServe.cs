@@ -43,15 +43,18 @@ namespace CardShopCoop.Sync
             return best;
         }
 
-        /// <summary>Host: execute one register step on the given counter. Returns feedback text.</summary>
-        public static string Serve(int counterIndex, string serverName)
+        /// <summary>Host: execute one register step. Returns feedback text; when a scan
+        /// landed, scanEcho carries (counterIdx, kind, price, identity) so the client can
+        /// fill its vanilla checkout UI.</summary>
+        public static string Serve(int counterIndex, string serverName, out byte[] scanEcho)
         {
-            string result = ServeInner(counterIndex, serverName);
+            scanEcho = null;
+            string result = ServeInner(counterIndex, serverName, ref scanEcho);
             CoopPlugin.Log.LogInfo($"serve: {serverName} @ counter {counterIndex} -> {result}");
             return result;
         }
 
-        private static string ServeInner(int counterIndex, string serverName)
+        private static string ServeInner(int counterIndex, string serverName, ref byte[] scanEcho)
         {
             var sm = Object.FindObjectOfType<ShelfManager>();
             if (sm == null || counterIndex < 0 || counterIndex >= sm.m_CashierCounterList.Count)
@@ -73,13 +76,17 @@ namespace CardShopCoop.Sync
             {
                 case ECashierCounterState.ScanningItem:
                 {
+                    double before = FiTotalScanned?.GetValue(counter) is double b ? b : 0.0;
                     bool scanned = false;
+                    EItemType scannedType = default;
+                    CardData scannedCard = null;
                     var items = customer.GetItemInBagList();
                     for (int i = 0; i < items.Count && !scanned; i++)
                     {
                         var scan = items[i] != null ? items[i].m_InteractableScanItem : null;
                         if (scan != null && scan.IsNotScanned())
                         {
+                            scannedType = items[i].GetItemType();
                             scan.OnMouseButtonUp();
                             scanned = true;
                         }
@@ -91,12 +98,27 @@ namespace CardShopCoop.Sync
                         {
                             if (cards[i] != null && cards[i].IsNotScanned())
                             {
+                                try { scannedCard = cards[i].m_Card3dUI.m_CardUI.GetCardData(); } catch { }
                                 cards[i].OnMouseButtonUp();
                                 scanned = true;
                             }
                         }
                     }
                     if (!scanned) return "nothing left to scan - wait a moment";
+
+                    // echo the landed scan (price = observed total delta, exact by construction)
+                    double after = FiTotalScanned?.GetValue(counter) is double a ? a : before;
+                    using (var ms = new MemoryStream())
+                    using (var bw = new BinaryWriter(ms))
+                    {
+                        bw.Write((byte)counterIndex);
+                        bw.Write(scannedCard != null);
+                        bw.Write(after - before);
+                        if (scannedCard != null) Net.Msg.WriteCard(bw, scannedCard);
+                        else bw.Write((int)scannedType);
+                        bw.Flush();
+                        scanEcho = ms.ToArray();
+                    }
 
                     int total = customer.GetItemInBagList().Count + customer.GetCardInBagList().Count;
                     int done = FiScannedCount?.GetValue(customer) is int c ? c : 0;
@@ -225,8 +247,23 @@ namespace CardShopCoop.Sync
         private readonly Dictionary<int, RegisterServe.CounterInfo> _states = new Dictionary<int, RegisterServe.CounterInfo>();
         private readonly Dictionary<int, List<Item>> _props = new Dictionary<int, List<Item>>();
         private readonly Dictionary<int, string> _propSig = new Dictionary<int, string>();
+        private readonly Dictionary<Collider, int> _propColliders = new Dictionary<Collider, int>();
         private ShelfManager _sm;
         private float _staleTimer;
+
+        /// <summary>Was this collider one of our mirrored cart items? (click-to-scan)</summary>
+        public bool TryGetPropCounter(Collider c, out int counterIdx)
+        {
+            return _propColliders.TryGetValue(c, out counterIdx);
+        }
+
+        /// <summary>True while the nearest counter waits for a payment/change click.</summary>
+        public bool IsPaymentPhase(int counterIdx)
+        {
+            return _states.TryGetValue(counterIdx, out var ci)
+                && ((ECashierCounterState)ci.State == ECashierCounterState.TakingCash
+                 || (ECashierCounterState)ci.State == ECashierCounterState.GivingChange);
+        }
 
         public void Reset()
         {
@@ -235,6 +272,7 @@ namespace CardShopCoop.Sync
                     if (item != null) ItemSpawnManager.DisableItem(item);
             _props.Clear();
             _propSig.Clear();
+            _propColliders.Clear();
             _states.Clear();
             _sm = null;
             _staleTimer = 0f;
@@ -276,6 +314,16 @@ namespace CardShopCoop.Sync
             }
         }
 
+        private void ReleaseProps(int idx)
+        {
+            foreach (var item in _props[idx])
+            {
+                if (item == null) continue;
+                if (item.m_Collider != null) _propColliders.Remove(item.m_Collider);
+                ItemSpawnManager.DisableItem(item);
+            }
+        }
+
         private void RefreshProps()
         {
             if (_sm == null) _sm = Object.FindObjectOfType<ShelfManager>();
@@ -288,7 +336,7 @@ namespace CardShopCoop.Sync
             if (drop != null)
                 foreach (int idx in drop)
                 {
-                    foreach (var item in _props[idx]) if (item != null) ItemSpawnManager.DisableItem(item);
+                    ReleaseProps(idx);
                     _props.Remove(idx);
                     _propSig.Remove(idx);
                 }
@@ -305,8 +353,7 @@ namespace CardShopCoop.Sync
                 if (_propSig.TryGetValue(idx, out var oldSig) && oldSig == sig) continue;
                 _propSig[idx] = sig;
 
-                if (_props.TryGetValue(idx, out var old))
-                    foreach (var item in old) if (item != null) ItemSpawnManager.DisableItem(item);
+                if (_props.ContainsKey(idx)) ReleaseProps(idx);
                 var list = new List<Item>();
                 _props[idx] = list;
 
@@ -326,7 +373,11 @@ namespace CardShopCoop.Sync
                         item.transform.rotation = t.rotation;
                         item.gameObject.SetActive(true);
                         if (item.m_Rigidbody != null) item.m_Rigidbody.isKinematic = true;
-                        if (item.m_Collider != null) item.m_Collider.enabled = false;
+                        if (item.m_Collider != null)
+                        {
+                            item.m_Collider.enabled = true; // clickable: click a cart item to scan it
+                            _propColliders[item.m_Collider] = idx;
+                        }
                         list.Add(item);
                     }
                     catch { }

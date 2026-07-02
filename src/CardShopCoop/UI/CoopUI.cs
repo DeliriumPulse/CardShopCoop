@@ -114,7 +114,7 @@ namespace CardShopCoop.UI
                 case CoopRole.Client:
                 {
                     GUILayout.Label(PlayersLine(core));
-                    GUILayout.Label($"<size=11>You're playing in the host's shop. Stand at the register and press {CoopPlugin.ServeKey.Value} to serve customers. Your own saves are protected.</size>",
+                    GUILayout.Label($"<size=11>You're playing in the host's shop. At the register, click the customer's items to scan them, then click to take payment and give change ({CoopPlugin.ServeKey.Value} also works). Your own saves are protected.</size>",
                         new GUIStyle(GUI.skin.label) { wordWrap = true, richText = true });
                     if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")")) core.SendEmote();
                     if (GUILayout.Button("Leave session")) core.Disconnect();

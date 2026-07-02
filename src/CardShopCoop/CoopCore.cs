@@ -421,6 +421,32 @@ namespace CardShopCoop
                 });
             }
 
+            // natural register: clicking a mirrored cart item scans it; clicking during the
+            // payment/change phases advances the sale - works like the normal till.
+            if (Role == CoopRole.Client && _serveThrottle <= 0f && InGameLevel()
+                && Input.GetMouseButtonDown(0) && !UI.CoopUI.TextFieldFocused)
+            {
+                Guarded("serve-click", () =>
+                {
+                    var cam = Camera.main;
+                    if (cam == null) return;
+                    if (Physics.Raycast(cam.ScreenPointToRay(Input.mousePosition), out var hit, 6f)
+                        && _registerMirror.TryGetPropCounter(hit.collider, out int propIdx))
+                    {
+                        _serveThrottle = 0.25f;
+                        Send(1, MsgType.ServeRequest, bw => bw.Write(propIdx));
+                        return;
+                    }
+                    var tf = ResolvePlayer();
+                    int near = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, 7f, quiet: true) : -1;
+                    if (near >= 0 && _registerMirror.IsPaymentPhase(near))
+                    {
+                        _serveThrottle = 0.3f;
+                        Send(1, MsgType.ServeRequest, bw => bw.Write(near));
+                    }
+                });
+            }
+
             if (_net == null) return;
 
             // The game forces Application.runInBackground=false (changeFramerate coroutine),
@@ -1057,8 +1083,10 @@ namespace CardShopCoop
                     {
                         int idx = br.ReadInt32();
                         string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : "player";
-                        string status = Sync.RegisterServe.Serve(idx, who);
+                        string status = Sync.RegisterServe.Serve(idx, who, out var scanEcho);
                         Send(msg.ConnId, MsgType.ServeStatus, bw => bw.Write(status));
+                        if (scanEcho != null)
+                            Send(msg.ConnId, MsgType.ScanEcho, bw => bw.Write(scanEcho));
                     }
                     break;
                 }
@@ -1069,6 +1097,31 @@ namespace CardShopCoop
                     {
                         RegisterLine = br.ReadString();
                         RegisterLineTimer = 3f;
+                    }
+                    if (RegisterLine == "sale complete!")
+                    {
+                        // clear the vanilla checkout screen for the next customer
+                        try { CSingleton<UI_CashCounterScreen>.Instance.ResetCounter(); } catch { }
+                    }
+                    break;
+                }
+                case MsgType.ScanEcho:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        int counterIdx = br.ReadByte();
+                        bool isCard = br.ReadBoolean();
+                        double price = br.ReadDouble();
+                        try
+                        {
+                            var sm = FindObjectOfType<ShelfManager>();
+                            if (sm == null || counterIdx >= sm.m_CashierCounterList.Count) break;
+                            var counter = sm.m_CashierCounterList[counterIdx];
+                            if (isCard) counter.AddScannedCardCostTotal(price, Msg.ReadCard(br));
+                            else counter.AddScannedItemCostTotal(price, (EItemType)br.ReadInt32());
+                        }
+                        catch { } // vanilla UI not open on this side - totals still fine
                     }
                     break;
                 }
