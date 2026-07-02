@@ -401,18 +401,23 @@ namespace CardShopCoop
                 RegisterLineTimer -= Time.deltaTime;
                 if (RegisterLineTimer <= 0f) RegisterLine = "";
             }
+            // tap V = one register action; HOLD V = auto-serve (~4 actions/sec)
+            bool serveTap = Input.GetKeyDown(CoopPlugin.ServeKey.Value);
             if (Role == CoopRole.Client && _serveThrottle <= 0f && InGameLevel()
-                && Input.GetKeyDown(CoopPlugin.ServeKey.Value) && !UI.CoopUI.TextFieldFocused)
+                && (serveTap || Input.GetKey(CoopPlugin.ServeKey.Value)) && !UI.CoopUI.TextFieldFocused)
             {
                 _serveThrottle = 0.25f;
                 Guarded("serve", () =>
                 {
                     var tf = ResolvePlayer();
-                    int idx = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position) : -1;
+                    int idx = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, 7f, quiet: !serveTap) : -1;
                     if (idx < 0)
                     {
-                        RegisterLine = "walk up to the register first";
-                        RegisterLineTimer = 2f;
+                        if (serveTap) // don't nag every repeat while held
+                        {
+                            RegisterLine = "walk up to the register first";
+                            RegisterLineTimer = 2f;
+                        }
                     }
                     else
                     {
