@@ -61,6 +61,25 @@ namespace CardShopCoop
         private bool _loggedEconLink;
         private bool _loggedTimeLink;
 
+        // pipeline diagnostics: prove where sync stalls instead of guessing
+        private long _diagSent;
+        private long _diagRecvStates;
+        private float _diagTimer;
+        private float _errLogCooldown;
+
+        private void Guarded(string stage, Action action)
+        {
+            try { action(); }
+            catch (Exception e)
+            {
+                if (_errLogCooldown <= 0f)
+                {
+                    _errLogCooldown = 5f;
+                    CoopPlugin.Log.LogError($"[{stage}] {e}");
+                }
+            }
+        }
+
         // LightManager reflection (time of day)
         private static readonly FieldInfo FiTimeHour = typeof(LightManager).GetField("m_TimeHour", BindingFlags.NonPublic | BindingFlags.Instance);
         private static readonly FieldInfo FiTimeMin = typeof(LightManager).GetField("m_TimeMin", BindingFlags.NonPublic | BindingFlags.Instance);
@@ -89,11 +108,20 @@ namespace CardShopCoop
             }
             if (_autoHostSlot >= 0) CoopPlugin.Log.LogInfo($"AUTO: will load slot {_autoHostSlot} and host");
             if (_autoJoinIp != null) CoopPlugin.Log.LogInfo($"AUTO: will join {_autoJoinIp}");
+
+            CEventManager.AddListener<CEventPlayer_OnOpenCardPack>(OnLocalPackOpened);
+        }
+
+        private void OnLocalPackOpened(CEventPlayer_OnOpenCardPack evt)
+        {
+            if (Role != CoopRole.None && _net != null && _net.ConnectionCount > 0)
+                Broadcast(MsgType.Activity, bw => bw.Write((byte)1));
         }
 
         private void OnDestroy()
         {
             SceneManager.sceneLoaded -= OnSceneLoaded;
+            CEventManager.RemoveListener<CEventPlayer_OnOpenCardPack>(OnLocalPackOpened);
             Shutdown("plugin unloaded");
         }
 
@@ -345,32 +373,47 @@ namespace CardShopCoop
             if (_net == null) return; // a Bye may have shut us down mid-drain
 
             float dt = Time.deltaTime;
-            _avatars.Tick(dt);
-            _world.Tick(dt, Role != CoopRole.None && _net.ConnectionCount > 0 && InGameLevel());
+            if (_errLogCooldown > 0f) _errLogCooldown -= dt;
+
+            // Every stage is individually armored: one failing subsystem must degrade
+            // that feature only, never kill position sync for the whole session.
+            Guarded("avatars", () => _avatars.Tick(dt));
+            Guarded("world", () => _world.Tick(dt, Role != CoopRole.None && _net.ConnectionCount > 0 && InGameLevel()));
 
             // position updates
             _stateTimer += dt;
             float interval = 1f / Mathf.Clamp(CoopPlugin.SendRateHz.Value, 4f, 30f);
-            Transform playerTf = InGameLevel() ? ResolvePlayer() : null;
-            if (_stateTimer >= interval && playerTf != null)
+            Guarded("state-send", () =>
             {
-                Vector3 pos = playerTf.position;
-                float speed = 0f;
-                if (_hasLastPos)
+                Transform playerTf = InGameLevel() ? ResolvePlayer() : null;
+                if (_stateTimer >= interval && playerTf != null)
                 {
-                    Vector3 delta = pos - _lastPos;
-                    delta.y = 0f;
-                    speed = Mathf.Clamp(delta.magnitude / _stateTimer, 0f, 6f);
+                    Vector3 pos = playerTf.position;
+                    float speed = 0f;
+                    if (_hasLastPos)
+                    {
+                        Vector3 delta = pos - _lastPos;
+                        delta.y = 0f;
+                        speed = Mathf.Clamp(delta.magnitude / _stateTimer, 0f, 6f);
+                    }
+                    _lastPos = pos; _hasLastPos = true;
+                    float yaw = Camera.main != null ? Camera.main.transform.eulerAngles.y : 0f;
+                    byte hold = ComputeHoldState();
+                    Broadcast(MsgType.PlayerState, bw =>
+                    {
+                        bw.Write(pos.x); bw.Write(pos.y); bw.Write(pos.z);
+                        bw.Write(yaw); bw.Write(speed); bw.Write(hold);
+                    });
+                    _diagSent++;
+                    _stateTimer = 0f;
                 }
-                _lastPos = pos; _hasLastPos = true;
-                float yaw = Camera.main != null ? Camera.main.transform.eulerAngles.y : 0f;
-                byte hold = ComputeHoldState();
-                Broadcast(MsgType.PlayerState, bw =>
-                {
-                    bw.Write(pos.x); bw.Write(pos.y); bw.Write(pos.z);
-                    bw.Write(yaw); bw.Write(speed); bw.Write(hold);
-                });
-                _stateTimer = 0f;
+            });
+
+            _diagTimer += dt;
+            if (_diagTimer >= 15f)
+            {
+                _diagTimer = 0f;
+                CoopPlugin.Log.LogInfo($"diag: role={Role} conns={_net.ConnectionCount} sentStates={_diagSent} recvStates={_diagRecvStates} inGame={InGameLevel()} player={(ResolvePlayer() != null)}");
             }
 
             // heartbeat + timeout
@@ -381,7 +424,7 @@ namespace CardShopCoop
                 Broadcast(MsgType.Ping, null);
                 foreach (int id in _net.ConnIds())
                 {
-                    if (_net.SecondsSinceLastRecv(id) > 30.0)
+                    if (_net.SecondsSinceLastRecv(id) > 60.0)
                     {
                         CoopPlugin.Log.LogWarning("Connection " + id + " timed out");
                         _net.Kick(id);
@@ -619,14 +662,17 @@ namespace CardShopCoop
                 }
                 case MsgType.ShelfDelta:
                 {
-                    if (Role != CoopRole.Client) break;
+                    // Dropping deltas while not in the game scene is safe (the world just
+                    // loaded from the host's save; the host keeps re-diffing changes) and
+                    // avoids touching scene managers that don't exist yet.
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
                     using (var br = Msg.Reader(msg.Payload))
                         _world.ApplyRemote(WorldSync.ReadEntries(br));
                     break;
                 }
                 case MsgType.ShelfRequest:
                 {
-                    if (Role != CoopRole.Host) break;
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
                     using (var br = Msg.Reader(msg.Payload))
                         _world.ApplyRemote(WorldSync.ReadEntries(br));
                     break;
@@ -658,6 +704,7 @@ namespace CardShopCoop
                         float yaw = br.ReadSingle();
                         float speed = br.ReadSingle();
                         byte hold = br.ReadByte();
+                        _diagRecvStates++;
                         _avatars.UpdateState(msg.ConnId, pos, yaw, speed, hold);
                         if (PeerNames.TryGetValue(msg.ConnId, out var peerName))
                             _avatars.SetName(msg.ConnId, peerName); // re-seed after scene loads clear avatars
@@ -739,6 +786,11 @@ namespace CardShopCoop
                 case MsgType.Emote:
                 {
                     _avatars.ShowEmote(msg.ConnId);
+                    break;
+                }
+                case MsgType.Activity:
+                {
+                    _avatars.ShowTag(msg.ConnId, "opening a pack!", 3f);
                     break;
                 }
                 case MsgType.Ping:

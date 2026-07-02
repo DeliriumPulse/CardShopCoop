@@ -28,6 +28,12 @@ namespace CardShopCoop.UI
             {
                 GUI.Label(new Rect(8f, Screen.height - 22f, 400f, 20f),
                     $"<size=11><color=#9fd3ff>CardShopCoop: {CoopPlugin.UiToggleKey.Value} for co-op</color></size>");
+                if (core.ErrorLine.Length > 0)
+                {
+                    var warn = new GUIStyle(GUI.skin.label) { richText = true, fontStyle = FontStyle.Bold };
+                    GUI.Label(new Rect(8f, Screen.height - 46f, 900f, 22f),
+                        $"<size=13><color=#ff5a4a>CO-OP: {core.ErrorLine}</color></size>", warn);
+                }
             }
             if (CoopCore.Role == CoopRole.Client && core.HostTimeLine.Length > 0)
             {

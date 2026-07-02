@@ -73,10 +73,15 @@ namespace CardShopCoop.Sync
 
         public void ShowEmote(int connId)
         {
+            ShowTag(connId, "\\o/  hi!", 2.5f);
+        }
+
+        public void ShowTag(int connId, string text, float seconds)
+        {
             if (_avatars.TryGetValue(connId, out var av) && av.EmoteTag != null)
             {
-                av.EmoteTag.text = "\\o/  hi!";
-                av.EmoteTimer = 2.5f;
+                av.EmoteTag.text = text;
+                av.EmoteTimer = seconds;
             }
         }
 

@@ -22,6 +22,7 @@ namespace CardShopCoop.Net
         BundleChunk = 15,  // host -> client: mod sidecar data bundle
         BundleDone = 16,
         ProgressSet = 17,  // host -> client: shop exp, shop level, fame
+        Activity = 18,     // both ways: short activity ping ("opening a pack!")
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>

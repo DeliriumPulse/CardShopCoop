@@ -35,6 +35,18 @@ namespace CardShopCoop.Sync
         private static readonly FieldInfo FiWarehouseComps =
             AccessTools.Field(typeof(WarehouseShelf), "m_ItemCompartmentList");
 
+        // NEVER CSingleton<ShelfManager>.Instance: if touched before the game scene
+        // exists (e.g. deltas arriving during the client's loading screen) it silently
+        // creates and caches an empty fake manager that then shadows the real one for
+        // the whole session, breaking the game's own shelf loading.
+        private ShelfManager _sm;
+
+        private ShelfManager ResolveShelfManager()
+        {
+            if (_sm == null) _sm = UnityEngine.Object.FindObjectOfType<ShelfManager>();
+            return _sm;
+        }
+
         private static int Key(int kind, int shelf, int comp)
         {
             return (kind << 24) | ((shelf & 0xFFFF) << 8) | (comp & 0xFF);
@@ -44,6 +56,7 @@ namespace CardShopCoop.Sync
         {
             _last.Clear();
             _timer = 0f;
+            _sm = null;
         }
 
         public void Tick(float dt, bool inGame)
@@ -56,7 +69,7 @@ namespace CardShopCoop.Sync
             List<Entry> changes = null;
             try
             {
-                var sm = CSingleton<ShelfManager>.Instance;
+                var sm = ResolveShelfManager();
                 if (sm == null) return;
 
                 for (int i = 0; i < sm.m_ShelfList.Count; i++)
@@ -103,7 +116,7 @@ namespace CardShopCoop.Sync
         /// <summary>Apply authoritative states (client) or requested states (host).</summary>
         public void ApplyRemote(List<Entry> entries)
         {
-            var sm = CSingleton<ShelfManager>.Instance;
+            var sm = ResolveShelfManager();
             if (sm == null) return;
             foreach (var e in entries)
             {
