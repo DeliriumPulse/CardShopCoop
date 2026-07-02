@@ -13,13 +13,17 @@ namespace CardShopCoop.Net
     /// but nothing hardcodes that). All socket work happens on background threads;
     /// received messages land in a ConcurrentQueue that the Unity main thread drains.
     /// </summary>
-    public class Transport : IDisposable
+    public class Transport : ICoopTransport
     {
         private const int MaxFrame = 64 * 1024 * 1024; // save files are ~4 MB; hard cap for sanity
 
-        public readonly ConcurrentQueue<InMsg> Incoming = new ConcurrentQueue<InMsg>();
-        public readonly ConcurrentQueue<int> Disconnects = new ConcurrentQueue<int>();
-        public readonly ConcurrentQueue<int> Connects = new ConcurrentQueue<int>();
+        public ConcurrentQueue<InMsg> Incoming { get; } = new ConcurrentQueue<InMsg>();
+        public ConcurrentQueue<int> Disconnects { get; } = new ConcurrentQueue<int>();
+        public ConcurrentQueue<int> Connects { get; } = new ConcurrentQueue<int>();
+
+        public void PumpMainThread() { } // all socket work lives on background threads
+
+        public double TimeoutSeconds => 60.0;
 
         /// <summary>Frame sent by a transport-owned thread every 2s per connection.
         /// Keeps the link alive even while Unity's main thread is frozen in a scene load.</summary>

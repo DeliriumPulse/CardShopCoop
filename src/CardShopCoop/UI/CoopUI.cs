@@ -28,7 +28,7 @@ namespace CardShopCoop.UI
             return 3;
         }
 
-        public void Draw(CoopCore core, Transport net)
+        public void Draw(CoopCore core, ICoopTransport net)
         {
             if (_ipField == null) _ipField = CoopPlugin.LastJoinIP.Value;
             if (_nameField == null) _nameField = CoopPlugin.PlayerName.Value;
@@ -69,7 +69,7 @@ namespace CardShopCoop.UI
             _win = GUILayout.Window(867530, _win, id => WindowFn(core, net), "CardShopCoop " + CoopPlugin.Version);
         }
 
-        private void WindowFn(CoopCore core, Transport net)
+        private void WindowFn(CoopCore core, ICoopTransport net)
         {
             GUILayout.Label(core.StatusLine);
             if (core.ErrorLine.Length > 0)
@@ -96,22 +96,38 @@ namespace CardShopCoop.UI
 
                     GUILayout.Space(6f);
                     GUILayout.Label("<b>Host</b> (load your shop first):");
-                    if (GUILayout.Button("Host my shop"))
+                    GUILayout.BeginHorizontal();
+                    if (GUILayout.Button("Host via Steam"))
+                        core.StartHostingSteam();
+                    if (GUILayout.Button("Host via LAN", GUILayout.Width(110f)))
                         core.StartHosting();
+                    GUILayout.EndHorizontal();
 
                     GUILayout.Space(6f);
                     GUILayout.Label("<b>Join</b> (stay on the main menu):");
+                    GUILayout.Label("<size=11>Steam: just accept the host's invite (friends list / overlay).</size>");
                     GUILayout.BeginHorizontal();
                     GUI.SetNextControlName("coop_ip");
                     _ipField = GUILayout.TextField(_ipField, 24);
-                    if (GUILayout.Button("Join", GUILayout.Width(64f)))
+                    if (GUILayout.Button("Join LAN", GUILayout.Width(80f)))
                         core.Join(_ipField);
                     GUILayout.EndHorizontal();
-                    GUILayout.Label($"<size=11>Port {CoopPlugin.Port.Value} - both PCs need this mod + the same mods.</size>");
+                    GUILayout.Label($"<size=11>LAN port {CoopPlugin.Port.Value} - both PCs need this mod + the same mods.</size>");
                     break;
                 }
                 case CoopRole.Host:
                 {
+                    if (core.IsSteamSession)
+                    {
+                        GUILayout.Label("Hosting through Steam - no IPs needed.");
+                        if (GUILayout.Button("Invite friend  (Steam overlay)"))
+                            core.OpenSteamInvite();
+                        int scount = net?.ConnectionCount ?? 0;
+                        GUILayout.Label(scount == 0 ? "Waiting for your invite to be accepted..." : PlayersLine(core));
+                        if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")")) core.SendEmote();
+                        if (GUILayout.Button("Stop hosting")) core.Disconnect();
+                        break;
+                    }
                     if (_lanIps == null)
                     {
                         var ips = LocalIPv4s();

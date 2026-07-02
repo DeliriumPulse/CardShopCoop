@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Threading;
 using CardShopCoop.Net;
 using CardShopCoop.Sync;
+using Steamworks;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
@@ -26,7 +27,10 @@ namespace CardShopCoop
         private float _serveThrottle;
         public readonly Dictionary<int, string> PeerNames = new Dictionary<int, string>();
 
-        private Transport _net;
+        private ICoopTransport _net;
+        private readonly SteamLobby _steamLobby = new SteamLobby();
+        private ulong _autoJoinSteamLobby; // from +connect_lobby (game launched via invite)
+        public bool IsSteamSession { get; private set; }
         private readonly AvatarManager _avatars = new AvatarManager();
         private readonly WorldSync _world = new WorldSync();
         private readonly NpcSync _npcs = new NpcSync();
@@ -117,18 +121,79 @@ namespace CardShopCoop
             };
             SceneManager.sceneLoaded += OnSceneLoaded;
 
-            foreach (string arg in Environment.GetCommandLineArgs())
+            var args = Environment.GetCommandLineArgs();
+            for (int i = 0; i < args.Length; i++)
             {
+                string arg = args[i];
                 if (arg.StartsWith("-coopautohost=") && int.TryParse(arg.Substring(14), out int slot))
                     _autoHostSlot = slot;
                 else if (arg.StartsWith("-coopautojoin="))
                     _autoJoinIp = arg.Substring(14);
+                else if (arg == "+connect_lobby" && i + 1 < args.Length && ulong.TryParse(args[i + 1], out ulong lob))
+                    _autoJoinSteamLobby = lob; // game was launched by accepting a Steam invite
             }
             if (_autoHostSlot >= 0) CoopPlugin.Log.LogInfo($"AUTO: will load slot {_autoHostSlot} and host");
             if (_autoJoinIp != null) CoopPlugin.Log.LogInfo($"AUTO: will join {_autoJoinIp}");
+            if (_autoJoinSteamLobby != 0) CoopPlugin.Log.LogInfo($"AUTO: will join Steam lobby {_autoJoinSteamLobby}");
+
+            _steamLobby.Init();
+            _steamLobby.OnError = err => { ErrorLine = err; CoopPlugin.Log.LogWarning(err); };
+            _steamLobby.OnLobbyCreated = lobby =>
+            {
+                if (_net is SteamTransport st) st.LobbyId = lobby;
+                StatusLine = "Hosting via Steam - click 'Invite friend'";
+                CoopPlugin.Log.LogInfo("steam: lobby live " + lobby);
+            };
+            _steamLobby.OnEnteredLobby = owner =>
+            {
+                if (Role != CoopRole.Client || !(_net is SteamTransport st)) return;
+                st.LobbyId = _steamLobby.LobbyId;
+                st.ConnectToHost(owner);
+                StatusLine = "Connected via Steam - requesting world...";
+                Send(1, MsgType.Hello, bw =>
+                {
+                    bw.Write(CoopPlugin.Version);
+                    bw.Write(CoopPlugin.PlayerName.Value);
+                });
+            };
+            _steamLobby.OnInviteAccepted = lobby =>
+            {
+                CoopPlugin.Log.LogInfo("steam: invite accepted -> lobby " + lobby);
+                JoinSteam(lobby);
+            };
 
             CEventManager.AddListener<CEventPlayer_OnOpenCardPack>(OnLocalPackOpened);
         }
+
+        /// <summary>Join a host through Steam (invite accept, +connect_lobby, or auto flow).</summary>
+        public void JoinSteam(CSteamID lobby)
+        {
+            ErrorLine = "";
+            if (Role != CoopRole.None) { ErrorLine = "Already in a session."; return; }
+            if (InGameLevel()) { ErrorLine = "Go to the main menu first, then accept the invite again."; return; }
+            if (!_steamLobby.SteamAvailable()) { ErrorLine = "Steam isn't running."; return; }
+            Role = CoopRole.Client;
+            IsSteamSession = true;
+            _net = new SteamTransport(isHost: false) { KeepaliveFrame = Msg.Build(MsgType.Ping) };
+            StatusLine = "Joining Steam lobby...";
+            _steamLobby.Join(lobby);
+        }
+
+        /// <summary>Host through Steam: create a friends-only lobby, then invite via overlay.</summary>
+        public void StartHostingSteam()
+        {
+            ErrorLine = "";
+            if (Role != CoopRole.None) { ErrorLine = "Already in a session."; return; }
+            if (!InGameLevel()) { ErrorLine = "Load your shop first, then host."; return; }
+            if (!_steamLobby.SteamAvailable()) { ErrorLine = "Steam isn't running - use LAN instead."; return; }
+            Role = CoopRole.Host;
+            IsSteamSession = true;
+            _net = new SteamTransport(isHost: true) { KeepaliveFrame = Msg.Build(MsgType.Ping) };
+            StatusLine = "Creating Steam lobby...";
+            _steamLobby.Host();
+        }
+
+        public void OpenSteamInvite() { _steamLobby.OpenInviteDialog(); }
 
         private void OnLocalPackOpened(CEventPlayer_OnOpenCardPack evt)
         {
@@ -236,8 +301,9 @@ namespace CardShopCoop
             if (!InGameLevel()) { ErrorLine = "Load your shop first, then host."; return; }
             try
             {
-                _net = new Transport { KeepaliveFrame = Msg.Build(MsgType.Ping) };
-                _net.StartHost(CoopPlugin.Port.Value);
+                var tcp = new Transport { KeepaliveFrame = Msg.Build(MsgType.Ping) };
+                tcp.StartHost(CoopPlugin.Port.Value);
+                _net = tcp;
                 Role = CoopRole.Host;
                 StatusLine = "Hosting - waiting for a player...";
                 CoopPlugin.Log.LogInfo($"Hosting on port {CoopPlugin.Port.Value}");
@@ -358,6 +424,8 @@ namespace CardShopCoop
             _cardShelves.Reset();
             _registerMirror.Reset();
             PromptLine = "";
+            _steamLobby.Leave();
+            IsSteamSession = false;
             Application.runInBackground = false; // back to the game's normal behavior
             Role = CoopRole.None;
             if (reason != null)
@@ -453,6 +521,8 @@ namespace CardShopCoop
             }
 
             if (_net == null) return;
+
+            Guarded("net-pump", () => _net.PumpMainThread());
 
             // The game forces Application.runInBackground=false (changeFramerate coroutine),
             // which freezes the whole simulation when the window loses focus - fatal for
@@ -605,7 +675,7 @@ namespace CardShopCoop
                 Broadcast(MsgType.Ping, null);
                 foreach (int id in _net.ConnIds())
                 {
-                    if (_net.SecondsSinceLastRecv(id) > 60.0)
+                    if (_net.SecondsSinceLastRecv(id) > _net.TimeoutSeconds)
                     {
                         CoopPlugin.Log.LogWarning("Connection " + id + " timed out");
                         _net.Kick(id);
@@ -652,6 +722,16 @@ namespace CardShopCoop
                 {
                     CoopPlugin.Log.LogInfo($"AUTO: joining {_autoJoinIp}...");
                     Join(_autoJoinIp);
+                    _autoPhase = 99;
+                }
+            }
+            else if (_autoJoinSteamLobby != 0)
+            {
+                if (_autoPhase == 0 && _autoTimer > 10f && !InGameLevel()
+                    && CSingleton<CGameManager>.Instance != null)
+                {
+                    CoopPlugin.Log.LogInfo($"AUTO: joining Steam lobby {_autoJoinSteamLobby}...");
+                    JoinSteam(new CSteamID(_autoJoinSteamLobby));
                     _autoPhase = 99;
                 }
             }

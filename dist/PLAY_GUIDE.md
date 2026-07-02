@@ -22,15 +22,23 @@ it never touches card content, so the Pokemon mods just work.
 
 ## Playing (every session)
 
+### The easy way — Steam invites (works from anywhere, no IPs)
+
 | Who | What to do |
 |-----|------------|
-| **Dad (host)** | Start the game normally, load your shop, press **F2**, click **Host my shop**. The window shows your IP. Leave the game running. |
-| **Son (joiner)** | Double-click **Play with Dad**. The game starts, joins automatically, downloads dad's shop (~30 MB), and loads into it. Takes a minute or two with all the mods. |
+| **Host** | Load your shop, press **F2**, click **Host via Steam**, then **Invite friend** — pick them in the Steam overlay. |
+| **Joiner** | Accept the invite from Steam (game running at the main menu, or not running at all — Steam will launch it). The shop downloads and loads automatically. |
 
-First time hosting, Windows Firewall will ask — click **Allow** (private networks).
+Both players need to be Steam friends, and both PCs need the same mods (the USB setup).
 
-You can also do everything manually: press **F2** at the main menu, type the host's IP,
-click **Join**.
+### The LAN way (same house, no Steam friends needed)
+
+| Who | What to do |
+|-----|------------|
+| **Host** | Load your shop, press **F2**, click **Host via LAN**. The window shows your IP. |
+| **Joiner** | Double-click **Play with Dad** (auto-joins), or press **F2** at the main menu, type the host's IP, click **Join LAN**. |
+
+First time hosting via LAN, Windows Firewall will ask — click **Allow** (private networks).
 
 ## Controls
 
