@@ -488,7 +488,19 @@ namespace CardShopCoop
                 _diagTimer = 0f;
                 var diagTf = InGameLevel() ? ResolvePlayer() : null;
                 string posStr = diagTf != null ? $"({diagTf.position.x:F1},{diagTf.position.y:F1},{diagTf.position.z:F1})" : "n/a";
-                CoopPlugin.Log.LogInfo($"diag: role={Role} conns={_net.ConnectionCount} sentStates={_diagSent} recvStates={_diagRecvStates} inGame={InGameLevel()} pos={posStr}");
+                string npcStr = "";
+                if (InGameLevel())
+                {
+                    try
+                    {
+                        int local = NpcSync.CountLocalActiveNpcs();
+                        npcStr = Role == CoopRole.Client
+                            ? $" puppets={_npcs.PuppetCount} localNpcs={local}(should be 0)"
+                            : $" liveNpcs={local}";
+                    }
+                    catch { }
+                }
+                CoopPlugin.Log.LogInfo($"diag: role={Role} conns={_net.ConnectionCount} sentStates={_diagSent} recvStates={_diagRecvStates} inGame={InGameLevel()} pos={posStr}{npcStr}");
             }
 
             // heartbeat + timeout

@@ -144,6 +144,28 @@ namespace CardShopCoop.Sync
         private CustomerManager _cmClient;
         private float _now;
 
+        public int PuppetCount => _puppets.Count;
+
+        /// <summary>Diagnostic: how many REAL (non-puppet) NPCs are currently active in
+        /// this instance's own managers. On the host that's the true crowd; on the client
+        /// it should be zero (anything else is escaping suppression).</summary>
+        public static int CountLocalActiveNpcs()
+        {
+            int n = 0;
+            var cm = Object.FindObjectOfType<CustomerManager>();
+            if (cm != null)
+            {
+                var list = cm.GetCustomerList();
+                for (int i = 0; i < list.Count; i++)
+                    if (list[i] != null && list[i].gameObject.activeSelf) n++;
+            }
+            var workers = WorkerManager.GetWorkerList();
+            if (workers != null)
+                for (int i = 0; i < workers.Count; i++)
+                    if (workers[i] != null && workers[i].gameObject.activeSelf) n++;
+            return n;
+        }
+
         public void ClearPuppets()
         {
             foreach (var p in _puppets.Values)
