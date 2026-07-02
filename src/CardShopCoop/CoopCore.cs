@@ -30,6 +30,7 @@ namespace CardShopCoop
         private readonly AvatarManager _avatars = new AvatarManager();
         private readonly WorldSync _world = new WorldSync();
         private readonly NpcSync _npcs = new NpcSync();
+        private readonly CardShelfSync _cardShelves = new CardShelfSync();
         private float _npcSweepTimer;
         private readonly ConcurrentQueue<Action> _mainThread = new ConcurrentQueue<Action>();
         private UI.CoopUI _ui;
@@ -104,6 +105,13 @@ namespace CardShopCoop
             Instance = this;
             _ui = new UI.CoopUI();
             _world.OnLocalChanges = OnLocalWorldChanges;
+            _cardShelves.OnLocalChanges = changes =>
+            {
+                if (Role == CoopRole.Host)
+                    Broadcast(MsgType.CardShelfDelta, bw => CardShelfSync.WriteEntries(bw, changes));
+                else if (Role == CoopRole.Client)
+                    Send(1, MsgType.CardShelfRequest, bw => CardShelfSync.WriteEntries(bw, changes));
+            };
             SceneManager.sceneLoaded += OnSceneLoaded;
 
             foreach (string arg in Environment.GetCommandLineArgs())
@@ -142,6 +150,7 @@ namespace CardShopCoop
             _avatars.Clear();
             _world.Reset();
             _npcs.Reset();
+            _cardShelves.Reset();
             _lightManager = null;
             _playerTf = null;
             _playerCamTf = null;
@@ -304,15 +313,18 @@ namespace CardShopCoop
             {
                 bw.Write(isAdd);
                 bw.Write(amount);
-                bw.Write((int)card.expansionType);
-                bw.Write((int)card.monsterType);
-                bw.Write((int)card.borderType);
-                bw.Write(card.isFoil);
-                bw.Write(card.isDestiny);
-                bw.Write(card.isChampionCard);
-                bw.Write(card.isNew);
-                bw.Write(card.cardGrade);
-                bw.Write(card.gradedCardIndex);
+                Msg.WriteCard(bw, card);
+            });
+        }
+
+        /// <summary>Both roles: mirror a marked-card-price change.</summary>
+        public void ForwardCardPrice(CardData card, float price)
+        {
+            if (Role == CoopRole.None || _net == null || card == null) return;
+            Broadcast(MsgType.CardPriceSet, bw =>
+            {
+                Msg.WriteCard(bw, card);
+                bw.Write(price);
             });
         }
 
@@ -338,6 +350,7 @@ namespace CardShopCoop
             _lastProgressSent = long.MinValue;
             _world.Reset();
             _npcs.Reset();
+            _cardShelves.Reset();
             Application.runInBackground = false; // back to the game's normal behavior
             Role = CoopRole.None;
             if (reason != null)
@@ -449,7 +462,9 @@ namespace CardShopCoop
             // Every stage is individually armored: one failing subsystem must degrade
             // that feature only, never kill position sync for the whole session.
             Guarded("avatars", () => _avatars.Tick(dt));
-            Guarded("world", () => _world.Tick(dt, Role != CoopRole.None && _net.ConnectionCount > 0 && InGameLevel()));
+            bool syncActive = Role != CoopRole.None && _net.ConnectionCount > 0 && InGameLevel();
+            Guarded("world", () => _world.Tick(dt, syncActive));
+            Guarded("cardshelves", () => _cardShelves.Tick(dt, syncActive));
 
             if (Role == CoopRole.Client)
             {
@@ -970,6 +985,32 @@ namespace CardShopCoop
                     if (Role != CoopRole.Client) break;
                     using (var br = Msg.Reader(msg.Payload))
                         _npcs.ApplyBatch(br, InGameLevel());
+                    break;
+                }
+                case MsgType.CardShelfDelta:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                        _cardShelves.ApplyRemote(CardShelfSync.ReadEntries(br));
+                    break;
+                }
+                case MsgType.CardShelfRequest:
+                {
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                        _cardShelves.ApplyRemote(CardShelfSync.ReadEntries(br));
+                    break;
+                }
+                case MsgType.CardPriceSet:
+                {
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        var card = Msg.ReadCard(br);
+                        float price = br.ReadSingle();
+                        Patches.GamePatches.ApplyingRemotePrice = true;
+                        try { CPlayerData.SetCardPrice(card, price); }
+                        finally { Patches.GamePatches.ApplyingRemotePrice = false; }
+                    }
                     break;
                 }
                 case MsgType.ServeRequest:

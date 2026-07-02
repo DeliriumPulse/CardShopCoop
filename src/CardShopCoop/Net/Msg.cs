@@ -28,6 +28,9 @@ namespace CardShopCoop.Net
         NpcState = 21,     // host -> client: batched customer/worker puppet states
         ServeRequest = 22, // client -> host: joiner works the register (scan / take payment)
         ServeStatus = 23,  // host -> client: register feedback (scanned n/m, paid, no customer)
+        CardShelfDelta = 24,   // host -> client: authoritative card display slots
+        CardShelfRequest = 25, // client -> host: joiner placed/removed a display card
+        CardPriceSet = 26,     // both ways: a card's marked price changed
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>
@@ -62,6 +65,36 @@ namespace CardShopCoop.Net
         public static BinaryReader Reader(byte[] payload)
         {
             return new BinaryReader(new MemoryStream(payload, writable: false));
+        }
+
+        /// <summary>Shared CardData wire format (used by CardDelta, CardShelfDelta, CardPriceSet).</summary>
+        public static void WriteCard(BinaryWriter bw, CardData card)
+        {
+            bw.Write((int)card.expansionType);
+            bw.Write((int)card.monsterType);
+            bw.Write((int)card.borderType);
+            bw.Write(card.isFoil);
+            bw.Write(card.isDestiny);
+            bw.Write(card.isChampionCard);
+            bw.Write(card.isNew);
+            bw.Write(card.cardGrade);
+            bw.Write(card.gradedCardIndex);
+        }
+
+        public static CardData ReadCard(BinaryReader br)
+        {
+            return new CardData
+            {
+                expansionType = (ECardExpansionType)br.ReadInt32(),
+                monsterType = (EMonsterType)br.ReadInt32(),
+                borderType = (ECardBorderType)br.ReadInt32(),
+                isFoil = br.ReadBoolean(),
+                isDestiny = br.ReadBoolean(),
+                isChampionCard = br.ReadBoolean(),
+                isNew = br.ReadBoolean(),
+                cardGrade = br.ReadInt32(),
+                gradedCardIndex = br.ReadInt32(),
+            };
         }
     }
 }

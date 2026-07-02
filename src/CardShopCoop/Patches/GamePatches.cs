@@ -41,6 +41,19 @@ namespace CardShopCoop.Patches
                 prefix: null, postfix: new HarmonyMethod(typeof(GamePatches), nameof(AddCardPostfix)));
             Try(h, typeof(CPlayerData), "ReduceCard",
                 prefix: null, postfix: new HarmonyMethod(typeof(GamePatches), nameof(ReduceCardPostfix)));
+
+            // Shared card pricing: SetCardPrice writes the price table and fires the UI
+            // refresh event itself, so mirroring the call keeps tags in step on both sides.
+            Try(h, typeof(CPlayerData), "SetCardPrice",
+                prefix: null, postfix: new HarmonyMethod(typeof(GamePatches), nameof(SetCardPricePostfix)));
+        }
+
+        public static bool ApplyingRemotePrice;
+
+        public static void SetCardPricePostfix(CardData cardData, float priceSet)
+        {
+            if (!ApplyingRemotePrice && CoopCore.Role != CoopRole.None)
+                CoopCore.Instance?.ForwardCardPrice(cardData, priceSet);
         }
 
         /// <summary>True while we're applying a card delta that came over the network,
