@@ -21,6 +21,7 @@ namespace CardShopCoop.Net
         PriceList = 14,    // host -> client: full item price table
         BundleChunk = 15,  // host -> client: mod sidecar data bundle
         BundleDone = 16,
+        ProgressSet = 17,  // host -> client: shop exp, shop level, fame
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>

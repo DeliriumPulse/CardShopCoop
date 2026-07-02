@@ -177,9 +177,9 @@ namespace CardShopCoop.Sync
             clone.SetActive(true);
             Object.Destroy(holder);
 
+            var cust = clone.GetComponent<Customer>();
             try
             {
-                var cust = clone.GetComponent<Customer>();
                 if (cust != null) cust.RandomizeCharacterMesh(); // game's own wardrobe pipeline
             }
             catch (System.Exception e)
@@ -187,8 +187,38 @@ namespace CardShopCoop.Sync
                 CoopPlugin.Log.LogWarning("Avatar dressing failed (spawning undressed): " + e.Message);
             }
 
+            // Hide the hand/FX props that ActivateCustomer normally hides - without this
+            // the clone spawns clutching the prefab's shopping bag, cash and card fans.
+            if (cust != null)
+            {
+                try
+                {
+                    if (cust.m_ShoppingBagTransform != null) cust.m_ShoppingBagTransform.gameObject.SetActive(false);
+                    if (cust.m_CustomerCash != null) cust.m_CustomerCash.gameObject.SetActive(false);
+                    if (cust.m_GameCardFanOut != null) cust.m_GameCardFanOut.SetActive(false);
+                    if (cust.m_GameCardSingle != null) cust.m_GameCardSingle.SetActive(false);
+                    if (cust.m_CleanFX != null) cust.m_CleanFX.SetActive(false);
+                    if (cust.m_ExclaimationMesh != null) cust.m_ExclaimationMesh.SetActive(false);
+                    if (cust.m_InteractCollider != null) cust.m_InteractCollider.SetActive(false);
+                    if (cust.m_SmellyFX != null) cust.m_SmellyFX.SetActive(false);
+                }
+                catch (System.Exception e)
+                {
+                    CoopPlugin.Log.LogWarning("Avatar prop hiding partial: " + e.Message);
+                }
+            }
+
+            // Strip game logic but KEEP the cosmetic rig helpers (CC namespace): CopyPose
+            // drives hair/apparel bones every LateUpdate - destroying it is why hair froze.
             foreach (var mb in clone.GetComponentsInChildren<MonoBehaviour>(true))
+            {
+                if (mb == null) continue;
+                string tn = mb.GetType().Name;
+                if (tn == "CopyPose" || tn == "BlendshapeManager" || tn == "ScaleCharacter"
+                    || tn == "TransformBone" || tn == "MipBiasAdjust")
+                    continue;
                 Object.DestroyImmediate(mb);
+            }
             foreach (var comp in clone.GetComponentsInChildren<Component>(true))
             {
                 if (comp == null) continue;

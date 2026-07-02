@@ -52,8 +52,9 @@ namespace CardShopCoop
         private Vector3 _lastPos;
         private bool _hasLastPos;
 
-        // host economy change detection
+        // host economy/progression change detection
         private double _lastCoinSent = double.MinValue;
+        private long _lastProgressSent = long.MinValue;
 
         // one-time link confirmation logging
         private readonly HashSet<int> _gotStateFrom = new HashSet<int>();
@@ -262,7 +263,9 @@ namespace CardShopCoop
             _hasLastPos = false;
             _lastCoinSent = double.MinValue;
             _lastPriceHash = 0;
+            _lastProgressSent = long.MinValue;
             _world.Reset();
+            Application.runInBackground = false; // back to the game's normal behavior
             Role = CoopRole.None;
             if (reason != null)
             {
@@ -300,6 +303,15 @@ namespace CardShopCoop
                 SendEmote();
 
             if (_net == null) return;
+
+            // The game forces Application.runInBackground=false (changeFramerate coroutine),
+            // which freezes the whole simulation when the window loses focus - fatal for
+            // co-op (and for two-instance testing). Re-assert while in a session.
+            if (!Application.runInBackground)
+            {
+                Application.runInBackground = true;
+                CoopPlugin.Log.LogInfo("Forced runInBackground=true for the co-op session");
+            }
 
             while (_net.Connects.TryDequeue(out int joined))
             {
@@ -467,6 +479,16 @@ namespace CardShopCoop
                     _lastCoinSent = coin;
                     float coinF = CPlayerData.m_CoinAmount;
                     Broadcast(MsgType.CoinSet, bw => { bw.Write(coin); bw.Write(coinF); });
+                }
+
+                int exp = CPlayerData.m_ShopExpPoint;
+                int level = CPlayerData.m_ShopLevel;
+                int fame = CPlayerData.m_FamePoint;
+                long progress = ((long)level << 40) ^ ((long)fame << 20) ^ (uint)exp;
+                if (progress != _lastProgressSent)
+                {
+                    _lastProgressSent = progress;
+                    Broadcast(MsgType.ProgressSet, bw => { bw.Write(exp); bw.Write(level); bw.Write(fame); });
                 }
             }
 
@@ -691,6 +713,26 @@ namespace CardShopCoop
                             }
                         }
                         catch { }
+                    }
+                    break;
+                }
+                case MsgType.ProgressSet:
+                {
+                    if (Role != CoopRole.Client) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        int exp = br.ReadInt32();
+                        int level = br.ReadInt32();
+                        int fame = br.ReadInt32();
+                        int prevLevel = CPlayerData.m_ShopLevel;
+                        // Order matters: set the level FIRST, because the SetShopExp handler
+                        // levels up while exp >= required-for-current-level. With the host's
+                        // consistent (level, exp) pair, exp < required and no spurious level-up.
+                        CPlayerData.m_ShopLevel = level;
+                        CEventManager.QueueEvent(new CEventPlayer_SetShopExp(exp));
+                        CEventManager.QueueEvent(new CEventPlayer_SetFame(fame));
+                        if (level > prevLevel)
+                            CEventManager.QueueEvent(new CEventPlayer_ShopLeveledUp(level));
                     }
                     break;
                 }

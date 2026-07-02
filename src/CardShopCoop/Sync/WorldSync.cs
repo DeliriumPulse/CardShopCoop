@@ -137,46 +137,55 @@ namespace CardShopCoop.Sync
             return whComps != null && compIdx < whComps.Count ? whComps[compIdx] : null;
         }
 
+        private static readonly FieldInfo FiStoredItemList =
+            AccessTools.Field(typeof(ShelfCompartment), "m_StoredItemList");
+
+        /// <summary>
+        /// Set a compartment to exactly (type, count). IMPORTANT: ShelfCompartment.SpawnItem
+        /// is a LOADER, not an adder - it sets m_ItemAmount = amount and appends `amount`
+        /// fresh items, assuming an empty compartment (that's how Shelf.LoadItemCompartment
+        /// uses it at save load). Calling it incrementally corrupts the count (the
+        /// "shelf wiped down to one item" bug). So every apply is an atomic
+        /// clear-and-rebuild: synchronous within the frame, no flicker, and it self-heals
+        /// compartments whose m_ItemAmount already disagrees with their real item list.
+        /// </summary>
         private static void ApplyCompartment(ShelfCompartment comp, int type, int count)
         {
             int curType = (int)comp.GetItemType();
             int cur = comp.GetItemCount();
             if (cur == count && (curType == type || count == 0)) return;
 
-            if (curType != type && cur > 0)
+            Clear(comp);
+            if (count > 0)
             {
-                Clear(comp);
-                cur = 0;
+                comp.SetCompartmentItemType((EItemType)type);
+                comp.CalculatePositionList();
+                comp.SpawnItem(count, spawnFromFront: true);
             }
-            if (count > cur)
+        }
+
+        private static void Clear(ShelfCompartment comp)
+        {
+            // Drain the REAL stored list (not m_ItemAmount, which may be corrupted).
+            if (FiStoredItemList?.GetValue(comp) is List<Item> stored && stored.Count > 0)
             {
-                if (curType != type)
+                foreach (var item in new List<Item>(stored))
                 {
-                    comp.SetCompartmentItemType((EItemType)type);
-                    comp.CalculatePositionList();
+                    if (item == null) continue;
+                    comp.RemoveItem(item);
+                    ItemSpawnManager.DisableItem(item);
                 }
-                comp.SpawnItem(count - cur, spawnFromFront: true);
+                stored.Clear();
             }
-            else if (count < cur)
+            else
             {
-                for (int k = 0; k < cur - count; k++)
+                for (int guard = 0; guard < 4096; guard++)
                 {
                     var item = comp.GetLastItem();
                     if (item == null) break;
                     comp.RemoveItem(item);
                     ItemSpawnManager.DisableItem(item);
                 }
-            }
-        }
-
-        private static void Clear(ShelfCompartment comp)
-        {
-            for (int guard = 0; guard < 4096 && comp.GetItemCount() > 0; guard++)
-            {
-                var item = comp.GetLastItem();
-                if (item == null) break;
-                comp.RemoveItem(item);
-                ItemSpawnManager.DisableItem(item);
             }
         }
 
