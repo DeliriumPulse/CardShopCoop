@@ -21,9 +21,13 @@ if ($Target -eq "") {
 $dest = Join-Path $Target "CardShopCoop-Setup"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 
-$myIp = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike "169.254*" -and $_.IPAddress -ne "127.0.0.1" } | Select-Object -First 1).IPAddress
+# prefer the real home-LAN address (192.168.*) over virtual/VPN adapters
+$candidates = Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike "169.254*" -and $_.IPAddress -ne "127.0.0.1" } | ForEach-Object { $_.IPAddress }
+$myIp = ($candidates | Where-Object { $_ -like "192.168.*" } | Select-Object -First 1)
+if (-not $myIp) { $myIp = ($candidates | Where-Object { $_ -like "10.*" } | Select-Object -First 1) }
+if (-not $myIp) { $myIp = $candidates | Select-Object -First 1 }
 Set-Content -Path (Join-Path $dest "dad-ip.txt") -Value $myIp
-Write-Host "Dad's current LAN IP recorded: $myIp" -ForegroundColor Green
+Write-Host "Dad's home-LAN IP recorded: $myIp" -ForegroundColor Green
 
 Write-Host "Copying mod layer (this is ~57 GB - grab a snack)..." -ForegroundColor Cyan
 robocopy "$game\BepInEx" "$dest\BepInEx" /E /XD cache /XF LogOutput.log "CardShopCoop_*.log" /NFL /NDL /NP

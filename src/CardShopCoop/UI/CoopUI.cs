@@ -17,6 +17,16 @@ namespace CardShopCoop.UI
         private string _ipField;
         private string _nameField;
         private string _lanIps;
+        private string _lanIpsOther;
+
+        /// <summary>Lower = more likely the real home-LAN address.</summary>
+        private static int IpRank(string ip)
+        {
+            if (ip.StartsWith("192.168.")) return 0;             // classic home router
+            if (ip.StartsWith("10.")) return 1;                   // some routers/VPNs
+            if (ip.StartsWith("172.")) return 2;                  // usually WSL/Hyper-V/Docker
+            return 3;
+        }
 
         public void Draw(CoopCore core, Transport net)
         {
@@ -102,9 +112,18 @@ namespace CardShopCoop.UI
                 }
                 case CoopRole.Host:
                 {
-                    if (_lanIps == null) _lanIps = string.Join("  ", LocalIPv4s());
+                    if (_lanIps == null)
+                    {
+                        var ips = LocalIPv4s();
+                        // home-router addresses first; virtual/VPN adapters are unreachable
+                        ips.Sort((a, b) => IpRank(a).CompareTo(IpRank(b)));
+                        _lanIps = ips.Count > 0 ? ips[0] : "(no LAN address found)";
+                        _lanIpsOther = ips.Count > 1 ? string.Join("  ", ips.GetRange(1, ips.Count - 1)) : "";
+                    }
                     GUILayout.Label("Give this to the other PC:");
-                    GUILayout.Label($"<b><size=15>{_lanIps}</size></b>  (port {CoopPlugin.Port.Value})");
+                    GUILayout.Label($"<b><size=16>{_lanIps}</size></b>  (port {CoopPlugin.Port.Value})");
+                    if (_lanIpsOther.Length > 0)
+                        GUILayout.Label($"<size=10>(other adapters, usually wrong: {_lanIpsOther})</size>");
                     int count = net?.ConnectionCount ?? 0;
                     GUILayout.Label(count == 0 ? "Waiting for a player..." : PlayersLine(core));
                     if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")")) core.SendEmote();
