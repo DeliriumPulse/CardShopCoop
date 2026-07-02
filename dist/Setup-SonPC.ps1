@@ -32,6 +32,15 @@ foreach ($f in "winhttp.dll", "doorstop_config.ini", ".doorstop_version", "steam
     if (Test-Path "$src\$f") { Copy-Item "$src\$f" $game -Force }
 }
 
+# --- custom-card ID registry (must match the host's, or joining is refused) ---
+if (Test-Path "$src\enum_values.json") {
+    $eplDir = "$env:USERPROFILE\AppData\LocalLow\OPNeonGames\Card Shop Simulator\PrefabLoader"
+    New-Item -ItemType Directory -Force -Path $eplDir | Out-Null
+    if (Test-Path "$eplDir\enum_values.json") { Copy-Item "$eplDir\enum_values.json" "$eplDir\enum_values.json.bak" -Force }
+    Copy-Item "$src\enum_values.json" "$eplDir\enum_values.json" -Force
+    Write-Host "Installed the host's custom-card registry (old one backed up as .bak)" -ForegroundColor Green
+}
+
 # --- desktop shortcuts ---
 $dadIp = (Get-Content "$src\dad-ip.txt" -ErrorAction SilentlyContinue | Select-Object -First 1)
 if (-not $dadIp) { $dadIp = Read-Host "Enter dad's PC IP address (shown in his co-op window when hosting)" }

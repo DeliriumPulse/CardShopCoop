@@ -37,4 +37,9 @@ foreach ($f in "winhttp.dll", "doorstop_config.ini", ".doorstop_version", "steam
 Copy-Item (Join-Path $PSScriptRoot "Setup-SonPC.ps1") $dest -Force
 Copy-Item (Join-Path $PSScriptRoot "PLAY_GUIDE.md") $dest -Force -ErrorAction SilentlyContinue
 
+# EPL's custom-card ID registry MUST match between both PCs (the mod's parity check
+# enforces this). Carry the host's copy so the setup script can install it.
+$enumFile = "$env:USERPROFILE\AppData\LocalLow\OPNeonGames\Card Shop Simulator\PrefabLoader\enum_values.json"
+if (Test-Path $enumFile) { Copy-Item $enumFile (Join-Path $dest "enum_values.json") -Force; Write-Host "Included custom-card registry (enum_values.json)" -ForegroundColor Green }
+
 Write-Host "`nDone! Take the USB to the other PC and run Setup-SonPC.ps1 from it." -ForegroundColor Green
