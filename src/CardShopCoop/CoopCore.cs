@@ -136,6 +136,7 @@ namespace CardShopCoop
             _world.Reset();
             _lightManager = null;
             _playerTf = null;
+            _playerCamTf = null;
             _playerIpc = null;
             if (scene.name == "Title" && Role == CoopRole.Client && _net != null)
             {
@@ -154,9 +155,14 @@ namespace CardShopCoop
         /// InteractionPlayerController.m_Instance (both are dead statics), so find the
         /// player controller in the scene once and cache its transform. FindObjectOfType
         /// never auto-creates, unlike CSingleton&lt;T&gt;.Instance.</summary>
-        private Transform _playerTf;
+        private Transform _playerTf;   // the MOVING body: IPC.m_WalkerCtrl (CMF walker)
+        private Transform _playerCamTf; // player camera, for look yaw
         private InteractionPlayerController _playerIpc;
 
+        /// <summary>InteractionPlayerController itself sits on a stationary manager object -
+        /// its transform never moves (that was the frozen-avatar bug). The walking body is
+        /// its public m_WalkerCtrl (the game's own teleport code moves the player by setting
+        /// m_WalkerCtrl.transform.position), and look direction lives on m_Cam.</summary>
         private Transform ResolvePlayer()
         {
             if (_playerTf != null) return _playerTf;
@@ -165,8 +171,9 @@ namespace CardShopCoop
             if (ipc != null)
             {
                 _playerIpc = ipc;
-                _playerTf = ipc.transform;
-                CoopPlugin.Log.LogInfo("Player transform resolved: " + _playerTf.name);
+                _playerTf = ipc.m_WalkerCtrl != null ? ipc.m_WalkerCtrl.transform : ipc.transform;
+                _playerCamTf = ipc.m_Cam != null ? ipc.m_Cam.transform : null;
+                CoopPlugin.Log.LogInfo($"Player body resolved: {_playerTf.name} at {_playerTf.position}, cam={(_playerCamTf != null ? _playerCamTf.name : "none")}");
             }
             return _playerTf;
         }
@@ -397,7 +404,8 @@ namespace CardShopCoop
                         speed = Mathf.Clamp(delta.magnitude / _stateTimer, 0f, 6f);
                     }
                     _lastPos = pos; _hasLastPos = true;
-                    float yaw = Camera.main != null ? Camera.main.transform.eulerAngles.y : 0f;
+                    float yaw = _playerCamTf != null ? _playerCamTf.eulerAngles.y
+                        : (Camera.main != null ? Camera.main.transform.eulerAngles.y : playerTf.eulerAngles.y);
                     byte hold = ComputeHoldState();
                     Broadcast(MsgType.PlayerState, bw =>
                     {
@@ -413,7 +421,9 @@ namespace CardShopCoop
             if (_diagTimer >= 15f)
             {
                 _diagTimer = 0f;
-                CoopPlugin.Log.LogInfo($"diag: role={Role} conns={_net.ConnectionCount} sentStates={_diagSent} recvStates={_diagRecvStates} inGame={InGameLevel()} player={(ResolvePlayer() != null)}");
+                var diagTf = InGameLevel() ? ResolvePlayer() : null;
+                string posStr = diagTf != null ? $"({diagTf.position.x:F1},{diagTf.position.y:F1},{diagTf.position.z:F1})" : "n/a";
+                CoopPlugin.Log.LogInfo($"diag: role={Role} conns={_net.ConnectionCount} sentStates={_diagSent} recvStates={_diagRecvStates} inGame={InGameLevel()} pos={posStr}");
             }
 
             // heartbeat + timeout
