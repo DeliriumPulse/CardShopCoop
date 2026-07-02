@@ -23,6 +23,7 @@ namespace CardShopCoop.Net
         BundleDone = 16,
         ProgressSet = 17,  // host -> client: shop exp, shop level, fame
         Activity = 18,     // both ways: short activity ping ("opening a pack!")
+        EconContrib = 19,  // client -> host: forwarded money/XP/fame earned by the joiner
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>

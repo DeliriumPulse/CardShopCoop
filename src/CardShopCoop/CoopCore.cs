@@ -279,6 +279,14 @@ namespace CardShopCoop
                 Broadcast(MsgType.Emote, bw => bw.Write((byte)1));
         }
 
+        /// <summary>Client: route a locally-earned gain/spend to the host's real economy.
+        /// kinds: 1 AddCoin, 2 ReduceCoin, 3 AddShopExp, 4 AddFame.</summary>
+        public void ForwardContribution(byte kind, float value)
+        {
+            if (Role != CoopRole.Client || _net == null) return;
+            Send(1, MsgType.EconContrib, bw => { bw.Write(kind); bw.Write(value); });
+        }
+
         private void Shutdown(string reason)
         {
             if (_net != null)
@@ -801,6 +809,23 @@ namespace CardShopCoop
                 case MsgType.Activity:
                 {
                     _avatars.ShowTag(msg.ConnId, "opening a pack!", 3f);
+                    break;
+                }
+                case MsgType.EconContrib:
+                {
+                    if (Role != CoopRole.Host) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        byte kind = br.ReadByte();
+                        float v = br.ReadSingle();
+                        switch (kind)
+                        {
+                            case 1: CEventManager.QueueEvent(new CEventPlayer_AddCoin(v)); break;
+                            case 2: CEventManager.QueueEvent(new CEventPlayer_ReduceCoin(v)); break;
+                            case 3: CEventManager.QueueEvent(new CEventPlayer_AddShopExp((int)v)); break;
+                            case 4: CEventManager.QueueEvent(new CEventPlayer_AddFame((int)v)); break;
+                        }
+                    }
                     break;
                 }
                 case MsgType.Ping:

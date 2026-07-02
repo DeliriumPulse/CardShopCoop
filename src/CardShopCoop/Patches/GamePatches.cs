@@ -67,9 +67,36 @@ namespace CardShopCoop.Patches
 
         public static bool DayEndBlockPrefix(CEvent evt)
         {
-            if (CoopCore.Role == CoopRole.Client
-                && (evt is CEventPlayer_OnDayEnded || evt is CEventPlayer_OnDayStarted))
+            if (CoopCore.Role != CoopRole.Client) return true;
+
+            // The client's clock follows the host; its own day must never end.
+            if (evt is CEventPlayer_OnDayEnded || evt is CEventPlayer_OnDayStarted)
                 return false;
+
+            // Shared-wallet contribution: gains/spends the JOINER earns are forwarded to
+            // the host (who banks them for real) instead of applying to the mirrored copy.
+            // Only Add*/Reduce* are intercepted - the Set* events the sync itself uses
+            // pass through, so there is no feedback loop.
+            if (evt is CEventPlayer_AddCoin addCoin)
+            {
+                CoopCore.Instance?.ForwardContribution(1, (float)addCoin.m_CoinValue);
+                return false;
+            }
+            if (evt is CEventPlayer_ReduceCoin reduceCoin)
+            {
+                CoopCore.Instance?.ForwardContribution(2, (float)reduceCoin.m_CoinValue);
+                return false;
+            }
+            if (evt is CEventPlayer_AddShopExp addExp)
+            {
+                CoopCore.Instance?.ForwardContribution(3, addExp.m_ExpValue);
+                return false;
+            }
+            if (evt is CEventPlayer_AddFame addFame)
+            {
+                CoopCore.Instance?.ForwardContribution(4, addFame.m_FameValue);
+                return false;
+            }
             return true;
         }
     }
