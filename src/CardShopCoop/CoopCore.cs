@@ -21,6 +21,9 @@ namespace CardShopCoop
         public string StatusLine = "Not connected";
         public string ErrorLine = "";
         public string HostTimeLine = "";
+        public string RegisterLine = "";
+        public float RegisterLineTimer;
+        private float _serveThrottle;
         public readonly Dictionary<int, string> PeerNames = new Dictionary<int, string>();
 
         private Transport _net;
@@ -371,6 +374,32 @@ namespace CardShopCoop
                 _ui.Visible = !_ui.Visible;
             if (Role != CoopRole.None && Input.GetKeyDown(CoopPlugin.EmoteKey.Value) && !UI.CoopUI.TextFieldFocused)
                 SendEmote();
+
+            if (_serveThrottle > 0f) _serveThrottle -= Time.deltaTime;
+            if (RegisterLineTimer > 0f)
+            {
+                RegisterLineTimer -= Time.deltaTime;
+                if (RegisterLineTimer <= 0f) RegisterLine = "";
+            }
+            if (Role == CoopRole.Client && _serveThrottle <= 0f && InGameLevel()
+                && Input.GetKeyDown(CoopPlugin.ServeKey.Value) && !UI.CoopUI.TextFieldFocused)
+            {
+                _serveThrottle = 0.25f;
+                Guarded("serve", () =>
+                {
+                    var tf = ResolvePlayer();
+                    int idx = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position) : -1;
+                    if (idx < 0)
+                    {
+                        RegisterLine = "walk up to the register first";
+                        RegisterLineTimer = 2f;
+                    }
+                    else
+                    {
+                        Send(1, MsgType.ServeRequest, bw => bw.Write(idx));
+                    }
+                });
+            }
 
             if (_net == null) return;
 
@@ -844,7 +873,7 @@ namespace CardShopCoop
                             _loggedTimeLink = true;
                             CoopPlugin.Log.LogInfo($"Time link active (Day {day} {hour:00}:{min:00})");
                         }
-                        HostTimeLine = $"Day {day}  {hour:00}:{min:00}";
+                        HostTimeLine = $"Day {day + 1}  {hour:00}:{min:00}"; // HUD shows day+1
                         bool dayChanged = day != CPlayerData.m_CurrentDay;
                         CPlayerData.m_CurrentDay = day;
                         // The client clock only advances while the shop-open flag is set and
@@ -941,6 +970,28 @@ namespace CardShopCoop
                     if (Role != CoopRole.Client) break;
                     using (var br = Msg.Reader(msg.Payload))
                         _npcs.ApplyBatch(br, InGameLevel());
+                    break;
+                }
+                case MsgType.ServeRequest:
+                {
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        int idx = br.ReadInt32();
+                        string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : "player";
+                        string status = Sync.RegisterServe.Serve(idx, who);
+                        Send(msg.ConnId, MsgType.ServeStatus, bw => bw.Write(status));
+                    }
+                    break;
+                }
+                case MsgType.ServeStatus:
+                {
+                    if (Role != CoopRole.Client) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        RegisterLine = br.ReadString();
+                        RegisterLineTimer = 3f;
+                    }
                     break;
                 }
                 case MsgType.EconContrib:

@@ -26,6 +26,8 @@ namespace CardShopCoop.Net
         EconContrib = 19,  // client -> host: forwarded money/XP/fame earned by the joiner
         CardDelta = 20,    // both ways: a card entered/left the shared collection
         NpcState = 21,     // host -> client: batched customer/worker puppet states
+        ServeRequest = 22, // client -> host: joiner works the register (scan / take payment)
+        ServeStatus = 23,  // host -> client: register feedback (scanned n/m, paid, no customer)
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>

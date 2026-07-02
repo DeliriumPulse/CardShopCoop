@@ -11,7 +11,7 @@ namespace CardShopCoop
     {
         public const string Guid = "com.zwhit.cardshopcoop";
         public const string Name = "CardShopCoop";
-        public const string Version = "0.3.2";
+        public const string Version = "0.4.0";
 
         public static ManualLogSource Log;
 
@@ -22,6 +22,7 @@ namespace CardShopCoop
         public static ConfigEntry<bool> AvatarsEnabled;
         public static ConfigEntry<KeyCode> UiToggleKey;
         public static ConfigEntry<KeyCode> EmoteKey;
+        public static ConfigEntry<KeyCode> ServeKey;
         public static ConfigEntry<int> ClientWorldSlot;
 
         private void Awake()
@@ -46,6 +47,8 @@ namespace CardShopCoop
                 UiToggleKey.Value = KeyCode.F2; // migrate configs saved by early builds
             EmoteKey = Config.Bind("Keys", "EmoteKey", KeyCode.G,
                 "Sends a wave emote that pops above your avatar.");
+            ServeKey = Config.Bind("Keys", "ServeKey", KeyCode.V,
+                "When JOINING: stand at the register and press this to serve the customer (scan items, take payment, give change).");
             ClientWorldSlot = Config.Bind("Network", "ClientWorldSlot", 7,
                 "Save slot the co-op world uses when JOINING someone (your own slots 0-3 are never touched). On a PC dedicated to co-op you can set 0 for maximum mod-data fidelity.");
 

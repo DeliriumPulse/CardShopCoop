@@ -41,6 +41,15 @@ namespace CardShopCoop.UI
                 GUI.Label(new Rect(Screen.width / 2f - 150f, 4f, 300f, 20f),
                     $"<color=#ffd54a>{core.HostTimeLine} - co-op</color>", style);
             }
+            if (core.RegisterLine.Length > 0)
+            {
+                var big = new GUIStyle(GUI.skin.label)
+                {
+                    alignment = TextAnchor.MiddleCenter, richText = true, fontStyle = FontStyle.Bold
+                };
+                GUI.Label(new Rect(Screen.width / 2f - 300f, Screen.height * 0.62f, 600f, 30f),
+                    $"<size=18><color=#8ef58a>{core.RegisterLine}</color></size>", big);
+            }
             if (!Visible) return;
 
             _win = GUILayout.Window(867530, _win, id => WindowFn(core, net), "CardShopCoop " + CoopPlugin.Version);
@@ -101,7 +110,7 @@ namespace CardShopCoop.UI
                 case CoopRole.Client:
                 {
                     GUILayout.Label(PlayersLine(core));
-                    GUILayout.Label("<size=11>You're playing in the host's shop. Your own saves are protected; this world autosaves to a separate co-op slot.</size>",
+                    GUILayout.Label($"<size=11>You're playing in the host's shop. Stand at the register and press {CoopPlugin.ServeKey.Value} to serve customers. Your own saves are protected.</size>",
                         new GUIStyle(GUI.skin.label) { wordWrap = true, richText = true });
                     if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")")) core.SendEmote();
                     if (GUILayout.Button("Leave session")) core.Disconnect();
