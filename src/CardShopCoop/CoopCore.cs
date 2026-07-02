@@ -86,6 +86,8 @@ namespace CardShopCoop
         private static readonly FieldInfo FiTimeHour = typeof(LightManager).GetField("m_TimeHour", BindingFlags.NonPublic | BindingFlags.Instance);
         private static readonly FieldInfo FiTimeMin = typeof(LightManager).GetField("m_TimeMin", BindingFlags.NonPublic | BindingFlags.Instance);
         private static readonly FieldInfo FiTimeMinFloat = typeof(LightManager).GetField("m_TimeMinFloat", BindingFlags.NonPublic | BindingFlags.Instance);
+        private static readonly FieldInfo FiHasDayEnded = typeof(LightManager).GetField("m_HasDayEnded", BindingFlags.NonPublic | BindingFlags.Instance);
+        private static readonly System.Reflection.MethodInfo MiDayReset = typeof(LightManager).GetMethod("DelayUpdateEnv", BindingFlags.NonPublic | BindingFlags.Instance);
         private LightManager _lightManager;
 
         // headless auto-test / shortcut args: -coopautohost=SLOT  -coopautojoin=IP
@@ -831,15 +833,33 @@ namespace CardShopCoop
                             CoopPlugin.Log.LogInfo($"Time link active (Day {day} {hour:00}:{min:00})");
                         }
                         HostTimeLine = $"Day {day}  {hour:00}:{min:00}";
+                        bool dayChanged = day != CPlayerData.m_CurrentDay;
                         CPlayerData.m_CurrentDay = day;
+                        // The client clock only advances while the shop-open flag is set and
+                        // the day hasn't "ended"; both are cosmetic here, keep them permissive.
+                        CPlayerData.m_IsShopOnceOpen = true;
                         try
                         {
                             if (_lightManager == null) _lightManager = FindObjectOfType<LightManager>();
                             if (_lightManager != null)
                             {
-                                FiTimeHour?.SetValue(_lightManager, hour);
-                                FiTimeMin?.SetValue(_lightManager, min);
-                                FiTimeMinFloat?.SetValue(_lightManager, (float)min);
+                                if (dayChanged && InGameLevel() && MiDayReset != null)
+                                {
+                                    // Run the game's own new-day environment reset (skybox, GI,
+                                    // 08:00 clock, morning music) and let exactly one
+                                    // OnDayStarted through so the HUD/day label refresh.
+                                    Patches.GamePatches.AllowNextDayStarted = true;
+                                    _lightManager.StartCoroutine(
+                                        (System.Collections.IEnumerator)MiDayReset.Invoke(_lightManager, null));
+                                    CoopPlugin.Log.LogInfo($"Mirroring host day change -> Day {day}");
+                                }
+                                else
+                                {
+                                    FiTimeHour?.SetValue(_lightManager, hour);
+                                    FiTimeMin?.SetValue(_lightManager, min);
+                                    FiTimeMinFloat?.SetValue(_lightManager, (float)min);
+                                    FiHasDayEnded?.SetValue(_lightManager, false); // never freeze at closing
+                                }
                             }
                         }
                         catch { }

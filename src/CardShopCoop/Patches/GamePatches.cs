@@ -89,13 +89,21 @@ namespace CardShopCoop.Patches
             return CoopCore.Role != CoopRole.Client;
         }
 
+        /// <summary>Set by CoopCore right before it mirrors a host day-change, so exactly
+        /// one OnDayStarted gets through to refresh the HUD/day label on the client.</summary>
+        public static bool AllowNextDayStarted;
+
         public static bool DayEndBlockPrefix(CEvent evt)
         {
             if (CoopCore.Role != CoopRole.Client) return true;
 
             // The client's clock follows the host; its own day must never end.
-            if (evt is CEventPlayer_OnDayEnded || evt is CEventPlayer_OnDayStarted)
+            if (evt is CEventPlayer_OnDayEnded) return false;
+            if (evt is CEventPlayer_OnDayStarted)
+            {
+                if (AllowNextDayStarted) { AllowNextDayStarted = false; return true; }
                 return false;
+            }
 
             // Shared-wallet contribution: gains/spends the JOINER earns are forwarded to
             // the host (who banks them for real) instead of applying to the mirrored copy.
