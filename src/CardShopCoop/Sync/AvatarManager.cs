@@ -28,6 +28,9 @@ namespace CardShopCoop.Sync
             public float TargetYaw;
             public float NetSpeed;
             public byte HoldState;
+            public List<int> HoldTypes;         // actual EItemTypes being carried
+            public string HeldSig = "";          // what the spawned props currently show
+            public readonly List<Item> HeldItems = new List<Item>();
             public float EmoteTimer;
             public bool EverPositioned;
             public bool HasState;
@@ -52,7 +55,8 @@ namespace CardShopCoop.Sync
             }
         }
 
-        public void UpdateState(int connId, Vector3 pos, float yaw, float speed, byte holdState)
+        public void UpdateState(int connId, Vector3 pos, float yaw, float speed, byte holdState,
+            List<int> holdTypes = null)
         {
             if (!_avatars.TryGetValue(connId, out var av))
             {
@@ -63,6 +67,7 @@ namespace CardShopCoop.Sync
             av.TargetYaw = yaw;
             av.NetSpeed = speed;
             av.HoldState = holdState;
+            av.HoldTypes = holdTypes;
             av.HasState = true;
             if (!av.EverPositioned && av.Go != null)
             {
@@ -89,6 +94,7 @@ namespace CardShopCoop.Sync
         {
             if (_avatars.TryGetValue(connId, out var av))
             {
+                ReleaseHeld(av); // pooled items must go back before their parent dies
                 if (av.Go != null) Object.Destroy(av.Go);
                 _avatars.Remove(connId);
             }
@@ -97,8 +103,22 @@ namespace CardShopCoop.Sync
         public void Clear()
         {
             foreach (var av in _avatars.Values)
+            {
+                ReleaseHeld(av);
                 if (av.Go != null) Object.Destroy(av.Go);
+            }
             _avatars.Clear();
+        }
+
+        private static void ReleaseHeld(RemoteAvatar av)
+        {
+            foreach (var item in av.HeldItems)
+                if (item != null)
+                {
+                    try { ItemSpawnManager.DisableItem(item); } catch { }
+                }
+            av.HeldItems.Clear();
+            av.HeldSig = "";
         }
 
         /// <summary>Called every frame from CoopCore while linked.</summary>
@@ -132,11 +152,40 @@ namespace CardShopCoop.Sync
                     if (av.HasHoldingBox)
                         av.Anim.SetBool("IsHoldingBox", av.HoldState != 0);
                 }
-                if (av.HoldProp != null && av.HoldProp.activeSelf != (av.HoldState != 0))
+                // carried visuals: real item meshes for items, the cardboard prop for boxes
+                bool showBox = av.HoldState == 1;
+                if (av.HoldProp != null && av.HoldProp.activeSelf != showBox)
                 {
-                    av.HoldProp.SetActive(av.HoldState != 0);
-                    float s = av.HoldState == 1 ? 0.34f : 0.16f; // box vs item-in-hand
-                    av.HoldProp.transform.localScale = new Vector3(s, s * 0.8f, s);
+                    av.HoldProp.SetActive(showBox);
+                    av.HoldProp.transform.localScale = new Vector3(0.34f, 0.27f, 0.34f);
+                }
+                string wantSig = av.HoldState == 2 && av.HoldTypes != null && av.HoldTypes.Count > 0
+                    ? string.Join(",", av.HoldTypes) : "";
+                if (wantSig != av.HeldSig)
+                {
+                    ReleaseHeld(av);
+                    av.HeldSig = wantSig;
+                    if (wantSig.Length > 0)
+                    {
+                        for (int i = 0; i < av.HoldTypes.Count; i++)
+                        {
+                            try
+                            {
+                                var meshData = InventoryBase.GetItemMeshData((EItemType)av.HoldTypes[i]);
+                                if (meshData == null) continue;
+                                var item = ItemSpawnManager.GetItem(av.Go.transform);
+                                item.SetMesh(meshData.mesh, meshData.material, (EItemType)av.HoldTypes[i],
+                                    meshData.meshSecondary, meshData.materialSecondary, meshData.materialList);
+                                item.transform.localPosition = new Vector3(0f, 1.02f + 0.14f * i, 0.42f);
+                                item.transform.localRotation = Quaternion.identity;
+                                item.gameObject.SetActive(true);
+                                if (item.m_Rigidbody != null) item.m_Rigidbody.isKinematic = true;
+                                if (item.m_Collider != null) item.m_Collider.enabled = false;
+                                av.HeldItems.Add(item);
+                            }
+                            catch { }
+                        }
+                    }
                 }
 
                 var cam = Camera.main;

@@ -222,6 +222,15 @@ namespace CardShopCoop
             _pendingKicks.Add(new KeyValuePair<int, float>(connId, 1.5f));
         }
 
+        private static List<int> ReadHoldTypes(System.IO.BinaryReader br)
+        {
+            int n = br.ReadByte();
+            if (n == 0) return null;
+            var list = new List<int>(n);
+            for (int i = 0; i < n; i++) list.Add(br.ReadInt32());
+            return list;
+        }
+
         private void RelayTagToOthers(int senderConn, byte kind)
         {
             if (Role != CoopRole.Host || _net == null || _net.ConnectionCount <= 1) return;
@@ -321,15 +330,26 @@ namespace CardShopCoop
         private static readonly FieldInfo FiHoldBoxCard = HarmonyLib.AccessTools.Field(typeof(InteractionPlayerController), "m_CurrentHoldingBoxCard");
         private static readonly FieldInfo FiHoldItemList = HarmonyLib.AccessTools.Field(typeof(InteractionPlayerController), "m_HoldItemList");
 
+        private readonly List<int> _holdTypesBuf = new List<int>(6);
+
+        /// <summary>What the local player carries: kind 0 none / 1 box / 2 items.
+        /// For items, fills the buffer with up to 6 actual EItemType values so the other
+        /// side can show the REAL meshes (modded types resolve identically because the
+        /// custom-item registries are parity-checked).</summary>
         private byte ComputeHoldState()
         {
+            _holdTypesBuf.Clear();
             if (_playerIpc == null) return 0;
             try
             {
                 if (IsAlive(FiHoldBox) || IsAlive(FiHoldItemBox) || IsAlive(FiHoldBoxShelf) || IsAlive(FiHoldBoxCard))
                     return 1; // carrying a box
-                if (FiHoldItemList?.GetValue(_playerIpc) is System.Collections.ICollection items && items.Count > 0)
+                if (FiHoldItemList?.GetValue(_playerIpc) is List<Item> items && items.Count > 0)
+                {
+                    for (int i = 0; i < items.Count && _holdTypesBuf.Count < 6; i++)
+                        if (items[i] != null) _holdTypesBuf.Add((int)items[i].GetItemType());
                     return 2; // items in hand
+                }
             }
             catch { }
             return 0;
@@ -691,6 +711,8 @@ namespace CardShopCoop
                     {
                         bw.Write(pos.x); bw.Write(pos.y); bw.Write(pos.z);
                         bw.Write(yaw); bw.Write(speed); bw.Write(hold);
+                        bw.Write((byte)_holdTypesBuf.Count);
+                        foreach (int t in _holdTypesBuf) bw.Write(t);
                     });
                     _diagSent++;
                     _stateTimer = 0f;
@@ -1071,8 +1093,9 @@ namespace CardShopCoop
                         float yaw = br.ReadSingle();
                         float speed = br.ReadSingle();
                         byte hold = br.ReadByte();
+                        var holdTypes = ReadHoldTypes(br);
                         _diagRecvStates++;
-                        _avatars.UpdateState(msg.ConnId, pos, yaw, speed, hold);
+                        _avatars.UpdateState(msg.ConnId, pos, yaw, speed, hold, holdTypes);
                         if (PeerNames.TryGetValue(msg.ConnId, out var peerName))
                             _avatars.SetName(msg.ConnId, peerName); // re-seed after scene loads clear avatars
                         if (Role == CoopRole.Host && _net.ConnectionCount > 1)
@@ -1083,6 +1106,8 @@ namespace CardShopCoop
                                 bw.Write((byte)msg.ConnId);
                                 bw.Write(pos.x); bw.Write(pos.y); bw.Write(pos.z);
                                 bw.Write(yaw); bw.Write(speed); bw.Write(hold);
+                                bw.Write((byte)(holdTypes?.Count ?? 0));
+                                if (holdTypes != null) foreach (int t in holdTypes) bw.Write(t);
                             });
                             foreach (int cid in _net.ConnIds())
                                 if (cid != msg.ConnId) _net.Send(cid, relay);
@@ -1227,8 +1252,9 @@ namespace CardShopCoop
                         float yaw = br.ReadSingle();
                         float speed = br.ReadSingle();
                         byte hold = br.ReadByte();
+                        var holdTypes = ReadHoldTypes(br);
                         if (senderId != _selfId)
-                            _avatars.UpdateState(1000 + senderId, pos, yaw, speed, hold);
+                            _avatars.UpdateState(1000 + senderId, pos, yaw, speed, hold, holdTypes);
                     }
                     break;
                 }
