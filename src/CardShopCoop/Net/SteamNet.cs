@@ -224,14 +224,32 @@ namespace CardShopCoop.Net
         private Callback<LobbyCreated_t> _cbCreated;
         private Callback<LobbyEnter_t> _cbEnter;
         private Callback<GameLobbyJoinRequested_t> _cbJoinRequested;
+        private CallResult<LobbyMatchList_t> _lobbyList;
 
         public CSteamID LobbyId = CSteamID.Nil;
         private bool _joining;
+        private bool _pendingPublic;
+        private string _pendingName = "";
+        private bool _pendingHasPw;
 
         public Action<CSteamID> OnLobbyCreated;   // host: lobby is live
         public Action<CSteamID> OnEnteredLobby;   // client: joined; arg = lobby owner
         public Action<CSteamID> OnInviteAccepted; // local player accepted someone's invite
         public Action<string> OnError;
+        public Action OnListUpdated;
+
+        public struct LobbyRow
+        {
+            public CSteamID Id;
+            public string Name;
+            public int Players;
+            public int Max;
+            public bool HasPw;
+            public string Ver;
+        }
+
+        public readonly List<LobbyRow> Lobbies = new List<LobbyRow>();
+        public bool ListRefreshing { get; private set; }
 
         public void Init()
         {
@@ -243,8 +261,33 @@ namespace CardShopCoop.Net
                     return;
                 }
                 LobbyId = new CSteamID(e.m_ulSteamIDLobby);
+                SteamMatchmaking.SetLobbyData(LobbyId, "coopmod", "cardshopcoop");
                 SteamMatchmaking.SetLobbyData(LobbyId, "coopver", CoopPlugin.Version);
+                SteamMatchmaking.SetLobbyData(LobbyId, "name",
+                    string.IsNullOrEmpty(_pendingName) ? (CoopPlugin.PlayerName.Value + "'s shop") : _pendingName);
+                SteamMatchmaking.SetLobbyData(LobbyId, "pw", _pendingHasPw ? "1" : "0");
                 OnLobbyCreated?.Invoke(LobbyId);
+            });
+            _lobbyList = CallResult<LobbyMatchList_t>.Create((e, ioFail) =>
+            {
+                ListRefreshing = false;
+                Lobbies.Clear();
+                if (ioFail) { OnError?.Invoke("Steam lobby list failed"); return; }
+                for (int i = 0; i < e.m_nLobbiesMatching; i++)
+                {
+                    var id = SteamMatchmaking.GetLobbyByIndex(i);
+                    if (id == CSteamID.Nil) continue;
+                    Lobbies.Add(new LobbyRow
+                    {
+                        Id = id,
+                        Name = SteamMatchmaking.GetLobbyData(id, "name"),
+                        Players = SteamMatchmaking.GetNumLobbyMembers(id),
+                        Max = SteamMatchmaking.GetLobbyMemberLimit(id),
+                        HasPw = SteamMatchmaking.GetLobbyData(id, "pw") == "1",
+                        Ver = SteamMatchmaking.GetLobbyData(id, "coopver"),
+                    });
+                }
+                OnListUpdated?.Invoke();
             });
             _cbEnter = Callback<LobbyEnter_t>.Create(e =>
             {
@@ -266,9 +309,25 @@ namespace CardShopCoop.Net
             catch { return false; }
         }
 
-        public void Host()
+        public void Host(bool isPublic, string lobbyName, bool hasPassword)
         {
-            SteamMatchmaking.CreateLobby(ELobbyType.k_ELobbyTypeFriendsOnly, 4);
+            _pendingPublic = isPublic;
+            _pendingName = lobbyName ?? "";
+            _pendingHasPw = hasPassword;
+            SteamMatchmaking.CreateLobby(
+                isPublic ? ELobbyType.k_ELobbyTypePublic : ELobbyType.k_ELobbyTypeFriendsOnly, 4);
+        }
+
+        /// <summary>Fetch public lobbies of THIS mod (server-side filtered by our key).</summary>
+        public void RefreshList()
+        {
+            if (ListRefreshing) return;
+            ListRefreshing = true;
+            SteamMatchmaking.AddRequestLobbyListStringFilter("coopmod", "cardshopcoop", ELobbyComparison.k_ELobbyComparisonEqual);
+            SteamMatchmaking.AddRequestLobbyListResultCountFilter(100);
+            SteamMatchmaking.AddRequestLobbyListDistanceFilter(ELobbyDistanceFilter.k_ELobbyDistanceFilterWorldwide);
+            var call = SteamMatchmaking.RequestLobbyList();
+            _lobbyList.Set(call);
         }
 
         public void Join(CSteamID lobby)

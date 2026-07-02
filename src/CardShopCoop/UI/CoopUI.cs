@@ -1,8 +1,10 @@
+using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using CardShopCoop.Net;
+using Steamworks;
 using UnityEngine;
 
 namespace CardShopCoop.UI
@@ -13,11 +15,22 @@ namespace CardShopCoop.UI
         public bool Visible = true;
         public static bool TextFieldFocused;
 
-        private Rect _win = new Rect(24f, 96f, 340f, 10f);
+        private Rect _win = new Rect(24f, 96f, 380f, 10f);
         private string _ipField;
         private string _nameField;
         private string _lanIps;
         private string _lanIpsOther;
+
+        // lobby browser + host options
+        private bool _browserOpen;
+        private string _searchField = "";
+        private int _page;
+        private bool _publicLobby;
+        private string _lobbyNameField = "";
+        private string _hostPwField = "";
+        private string _joinPwField = "";
+        private CSteamID _pwPromptLobby = CSteamID.Nil;
+        private const int PageSize = 6;
 
         /// <summary>Lower = more likely the real home-LAN address.</summary>
         private static int IpRank(string ip)
@@ -83,6 +96,8 @@ namespace CardShopCoop.UI
             {
                 case CoopRole.None:
                 {
+                    if (_browserOpen) { DrawBrowser(core); break; }
+
                     GUILayout.BeginHorizontal();
                     GUILayout.Label("Your name:", GUILayout.Width(72f));
                     GUI.SetNextControlName("coop_name");
@@ -96,23 +111,58 @@ namespace CardShopCoop.UI
 
                     GUILayout.Space(6f);
                     GUILayout.Label("<b>Host</b> (load your shop first):");
+                    _publicLobby = GUILayout.Toggle(_publicLobby, " public lobby (shows in the browser)");
+                    if (_publicLobby)
+                    {
+                        GUILayout.BeginHorizontal();
+                        GUILayout.Label("Lobby name:", GUILayout.Width(80f));
+                        GUI.SetNextControlName("coop_lobbyname");
+                        _lobbyNameField = GUILayout.TextField(_lobbyNameField, 28);
+                        GUILayout.EndHorizontal();
+                        GUILayout.BeginHorizontal();
+                        GUILayout.Label("Password:", GUILayout.Width(80f));
+                        GUI.SetNextControlName("coop_hostpw");
+                        _hostPwField = GUILayout.TextField(_hostPwField, 20);
+                        GUILayout.Label("<size=10>(blank = open)</size>", GUILayout.Width(80f));
+                        GUILayout.EndHorizontal();
+                    }
                     GUILayout.BeginHorizontal();
                     if (GUILayout.Button("Host via Steam"))
-                        core.StartHostingSteam();
+                        core.StartHostingSteam(_publicLobby, _lobbyNameField, _publicLobby ? _hostPwField : "");
                     if (GUILayout.Button("Host via LAN", GUILayout.Width(110f)))
                         core.StartHosting();
                     GUILayout.EndHorizontal();
 
                     GUILayout.Space(6f);
                     GUILayout.Label("<b>Join</b> (stay on the main menu):");
-                    GUILayout.Label("<size=11>Steam: just accept the host's invite (friends list / overlay).</size>");
+                    if (GUILayout.Button("Browse public lobbies"))
+                    {
+                        _browserOpen = true;
+                        _page = 0;
+                        _pwPromptLobby = CSteamID.Nil;
+                        core.Lobby.RefreshList();
+                    }
+                    GUILayout.Label("<size=11>Steam friends: just accept the host's invite.</size>");
+
+                    // wrong-password retry for invites into protected lobbies
+                    if (core.ErrorLine == "wrong password" && core.LastFailedLobby != CSteamID.Nil)
+                    {
+                        GUILayout.BeginHorizontal();
+                        GUILayout.Label("Password:", GUILayout.Width(80f));
+                        GUI.SetNextControlName("coop_joinpw");
+                        _joinPwField = GUILayout.TextField(_joinPwField, 20);
+                        if (GUILayout.Button("Retry", GUILayout.Width(60f)))
+                            core.JoinSteam(core.LastFailedLobby, _joinPwField);
+                        GUILayout.EndHorizontal();
+                    }
+
                     GUILayout.BeginHorizontal();
                     GUI.SetNextControlName("coop_ip");
                     _ipField = GUILayout.TextField(_ipField, 24);
                     if (GUILayout.Button("Join LAN", GUILayout.Width(80f)))
                         core.Join(_ipField);
                     GUILayout.EndHorizontal();
-                    GUILayout.Label($"<size=11>LAN port {CoopPlugin.Port.Value} - both PCs need this mod + the same mods.</size>");
+                    GUILayout.Label($"<size=11>LAN port {CoopPlugin.Port.Value} - all players need this mod + the same mods.</size>");
                     break;
                 }
                 case CoopRole.Host:
@@ -158,9 +208,86 @@ namespace CardShopCoop.UI
             }
 
             string focused = GUI.GetNameOfFocusedControl();
-            TextFieldFocused = focused == "coop_ip" || focused == "coop_name";
+            TextFieldFocused = focused != null && focused.StartsWith("coop_");
 
             GUI.DragWindow(new Rect(0f, 0f, 10000f, 20f));
+        }
+
+        private void DrawBrowser(CoopCore core)
+        {
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("<b>Public lobbies</b>");
+            GUILayout.FlexibleSpace();
+            if (GUILayout.Button(core.Lobby.ListRefreshing ? "..." : "Refresh", GUILayout.Width(70f)))
+                core.Lobby.RefreshList();
+            if (GUILayout.Button("Back", GUILayout.Width(50f)))
+            {
+                _browserOpen = false;
+                _pwPromptLobby = CSteamID.Nil;
+            }
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Search:", GUILayout.Width(52f));
+            GUI.SetNextControlName("coop_search");
+            string s = GUILayout.TextField(_searchField, 24);
+            if (s != _searchField) { _searchField = s; _page = 0; }
+            GUILayout.EndHorizontal();
+
+            var filtered = new List<SteamLobby.LobbyRow>();
+            foreach (var row in core.Lobby.Lobbies)
+                if (_searchField.Length == 0
+                    || (row.Name ?? "").IndexOf(_searchField, StringComparison.OrdinalIgnoreCase) >= 0)
+                    filtered.Add(row);
+
+            int pages = Mathf.Max(1, (filtered.Count + PageSize - 1) / PageSize);
+            _page = Mathf.Clamp(_page, 0, pages - 1);
+
+            if (filtered.Count == 0)
+            {
+                GUILayout.Label(core.Lobby.ListRefreshing ? "Searching..." : "No lobbies found - hit Refresh, or host one!");
+            }
+            for (int i = _page * PageSize; i < filtered.Count && i < (_page + 1) * PageSize; i++)
+            {
+                var row = filtered[i];
+                bool verOk = row.Ver == CoopPlugin.Version;
+                GUILayout.BeginHorizontal();
+                string label = $"{(row.HasPw ? "[pw] " : "")}{row.Name}  ({row.Players}/{row.Max})"
+                             + (verOk ? "" : $"  <size=10>v{row.Ver}</size>");
+                GUILayout.Label(label, GUILayout.ExpandWidth(true));
+                GUI.enabled = verOk;
+                if (GUILayout.Button("Join", GUILayout.Width(50f)))
+                {
+                    if (row.HasPw) { _pwPromptLobby = row.Id; _joinPwField = ""; }
+                    else { core.JoinSteam(row.Id, ""); _browserOpen = false; }
+                }
+                GUI.enabled = true;
+                GUILayout.EndHorizontal();
+
+                if (_pwPromptLobby == row.Id)
+                {
+                    GUILayout.BeginHorizontal();
+                    GUILayout.Label("Password:", GUILayout.Width(70f));
+                    GUI.SetNextControlName("coop_joinpw");
+                    _joinPwField = GUILayout.TextField(_joinPwField, 20);
+                    if (GUILayout.Button("Go", GUILayout.Width(40f)))
+                    {
+                        core.JoinSteam(row.Id, _joinPwField);
+                        _browserOpen = false;
+                        _pwPromptLobby = CSteamID.Nil;
+                    }
+                    GUILayout.EndHorizontal();
+                }
+            }
+
+            GUILayout.BeginHorizontal();
+            GUI.enabled = _page > 0;
+            if (GUILayout.Button("< Prev", GUILayout.Width(60f))) _page--;
+            GUI.enabled = _page < pages - 1;
+            if (GUILayout.Button("Next >", GUILayout.Width(60f))) _page++;
+            GUI.enabled = true;
+            GUILayout.Label($"<size=11>page {_page + 1}/{pages} - {filtered.Count} lobbies</size>");
+            GUILayout.EndHorizontal();
         }
 
         private static string PlayersLine(CoopCore core)

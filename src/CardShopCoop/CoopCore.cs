@@ -150,11 +150,7 @@ namespace CardShopCoop
                 st.LobbyId = _steamLobby.LobbyId;
                 st.ConnectToHost(owner);
                 StatusLine = "Connected via Steam - requesting world...";
-                Send(1, MsgType.Hello, bw =>
-                {
-                    bw.Write(CoopPlugin.Version);
-                    bw.Write(CoopPlugin.PlayerName.Value);
-                });
+                SendHello();
             };
             _steamLobby.OnInviteAccepted = lobby =>
             {
@@ -165,8 +161,13 @@ namespace CardShopCoop
             CEventManager.AddListener<CEventPlayer_OnOpenCardPack>(OnLocalPackOpened);
         }
 
-        /// <summary>Join a host through Steam (invite accept, +connect_lobby, or auto flow).</summary>
-        public void JoinSteam(CSteamID lobby)
+        public string HostPassword = "";        // required from joiners when non-empty
+        private string _joinPassword = "";       // sent in our Hello when joining
+        public CSteamID LastFailedLobby = CSteamID.Nil; // for the wrong-password retry flow
+        public SteamLobby Lobby => _steamLobby;
+
+        /// <summary>Join a host through Steam (invite accept, browser, +connect_lobby).</summary>
+        public void JoinSteam(CSteamID lobby, string password = "")
         {
             ErrorLine = "";
             if (Role != CoopRole.None) { ErrorLine = "Already in a session."; return; }
@@ -174,13 +175,15 @@ namespace CardShopCoop
             if (!_steamLobby.SteamAvailable()) { ErrorLine = "Steam isn't running."; return; }
             Role = CoopRole.Client;
             IsSteamSession = true;
+            _joinPassword = password ?? "";
+            LastFailedLobby = lobby;
             _net = new SteamTransport(isHost: false) { KeepaliveFrame = Msg.Build(MsgType.Ping) };
             StatusLine = "Joining Steam lobby...";
             _steamLobby.Join(lobby);
         }
 
-        /// <summary>Host through Steam: create a friends-only lobby, then invite via overlay.</summary>
-        public void StartHostingSteam()
+        /// <summary>Host through Steam: friends-only (invite) or public (lobby browser).</summary>
+        public void StartHostingSteam(bool isPublic, string lobbyName, string password)
         {
             ErrorLine = "";
             if (Role != CoopRole.None) { ErrorLine = "Already in a session."; return; }
@@ -188,12 +191,58 @@ namespace CardShopCoop
             if (!_steamLobby.SteamAvailable()) { ErrorLine = "Steam isn't running - use LAN instead."; return; }
             Role = CoopRole.Host;
             IsSteamSession = true;
+            HostPassword = password ?? "";
             _net = new SteamTransport(isHost: true) { KeepaliveFrame = Msg.Build(MsgType.Ping) };
             StatusLine = "Creating Steam lobby...";
-            _steamLobby.Host();
+            _steamLobby.Host(isPublic, lobbyName, HostPassword.Length > 0);
         }
 
         public void OpenSteamInvite() { _steamLobby.OpenInviteDialog(); }
+
+        private void SendHello()
+        {
+            Send(1, MsgType.Hello, bw =>
+            {
+                bw.Write(CoopPlugin.Version);
+                bw.Write(CoopPlugin.PlayerName.Value);
+                bw.Write(_joinPassword ?? "");
+                bw.Write(Util.ModParity.PluginHash());
+                bw.Write(Util.ModParity.EnumHash());
+            });
+        }
+
+        // Bye must actually reach the peer before the connection dies; on Steam, sends
+        // drain on later frames, so the kick is deferred a moment.
+        private readonly List<KeyValuePair<int, float>> _pendingKicks = new List<KeyValuePair<int, float>>();
+
+        private void RejectConn(int connId, string reason)
+        {
+            CoopPlugin.Log.LogWarning($"rejected connection {connId}: {reason}");
+            Send(connId, MsgType.Bye, bw => bw.Write(reason));
+            _pendingKicks.Add(new KeyValuePair<int, float>(connId, 1.5f));
+        }
+
+        private void RelayTagToOthers(int senderConn, byte kind)
+        {
+            if (Role != CoopRole.Host || _net == null || _net.ConnectionCount <= 1) return;
+            var relay = Msg.Build(MsgType.RelayTag, bw => { bw.Write((byte)senderConn); bw.Write(kind); });
+            foreach (int cid in _net.ConnIds())
+                if (cid != senderConn) _net.Send(cid, relay);
+        }
+
+        private void BroadcastRoster()
+        {
+            if (Role != CoopRole.Host) return;
+            var entries = new List<KeyValuePair<int, string>>(PeerNames);
+            Broadcast(MsgType.Roster, bw =>
+            {
+                bw.Write((byte)entries.Count);
+                foreach (var e in entries) { bw.Write((byte)e.Key); bw.Write(e.Value); }
+            });
+        }
+
+        private int _selfId = -1; // our connId on the host, from Welcome
+        private readonly HashSet<int> _relayIds = new HashSet<int>(); // other clients we render
 
         private void OnLocalPackOpened(CEventPlayer_OnOpenCardPack evt)
         {
@@ -338,11 +387,7 @@ namespace CardShopCoop
                     _mainThread.Enqueue(() =>
                     {
                         StatusLine = "Connected - requesting world...";
-                        Send(1, MsgType.Hello, bw =>
-                        {
-                            bw.Write(CoopPlugin.Version);
-                            bw.Write(CoopPlugin.PlayerName.Value);
-                        });
+                        SendHello();
                     });
                 }
                 catch (Exception e)
@@ -426,6 +471,11 @@ namespace CardShopCoop
             PromptLine = "";
             _steamLobby.Leave();
             IsSteamSession = false;
+            HostPassword = "";
+            _joinPassword = "";
+            _selfId = -1;
+            _relayIds.Clear();
+            _pendingKicks.Clear();
             Application.runInBackground = false; // back to the game's normal behavior
             Role = CoopRole.None;
             if (reason != null)
@@ -544,6 +594,7 @@ namespace CardShopCoop
                 _avatars.Remove(left);
                 if (Role == CoopRole.Host)
                 {
+                    BroadcastRoster();
                     StatusLine = _net.ConnectionCount == 0
                         ? "Hosting - waiting for a player..."
                         : $"Hosting - {_net.ConnectionCount} player(s)";
@@ -665,6 +716,19 @@ namespace CardShopCoop
                     catch { }
                 }
                 CoopPlugin.Log.LogInfo($"diag: role={Role} conns={_net.ConnectionCount} sentStates={_diagSent} recvStates={_diagRecvStates} inGame={InGameLevel()} pos={posStr}{npcStr}");
+            }
+
+            // deferred kicks (give a rejection Bye time to reach the peer first)
+            for (int i = _pendingKicks.Count - 1; i >= 0; i--)
+            {
+                float left = _pendingKicks[i].Value - dt;
+                if (left <= 0f)
+                {
+                    int cid = _pendingKicks[i].Key;
+                    _pendingKicks.RemoveAt(i);
+                    _net.Kick(cid);
+                }
+                else _pendingKicks[i] = new KeyValuePair<int, float>(_pendingKicks[i].Key, left);
             }
 
             // heartbeat + timeout
@@ -850,18 +914,38 @@ namespace CardShopCoop
                     {
                         string version = br.ReadString();
                         string name = br.ReadString();
+                        string password = br.ReadString();
+                        string pluginHash = br.ReadString();
+                        string enumHash = br.ReadString();
+
                         if (version != CoopPlugin.Version)
                         {
-                            CoopPlugin.Log.LogWarning($"Version mismatch: {name} has {version}, we have {CoopPlugin.Version}");
-                            Send(msg.ConnId, MsgType.Bye, null);
-                            _net.Kick(msg.ConnId);
+                            RejectConn(msg.ConnId, $"version mismatch - host runs CardShopCoop {CoopPlugin.Version}, you have {version}");
                             break;
                         }
+                        if (HostPassword.Length > 0 && password != HostPassword)
+                        {
+                            RejectConn(msg.ConnId, "wrong password");
+                            break;
+                        }
+                        if (pluginHash != Util.ModParity.PluginHash())
+                        {
+                            RejectConn(msg.ConnId, "your mod set differs from the host's - both players need identical mods (same versions)");
+                            break;
+                        }
+                        string hostEnum = Util.ModParity.EnumHash();
+                        if (enumHash != "none" && hostEnum != "none" && enumHash != hostEnum)
+                        {
+                            RejectConn(msg.ConnId, "custom-card registry differs (EPL enum_values.json) - see the mod page's compatibility notes");
+                            break;
+                        }
+
                         PeerNames[msg.ConnId] = name;
                         _avatars.SetName(msg.ConnId, name);
                         StatusLine = $"Hosting - {name} joined!";
                         CoopPlugin.Log.LogInfo(name + " joined, sending world...");
                         SendWorldTo(msg.ConnId);
+                        BroadcastRoster();
                     }
                     break;
                 }
@@ -875,6 +959,7 @@ namespace CardShopCoop
                         _saveExpected = br.ReadInt32();
                         _hostSlot = br.ReadInt32();
                         _bundleExpected = br.ReadInt32();
+                        _selfId = br.ReadByte();
                         PeerNames[msg.ConnId] = hostName;
                         _avatars.SetName(msg.ConnId, hostName);
                         _saveBuf = new MemoryStream(_saveExpected > 0 ? _saveExpected : 1024);
@@ -990,6 +1075,18 @@ namespace CardShopCoop
                         _avatars.UpdateState(msg.ConnId, pos, yaw, speed, hold);
                         if (PeerNames.TryGetValue(msg.ConnId, out var peerName))
                             _avatars.SetName(msg.ConnId, peerName); // re-seed after scene loads clear avatars
+                        if (Role == CoopRole.Host && _net.ConnectionCount > 1)
+                        {
+                            // other clients should see this player too
+                            var relay = Msg.Build(MsgType.RelayState, bw =>
+                            {
+                                bw.Write((byte)msg.ConnId);
+                                bw.Write(pos.x); bw.Write(pos.y); bw.Write(pos.z);
+                                bw.Write(yaw); bw.Write(speed); bw.Write(hold);
+                            });
+                            foreach (int cid in _net.ConnIds())
+                                if (cid != msg.ConnId) _net.Send(cid, relay);
+                        }
                         if (_gotStateFrom.Add(msg.ConnId))
                         {
                             string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : ("player " + msg.ConnId);
@@ -1086,11 +1183,66 @@ namespace CardShopCoop
                 case MsgType.Emote:
                 {
                     _avatars.ShowEmote(msg.ConnId);
+                    RelayTagToOthers(msg.ConnId, 0);
                     break;
                 }
                 case MsgType.Activity:
                 {
                     _avatars.ShowTag(msg.ConnId, "opening a pack!", 3f);
+                    RelayTagToOthers(msg.ConnId, 1);
+                    break;
+                }
+                case MsgType.Roster:
+                {
+                    if (Role != CoopRole.Client) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        int n = br.ReadByte();
+                        var seen = new HashSet<int>();
+                        for (int i = 0; i < n; i++)
+                        {
+                            int id = br.ReadByte();
+                            string name = br.ReadString();
+                            if (id == _selfId) continue;
+                            seen.Add(id);
+                            if (_relayIds.Add(id)) CoopPlugin.Log.LogInfo($"peer in shop: {name}");
+                            _avatars.SetName(1000 + id, name);
+                        }
+                        _relayIds.RemoveWhere(id =>
+                        {
+                            if (seen.Contains(id)) return false;
+                            _avatars.Remove(1000 + id);
+                            return true;
+                        });
+                    }
+                    break;
+                }
+                case MsgType.RelayState:
+                {
+                    if (Role != CoopRole.Client) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        int senderId = br.ReadByte();
+                        var pos = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
+                        float yaw = br.ReadSingle();
+                        float speed = br.ReadSingle();
+                        byte hold = br.ReadByte();
+                        if (senderId != _selfId)
+                            _avatars.UpdateState(1000 + senderId, pos, yaw, speed, hold);
+                    }
+                    break;
+                }
+                case MsgType.RelayTag:
+                {
+                    if (Role != CoopRole.Client) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        int senderId = br.ReadByte();
+                        byte kind = br.ReadByte();
+                        if (senderId == _selfId) break;
+                        if (kind == 0) _avatars.ShowEmote(1000 + senderId);
+                        else _avatars.ShowTag(1000 + senderId, "opening a pack!", 3f);
+                    }
                     break;
                 }
                 case MsgType.CardDelta:
@@ -1234,10 +1386,16 @@ namespace CardShopCoop
                     break;
                 case MsgType.Bye:
                 {
+                    string reason = "the host ended the session";
+                    if (msg.Payload.Length > 0)
+                    {
+                        try { using (var br = Msg.Reader(msg.Payload)) reason = br.ReadString(); }
+                        catch { }
+                    }
                     if (Role == CoopRole.Client)
                     {
-                        ErrorLine = "The host ended the session (or version mismatch - check both PCs run the same CardShopCoop).";
-                        Shutdown("host said bye");
+                        ErrorLine = reason;
+                        Shutdown("rejected: " + reason);
                     }
                     else
                     {
@@ -1278,6 +1436,7 @@ namespace CardShopCoop
                 bw.Write(payload.Length);
                 bw.Write(hostSlot);
                 bw.Write(bundle.Length);
+                bw.Write((byte)connId); // tells the client its own id (to skip in rosters)
             });
 
             var net = _net;

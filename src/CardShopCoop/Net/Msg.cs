@@ -33,6 +33,9 @@ namespace CardShopCoop.Net
         CardPriceSet = 26,     // both ways: a card's marked price changed
         RegisterState = 27,    // host -> client: per-counter checkout state + cart items
         ScanEcho = 28,         // host -> client: a scan landed (fills the vanilla checkout UI)
+        Roster = 29,           // host -> clients: connId->name table for relayed peers
+        RelayState = 30,       // host -> clients: another client's PlayerState [senderId + state]
+        RelayTag = 31,         // host -> clients: another client's emote/activity [senderId + kind]
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>
