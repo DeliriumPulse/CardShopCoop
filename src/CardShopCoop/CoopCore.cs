@@ -1,0 +1,799 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using System.Threading;
+using CardShopCoop.Net;
+using CardShopCoop.Sync;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+namespace CardShopCoop
+{
+    public enum CoopRole { None, Host, Client }
+
+    public class CoopCore : MonoBehaviour
+    {
+        public static CoopCore Instance { get; private set; }
+        public static CoopRole Role { get; private set; } = CoopRole.None;
+
+        public string StatusLine = "Not connected";
+        public string ErrorLine = "";
+        public string HostTimeLine = "";
+        public readonly Dictionary<int, string> PeerNames = new Dictionary<int, string>();
+
+        private Transport _net;
+        private readonly AvatarManager _avatars = new AvatarManager();
+        private readonly WorldSync _world = new WorldSync();
+        private readonly ConcurrentQueue<Action> _mainThread = new ConcurrentQueue<Action>();
+        private UI.CoopUI _ui;
+
+        // client-side save + mod-sidecar download
+        private MemoryStream _saveBuf;
+        private int _saveExpected = -1;
+        private byte[] _pendingSave;
+        private MemoryStream _bundleBuf;
+        private int _bundleExpected = -1;
+        private int _hostSlot;
+        private bool _worldRequested;
+
+        // host price sync
+        private float _priceTimer;
+        private int _lastPriceHash;
+
+        // timers
+        private float _stateTimer;
+        private float _pingTimer;
+        private float _econTimer;
+        private float _dayTimer;
+
+        // local movement measurement
+        private Vector3 _lastPos;
+        private bool _hasLastPos;
+
+        // host economy change detection
+        private double _lastCoinSent = double.MinValue;
+
+        // one-time link confirmation logging
+        private readonly HashSet<int> _gotStateFrom = new HashSet<int>();
+        private bool _loggedEconLink;
+        private bool _loggedTimeLink;
+
+        // LightManager reflection (time of day)
+        private static readonly FieldInfo FiTimeHour = typeof(LightManager).GetField("m_TimeHour", BindingFlags.NonPublic | BindingFlags.Instance);
+        private static readonly FieldInfo FiTimeMin = typeof(LightManager).GetField("m_TimeMin", BindingFlags.NonPublic | BindingFlags.Instance);
+        private static readonly FieldInfo FiTimeMinFloat = typeof(LightManager).GetField("m_TimeMinFloat", BindingFlags.NonPublic | BindingFlags.Instance);
+        private LightManager _lightManager;
+
+        // headless auto-test / shortcut args: -coopautohost=SLOT  -coopautojoin=IP
+        private int _autoHostSlot = -1;
+        private string _autoJoinIp;
+        private int _autoPhase;
+        private float _autoTimer;
+
+        private void Awake()
+        {
+            Instance = this;
+            _ui = new UI.CoopUI();
+            _world.OnLocalChanges = OnLocalWorldChanges;
+            SceneManager.sceneLoaded += OnSceneLoaded;
+
+            foreach (string arg in Environment.GetCommandLineArgs())
+            {
+                if (arg.StartsWith("-coopautohost=") && int.TryParse(arg.Substring(14), out int slot))
+                    _autoHostSlot = slot;
+                else if (arg.StartsWith("-coopautojoin="))
+                    _autoJoinIp = arg.Substring(14);
+            }
+            if (_autoHostSlot >= 0) CoopPlugin.Log.LogInfo($"AUTO: will load slot {_autoHostSlot} and host");
+            if (_autoJoinIp != null) CoopPlugin.Log.LogInfo($"AUTO: will join {_autoJoinIp}");
+        }
+
+        private void OnDestroy()
+        {
+            SceneManager.sceneLoaded -= OnSceneLoaded;
+            Shutdown("plugin unloaded");
+        }
+
+        private void OnApplicationQuit()
+        {
+            Shutdown("game closed");
+        }
+
+        private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+        {
+            _avatars.Clear();
+            _world.Reset();
+            _lightManager = null;
+            _playerTf = null;
+            _playerIpc = null;
+            if (scene.name == "Title" && Role == CoopRole.Client && _net != null)
+            {
+                // client backed out to the main menu -> leave the session
+                Shutdown("left the session");
+            }
+        }
+
+        private bool InGameLevel()
+        {
+            var gm = CSingleton<CGameManager>.Instance;
+            return gm != null && gm.m_IsGameLevel;
+        }
+
+        /// <summary>The game assigns neither CGameManager.Player nor
+        /// InteractionPlayerController.m_Instance (both are dead statics), so find the
+        /// player controller in the scene once and cache its transform. FindObjectOfType
+        /// never auto-creates, unlike CSingleton&lt;T&gt;.Instance.</summary>
+        private Transform _playerTf;
+        private InteractionPlayerController _playerIpc;
+
+        private Transform ResolvePlayer()
+        {
+            if (_playerTf != null) return _playerTf;
+            var ipc = InteractionPlayerController.m_Instance;
+            if (ipc == null) ipc = FindObjectOfType<InteractionPlayerController>();
+            if (ipc != null)
+            {
+                _playerIpc = ipc;
+                _playerTf = ipc.transform;
+                CoopPlugin.Log.LogInfo("Player transform resolved: " + _playerTf.name);
+            }
+            return _playerTf;
+        }
+
+        // what the local player is carrying (private fields; the game has no public API)
+        private static readonly FieldInfo FiHoldBox = HarmonyLib.AccessTools.Field(typeof(InteractionPlayerController), "m_CurrentHoldingBox");
+        private static readonly FieldInfo FiHoldItemBox = HarmonyLib.AccessTools.Field(typeof(InteractionPlayerController), "m_CurrentHoldingItemBox");
+        private static readonly FieldInfo FiHoldBoxShelf = HarmonyLib.AccessTools.Field(typeof(InteractionPlayerController), "m_CurrentHoldingBoxShelf");
+        private static readonly FieldInfo FiHoldBoxCard = HarmonyLib.AccessTools.Field(typeof(InteractionPlayerController), "m_CurrentHoldingBoxCard");
+        private static readonly FieldInfo FiHoldItemList = HarmonyLib.AccessTools.Field(typeof(InteractionPlayerController), "m_HoldItemList");
+
+        private byte ComputeHoldState()
+        {
+            if (_playerIpc == null) return 0;
+            try
+            {
+                if (IsAlive(FiHoldBox) || IsAlive(FiHoldItemBox) || IsAlive(FiHoldBoxShelf) || IsAlive(FiHoldBoxCard))
+                    return 1; // carrying a box
+                if (FiHoldItemList?.GetValue(_playerIpc) is System.Collections.ICollection items && items.Count > 0)
+                    return 2; // items in hand
+            }
+            catch { }
+            return 0;
+        }
+
+        private bool IsAlive(FieldInfo fi)
+        {
+            var obj = fi?.GetValue(_playerIpc) as UnityEngine.Object;
+            return obj != null;
+        }
+
+        // ------------------------------------------------ public entry points (UI)
+
+        public void StartHosting()
+        {
+            ErrorLine = "";
+            if (Role != CoopRole.None) { ErrorLine = "Already in a session."; return; }
+            if (!InGameLevel()) { ErrorLine = "Load your shop first, then host."; return; }
+            try
+            {
+                _net = new Transport { KeepaliveFrame = Msg.Build(MsgType.Ping) };
+                _net.StartHost(CoopPlugin.Port.Value);
+                Role = CoopRole.Host;
+                StatusLine = "Hosting - waiting for a player...";
+                CoopPlugin.Log.LogInfo($"Hosting on port {CoopPlugin.Port.Value}");
+            }
+            catch (Exception e)
+            {
+                ErrorLine = "Could not host: " + e.Message;
+                _net?.Stop(); _net = null;
+                Role = CoopRole.None;
+            }
+        }
+
+        public void Join(string ip)
+        {
+            ErrorLine = "";
+            if (Role != CoopRole.None) { ErrorLine = "Already in a session."; return; }
+            if (InGameLevel()) { ErrorLine = "Join from the main menu (Title screen)."; return; }
+            ip = (ip ?? "").Trim();
+            if (ip.Length == 0) { ErrorLine = "Enter the host's IP address."; return; }
+
+            CoopPlugin.LastJoinIP.Value = ip;
+            Role = CoopRole.Client;
+            StatusLine = "Connecting to " + ip + "...";
+            var net = new Transport { KeepaliveFrame = Msg.Build(MsgType.Ping) };
+            _net = net;
+            int port = CoopPlugin.Port.Value;
+            new Thread(() =>
+            {
+                try
+                {
+                    net.StartClient(ip, port);
+                    _mainThread.Enqueue(() =>
+                    {
+                        StatusLine = "Connected - requesting world...";
+                        Send(1, MsgType.Hello, bw =>
+                        {
+                            bw.Write(CoopPlugin.Version);
+                            bw.Write(CoopPlugin.PlayerName.Value);
+                        });
+                    });
+                }
+                catch (Exception e)
+                {
+                    _mainThread.Enqueue(() =>
+                    {
+                        ErrorLine = "Could not connect: " + e.Message;
+                        Shutdown(null);
+                    });
+                }
+            }) { IsBackground = true, Name = "CoopConnect" }.Start();
+        }
+
+        public void Disconnect()
+        {
+            Shutdown("disconnected");
+        }
+
+        public void SendEmote()
+        {
+            if (_net != null && Role != CoopRole.None)
+                Broadcast(MsgType.Emote, bw => bw.Write((byte)1));
+        }
+
+        private void Shutdown(string reason)
+        {
+            if (_net != null)
+            {
+                try { Broadcast(MsgType.Bye, null); } catch { }
+                _net.Stop();
+                _net = null;
+            }
+            _avatars.Clear();
+            PeerNames.Clear();
+            _saveBuf = null;
+            _saveExpected = -1;
+            _pendingSave = null;
+            _bundleBuf = null;
+            _bundleExpected = -1;
+            _worldRequested = false;
+            _hasLastPos = false;
+            _lastCoinSent = double.MinValue;
+            _lastPriceHash = 0;
+            _world.Reset();
+            Role = CoopRole.None;
+            if (reason != null)
+            {
+                StatusLine = "Not connected (" + reason + ")";
+                CoopPlugin.Log.LogInfo("Session ended: " + reason);
+            }
+        }
+
+        // ------------------------------------------------ send helpers
+
+        private void Send(int connId, MsgType type, Action<BinaryWriter> write)
+        {
+            _net?.Send(connId, Msg.Build(type, write));
+        }
+
+        private void Broadcast(MsgType type, Action<BinaryWriter> write)
+        {
+            _net?.Broadcast(Msg.Build(type, write));
+        }
+
+        // ------------------------------------------------ per-frame
+
+        private void Update()
+        {
+            while (_mainThread.TryDequeue(out var act))
+            {
+                try { act(); } catch (Exception e) { CoopPlugin.Log.LogError(e); }
+            }
+
+            AutoTick(Time.deltaTime);
+
+            if (Input.GetKeyDown(CoopPlugin.UiToggleKey.Value))
+                _ui.Visible = !_ui.Visible;
+            if (Role != CoopRole.None && Input.GetKeyDown(CoopPlugin.EmoteKey.Value) && !UI.CoopUI.TextFieldFocused)
+                SendEmote();
+
+            if (_net == null) return;
+
+            while (_net.Connects.TryDequeue(out int joined))
+            {
+                CoopPlugin.Log.LogInfo("Connection " + joined + " opened");
+            }
+            while (_net.Disconnects.TryDequeue(out int left))
+            {
+                string name = PeerNames.TryGetValue(left, out var n) ? n : ("player " + left);
+                PeerNames.Remove(left);
+                _avatars.Remove(left);
+                if (Role == CoopRole.Host)
+                {
+                    StatusLine = _net.ConnectionCount == 0
+                        ? "Hosting - waiting for a player..."
+                        : $"Hosting - {_net.ConnectionCount} player(s)";
+                    CoopPlugin.Log.LogInfo(name + " left");
+                }
+                else if (Role == CoopRole.Client)
+                {
+                    ErrorLine = "Lost connection to the host. You can keep walking around; nothing here touches your own saves.";
+                    Shutdown("host connection lost");
+                    return;
+                }
+            }
+
+            while (_net != null && _net.Incoming.TryDequeue(out var msg))
+            {
+                try { Dispatch(msg); }
+                catch (Exception e) { CoopPlugin.Log.LogError($"Dispatch {msg.Type}: {e}"); }
+            }
+            if (_net == null) return; // a Bye may have shut us down mid-drain
+
+            float dt = Time.deltaTime;
+            _avatars.Tick(dt);
+            _world.Tick(dt, Role != CoopRole.None && _net.ConnectionCount > 0 && InGameLevel());
+
+            // position updates
+            _stateTimer += dt;
+            float interval = 1f / Mathf.Clamp(CoopPlugin.SendRateHz.Value, 4f, 30f);
+            Transform playerTf = InGameLevel() ? ResolvePlayer() : null;
+            if (_stateTimer >= interval && playerTf != null)
+            {
+                Vector3 pos = playerTf.position;
+                float speed = 0f;
+                if (_hasLastPos)
+                {
+                    Vector3 delta = pos - _lastPos;
+                    delta.y = 0f;
+                    speed = Mathf.Clamp(delta.magnitude / _stateTimer, 0f, 6f);
+                }
+                _lastPos = pos; _hasLastPos = true;
+                float yaw = Camera.main != null ? Camera.main.transform.eulerAngles.y : 0f;
+                byte hold = ComputeHoldState();
+                Broadcast(MsgType.PlayerState, bw =>
+                {
+                    bw.Write(pos.x); bw.Write(pos.y); bw.Write(pos.z);
+                    bw.Write(yaw); bw.Write(speed); bw.Write(hold);
+                });
+                _stateTimer = 0f;
+            }
+
+            // heartbeat + timeout
+            _pingTimer += dt;
+            if (_pingTimer >= 2f)
+            {
+                _pingTimer = 0f;
+                Broadcast(MsgType.Ping, null);
+                foreach (int id in _net.ConnIds())
+                {
+                    if (_net.SecondsSinceLastRecv(id) > 30.0)
+                    {
+                        CoopPlugin.Log.LogWarning("Connection " + id + " timed out");
+                        _net.Kick(id);
+                    }
+                }
+            }
+
+            if (Role == CoopRole.Host) HostTick(dt);
+        }
+
+        /// <summary>Drives the -coopautohost / -coopautojoin command-line flows.</summary>
+        private void AutoTick(float dt)
+        {
+            if (_autoHostSlot < 0 && _autoJoinIp == null) return;
+            if (_autoPhase >= 99) return;
+            _autoTimer += dt;
+
+            if (_autoHostSlot >= 0)
+            {
+                if (_autoPhase == 0 && _autoTimer > 6f && !InGameLevel()
+                    && CSingleton<CGameManager>.Instance != null)
+                {
+                    CoopPlugin.Log.LogInfo($"AUTO: loading slot {_autoHostSlot}...");
+                    Sync.SaveTransfer.ForceLoadSlot(_autoHostSlot);
+                    _autoPhase = 1;
+                    _autoTimer = 0f;
+                }
+                else if (_autoPhase == 1 && InGameLevel() && GameInstance.m_FinishedSavefileLoading)
+                {
+                    _autoPhase = 2;
+                    _autoTimer = 0f;
+                }
+                else if (_autoPhase == 2 && _autoTimer > 3f)
+                {
+                    CoopPlugin.Log.LogInfo("AUTO: hosting now");
+                    StartHosting();
+                    _autoPhase = 99;
+                }
+            }
+            else if (_autoJoinIp != null)
+            {
+                if (_autoPhase == 0 && _autoTimer > 10f && !InGameLevel()
+                    && CSingleton<CGameManager>.Instance != null)
+                {
+                    CoopPlugin.Log.LogInfo($"AUTO: joining {_autoJoinIp}...");
+                    Join(_autoJoinIp);
+                    _autoPhase = 99;
+                }
+            }
+        }
+
+        /// <summary>Local snapshot diffs: host broadcasts authoritative state, client requests.</summary>
+        private void OnLocalWorldChanges(System.Collections.Generic.List<WorldSync.Entry> changes)
+        {
+            if (Role == CoopRole.Host)
+                Broadcast(MsgType.ShelfDelta, bw => WorldSync.WriteEntries(bw, changes));
+            else if (Role == CoopRole.Client)
+                Send(1, MsgType.ShelfRequest, bw => WorldSync.WriteEntries(bw, changes));
+        }
+
+        private void HostTick(float dt)
+        {
+            if (_net.ConnectionCount == 0) return;
+
+            _priceTimer += dt;
+            if (_priceTimer >= 3f)
+            {
+                _priceTimer = 0f;
+                try
+                {
+                    var prices = CPlayerData.m_SetItemPriceList;
+                    int hash = 17;
+                    for (int i = 0; i < prices.Count; i++)
+                        hash = hash * 31 + prices[i].GetHashCode();
+                    if (hash != _lastPriceHash)
+                    {
+                        _lastPriceHash = hash;
+                        Broadcast(MsgType.PriceList, bw =>
+                        {
+                            bw.Write((ushort)prices.Count);
+                            for (int i = 0; i < prices.Count; i++) bw.Write(prices[i]);
+                        });
+                    }
+                }
+                catch (Exception e) { CoopPlugin.Log.LogWarning("price sync: " + e.Message); }
+            }
+
+            _econTimer += dt;
+            if (_econTimer >= 0.5f)
+            {
+                _econTimer = 0f;
+                double coin = CPlayerData.m_CoinAmountDouble;
+                if (Math.Abs(coin - _lastCoinSent) > 0.0001)
+                {
+                    _lastCoinSent = coin;
+                    float coinF = CPlayerData.m_CoinAmount;
+                    Broadcast(MsgType.CoinSet, bw => { bw.Write(coin); bw.Write(coinF); });
+                }
+            }
+
+            _dayTimer += dt;
+            if (_dayTimer >= 2f)
+            {
+                _dayTimer = 0f;
+                int hour = 8, min = 0;
+                try
+                {
+                    if (_lightManager == null) _lightManager = FindObjectOfType<LightManager>();
+                    if (_lightManager != null)
+                    {
+                        if (FiTimeHour != null) hour = (int)FiTimeHour.GetValue(_lightManager);
+                        if (FiTimeMin != null) min = (int)FiTimeMin.GetValue(_lightManager);
+                    }
+                }
+                catch { }
+                int day = CPlayerData.m_CurrentDay;
+                Broadcast(MsgType.DayTime, bw => { bw.Write(day); bw.Write(hour); bw.Write(min); });
+            }
+        }
+
+        // ------------------------------------------------ message handling
+
+        private void Dispatch(InMsg msg)
+        {
+            switch (msg.Type)
+            {
+                case MsgType.Hello:
+                {
+                    if (Role != CoopRole.Host) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        string version = br.ReadString();
+                        string name = br.ReadString();
+                        if (version != CoopPlugin.Version)
+                        {
+                            CoopPlugin.Log.LogWarning($"Version mismatch: {name} has {version}, we have {CoopPlugin.Version}");
+                            Send(msg.ConnId, MsgType.Bye, null);
+                            _net.Kick(msg.ConnId);
+                            break;
+                        }
+                        PeerNames[msg.ConnId] = name;
+                        _avatars.SetName(msg.ConnId, name);
+                        StatusLine = $"Hosting - {name} joined!";
+                        CoopPlugin.Log.LogInfo(name + " joined, sending world...");
+                        SendWorldTo(msg.ConnId);
+                    }
+                    break;
+                }
+                case MsgType.Welcome:
+                {
+                    if (Role != CoopRole.Client) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        br.ReadString(); // host plugin version (already matched by host)
+                        string hostName = br.ReadString();
+                        _saveExpected = br.ReadInt32();
+                        _hostSlot = br.ReadInt32();
+                        _bundleExpected = br.ReadInt32();
+                        PeerNames[msg.ConnId] = hostName;
+                        _avatars.SetName(msg.ConnId, hostName);
+                        _saveBuf = new MemoryStream(_saveExpected > 0 ? _saveExpected : 1024);
+                        _bundleBuf = new MemoryStream(_bundleExpected > 0 ? _bundleExpected : 16);
+                        StatusLine = $"Downloading {hostName}'s shop ({(_saveExpected + _bundleExpected) / 1024} KB)...";
+                    }
+                    break;
+                }
+                case MsgType.SaveChunk:
+                {
+                    if (Role != CoopRole.Client || _saveBuf == null) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        br.ReadInt32(); // offset (TCP keeps order; kept for sanity/debug)
+                        int len = br.ReadInt32();
+                        var bytes = br.ReadBytes(len);
+                        _saveBuf.Write(bytes, 0, bytes.Length);
+                    }
+                    break;
+                }
+                case MsgType.SaveDone:
+                {
+                    if (Role != CoopRole.Client || _saveBuf == null || _worldRequested) break;
+                    var data = _saveBuf.ToArray();
+                    _saveBuf = null;
+                    if ((_saveExpected >= 0 && data.Length != _saveExpected)
+                        || data.Length < 1024 || data[0] != (byte)'{')
+                    {
+                        ErrorLine = $"World download looked corrupted ({data.Length}/{_saveExpected} bytes) - try again.";
+                        Shutdown("bad download");
+                        break;
+                    }
+                    _pendingSave = data;
+                    StatusLine = "Shop received - waiting for mod data...";
+                    break;
+                }
+                case MsgType.BundleChunk:
+                {
+                    if (Role != CoopRole.Client || _bundleBuf == null) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        br.ReadInt32(); // offset
+                        int len = br.ReadInt32();
+                        var bytes = br.ReadBytes(len);
+                        _bundleBuf.Write(bytes, 0, bytes.Length);
+                    }
+                    break;
+                }
+                case MsgType.BundleDone:
+                {
+                    if (Role != CoopRole.Client || _worldRequested || _pendingSave == null) break;
+                    var bundle = _bundleBuf != null ? _bundleBuf.ToArray() : new byte[0];
+                    _bundleBuf = null;
+                    _worldRequested = true;
+                    StatusLine = "World received - loading...";
+                    try
+                    {
+                        SidecarTransfer.ApplyBundle(bundle, _hostSlot, SaveTransfer.CoopSlot);
+                    }
+                    catch (Exception e)
+                    {
+                        CoopPlugin.Log.LogWarning("Sidecar apply failed (continuing): " + e.Message);
+                    }
+                    SaveTransfer.ApplyAndLoad(_pendingSave);
+                    _pendingSave = null;
+                    break;
+                }
+                case MsgType.ShelfDelta:
+                {
+                    if (Role != CoopRole.Client) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                        _world.ApplyRemote(WorldSync.ReadEntries(br));
+                    break;
+                }
+                case MsgType.ShelfRequest:
+                {
+                    if (Role != CoopRole.Host) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                        _world.ApplyRemote(WorldSync.ReadEntries(br));
+                    break;
+                }
+                case MsgType.PriceList:
+                {
+                    if (Role != CoopRole.Client) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        int n = br.ReadUInt16();
+                        var prices = CPlayerData.m_SetItemPriceList;
+                        for (int i = 0; i < n && i < prices.Count; i++)
+                        {
+                            float v = br.ReadSingle();
+                            if (Math.Abs(prices[i] - v) > 0.0001f)
+                            {
+                                prices[i] = v;
+                                CEventManager.QueueEvent(new CEventPlayer_ItemPriceChanged((EItemType)i, v));
+                            }
+                        }
+                    }
+                    break;
+                }
+                case MsgType.PlayerState:
+                {
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        var pos = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
+                        float yaw = br.ReadSingle();
+                        float speed = br.ReadSingle();
+                        byte hold = br.ReadByte();
+                        _avatars.UpdateState(msg.ConnId, pos, yaw, speed, hold);
+                        if (PeerNames.TryGetValue(msg.ConnId, out var peerName))
+                            _avatars.SetName(msg.ConnId, peerName); // re-seed after scene loads clear avatars
+                        if (_gotStateFrom.Add(msg.ConnId))
+                        {
+                            string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : ("player " + msg.ConnId);
+                            CoopPlugin.Log.LogInfo($"Position link active with {who}");
+                            if (Role == CoopRole.Host) StatusLine = $"Hosting - {who} is in your shop!";
+                        }
+                    }
+                    break;
+                }
+                case MsgType.CoinSet:
+                {
+                    if (Role != CoopRole.Client) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        double coin = br.ReadDouble();
+                        float coinF = br.ReadSingle();
+                        if (!_loggedEconLink)
+                        {
+                            _loggedEconLink = true;
+                            CoopPlugin.Log.LogInfo("Economy link active (host wallet mirrored)");
+                        }
+                        if (Math.Abs(CPlayerData.m_CoinAmountDouble - coin) > 0.0001)
+                            CEventManager.QueueEvent(new CEventPlayer_SetCoin(coinF, coin));
+                    }
+                    break;
+                }
+                case MsgType.DayTime:
+                {
+                    if (Role != CoopRole.Client) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        int day = br.ReadInt32();
+                        int hour = br.ReadInt32();
+                        int min = br.ReadInt32();
+                        if (!_loggedTimeLink)
+                        {
+                            _loggedTimeLink = true;
+                            CoopPlugin.Log.LogInfo($"Time link active (Day {day} {hour:00}:{min:00})");
+                        }
+                        HostTimeLine = $"Day {day}  {hour:00}:{min:00}";
+                        CPlayerData.m_CurrentDay = day;
+                        try
+                        {
+                            if (_lightManager == null) _lightManager = FindObjectOfType<LightManager>();
+                            if (_lightManager != null)
+                            {
+                                FiTimeHour?.SetValue(_lightManager, hour);
+                                FiTimeMin?.SetValue(_lightManager, min);
+                                FiTimeMinFloat?.SetValue(_lightManager, (float)min);
+                            }
+                        }
+                        catch { }
+                    }
+                    break;
+                }
+                case MsgType.Emote:
+                {
+                    _avatars.ShowEmote(msg.ConnId);
+                    break;
+                }
+                case MsgType.Ping:
+                    Send(msg.ConnId, MsgType.Pong, null);
+                    break;
+                case MsgType.Pong:
+                    break;
+                case MsgType.Bye:
+                {
+                    if (Role == CoopRole.Client)
+                    {
+                        ErrorLine = "The host ended the session (or version mismatch - check both PCs run the same CardShopCoop).";
+                        Shutdown("host said bye");
+                    }
+                    else
+                    {
+                        _net.Kick(msg.ConnId);
+                    }
+                    break;
+                }
+            }
+        }
+
+        private void SendWorldTo(int connId)
+        {
+            byte[] payload;
+            byte[] bundle;
+            int hostSlot;
+            try
+            {
+                hostSlot = CSingleton<CGameManager>.Instance.m_CurrentSaveLoadSlotSelectedIndex;
+                payload = SaveTransfer.BuildHostPayload();
+                try { bundle = SidecarTransfer.BuildBundle(hostSlot); }
+                catch (Exception e)
+                {
+                    CoopPlugin.Log.LogWarning("Sidecar bundle failed (sending base save only): " + e.Message);
+                    bundle = new byte[0];
+                }
+            }
+            catch (Exception e)
+            {
+                ErrorLine = "Could not snapshot the shop: " + e.Message;
+                CoopPlugin.Log.LogError(e);
+                return;
+            }
+
+            Send(connId, MsgType.Welcome, bw =>
+            {
+                bw.Write(CoopPlugin.Version);
+                bw.Write(CoopPlugin.PlayerName.Value);
+                bw.Write(payload.Length);
+                bw.Write(hostSlot);
+                bw.Write(bundle.Length);
+            });
+
+            var net = _net;
+            new Thread(() =>
+            {
+                const int chunk = 128 * 1024;
+                try
+                {
+                    for (int off = 0; off < payload.Length; off += chunk)
+                    {
+                        int len = Math.Min(chunk, payload.Length - off);
+                        int o = off;
+                        net.Send(connId, Msg.Build(MsgType.SaveChunk, bw =>
+                        {
+                            bw.Write(o);
+                            bw.Write(len);
+                            bw.Write(payload, o, len);
+                        }));
+                    }
+                    net.Send(connId, Msg.Build(MsgType.SaveDone, bw => bw.Write(payload.Length)));
+
+                    for (int off = 0; off < bundle.Length; off += chunk)
+                    {
+                        int len = Math.Min(chunk, bundle.Length - off);
+                        int o = off;
+                        net.Send(connId, Msg.Build(MsgType.BundleChunk, bw =>
+                        {
+                            bw.Write(o);
+                            bw.Write(len);
+                            bw.Write(bundle, o, len);
+                        }));
+                    }
+                    net.Send(connId, Msg.Build(MsgType.BundleDone, bw => bw.Write(bundle.Length)));
+                }
+                catch (Exception e)
+                {
+                    CoopPlugin.Log.LogError("World send failed: " + e.Message);
+                }
+            }) { IsBackground = true, Name = "CoopWorldSend" }.Start();
+        }
+
+        private void OnGUI()
+        {
+            _ui.Draw(this, _net);
+        }
+    }
+}

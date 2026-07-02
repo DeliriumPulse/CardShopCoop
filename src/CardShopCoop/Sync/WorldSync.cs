@@ -1,0 +1,205 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using HarmonyLib;
+
+namespace CardShopCoop.Sync
+{
+    /// <summary>
+    /// Shelf-stock synchronization by snapshot diffing. Both sides load identical saves,
+    /// so a compartment is identified by (shelfKind, shelfIndex, compartmentIndex) into
+    /// ShelfManager's lists. Every 0.75s the world is snapshotted; whatever changed since
+    /// the last snapshot is reported. On the host those diffs are authoritative broadcasts
+    /// (they capture player actions, customers, workers - every mutation source, with no
+    /// per-interaction patches). On the client, diffs against the last host-applied state
+    /// are the local player's own actions and are sent to the host as requests.
+    /// </summary>
+    public class WorldSync
+    {
+        public struct Entry
+        {
+            public int Key;   // kind<<24 | shelfIdx<<8 | compIdx
+            public int Type;  // EItemType
+            public int Count;
+        }
+
+        private struct CompState { public int Type; public int Count; }
+
+        private readonly Dictionary<int, CompState> _last = new Dictionary<int, CompState>();
+        private float _timer;
+
+        /// <summary>Fired with locally-originated changes (host: broadcast; client: request).</summary>
+        public Action<List<Entry>> OnLocalChanges;
+
+        private static readonly FieldInfo FiWarehouseComps =
+            AccessTools.Field(typeof(WarehouseShelf), "m_ItemCompartmentList");
+
+        private static int Key(int kind, int shelf, int comp)
+        {
+            return (kind << 24) | ((shelf & 0xFFFF) << 8) | (comp & 0xFF);
+        }
+
+        public void Reset()
+        {
+            _last.Clear();
+            _timer = 0f;
+        }
+
+        public void Tick(float dt, bool inGame)
+        {
+            if (!inGame) return;
+            _timer += dt;
+            if (_timer < 0.75f) return;
+            _timer = 0f;
+
+            List<Entry> changes = null;
+            try
+            {
+                var sm = CSingleton<ShelfManager>.Instance;
+                if (sm == null) return;
+
+                for (int i = 0; i < sm.m_ShelfList.Count; i++)
+                {
+                    var shelf = sm.m_ShelfList[i];
+                    if (shelf == null) continue;
+                    var comps = shelf.GetItemCompartmentList();
+                    for (int j = 0; j < comps.Count; j++)
+                        Visit(Key(0, i, j), comps[j], ref changes);
+                }
+                for (int i = 0; i < sm.m_WarehouseShelfList.Count; i++)
+                {
+                    var wh = sm.m_WarehouseShelfList[i];
+                    if (wh == null) continue;
+                    var comps = FiWarehouseComps?.GetValue(wh) as List<ShelfCompartment>;
+                    if (comps == null) continue;
+                    for (int j = 0; j < comps.Count; j++)
+                        Visit(Key(1, i, j), comps[j], ref changes);
+                }
+            }
+            catch (Exception e)
+            {
+                CoopPlugin.Log.LogWarning("WorldSync snapshot: " + e.Message);
+                return;
+            }
+
+            if (changes != null && changes.Count > 0)
+                OnLocalChanges?.Invoke(changes);
+        }
+
+        private void Visit(int key, ShelfCompartment comp, ref List<Entry> changes)
+        {
+            if (comp == null) return;
+            int type = (int)comp.GetItemType();
+            int count = comp.GetItemCount();
+            if (_last.TryGetValue(key, out var st) && st.Type == type && st.Count == count)
+                return;
+            if (changes == null) changes = new List<Entry>();
+            if (changes.Count >= 512) return; // leave un-recorded; picked up next tick
+            _last[key] = new CompState { Type = type, Count = count };
+            changes.Add(new Entry { Key = key, Type = type, Count = count });
+        }
+
+        /// <summary>Apply authoritative states (client) or requested states (host).</summary>
+        public void ApplyRemote(List<Entry> entries)
+        {
+            var sm = CSingleton<ShelfManager>.Instance;
+            if (sm == null) return;
+            foreach (var e in entries)
+            {
+                try
+                {
+                    var comp = Resolve(sm, e.Key);
+                    if (comp == null) continue;
+                    ApplyCompartment(comp, e.Type, e.Count);
+                    _last[e.Key] = new CompState { Type = e.Type, Count = e.Count };
+                }
+                catch (Exception ex)
+                {
+                    CoopPlugin.Log.LogWarning($"WorldSync apply {e.Key:X}: {ex.Message}");
+                }
+            }
+        }
+
+        private static ShelfCompartment Resolve(ShelfManager sm, int key)
+        {
+            int kind = key >> 24;
+            int shelfIdx = (key >> 8) & 0xFFFF;
+            int compIdx = key & 0xFF;
+            if (kind == 0)
+            {
+                if (shelfIdx >= sm.m_ShelfList.Count) return null;
+                var comps = sm.m_ShelfList[shelfIdx]?.GetItemCompartmentList();
+                return comps != null && compIdx < comps.Count ? comps[compIdx] : null;
+            }
+            if (shelfIdx >= sm.m_WarehouseShelfList.Count) return null;
+            var whComps = FiWarehouseComps?.GetValue(sm.m_WarehouseShelfList[shelfIdx]) as List<ShelfCompartment>;
+            return whComps != null && compIdx < whComps.Count ? whComps[compIdx] : null;
+        }
+
+        private static void ApplyCompartment(ShelfCompartment comp, int type, int count)
+        {
+            int curType = (int)comp.GetItemType();
+            int cur = comp.GetItemCount();
+            if (cur == count && (curType == type || count == 0)) return;
+
+            if (curType != type && cur > 0)
+            {
+                Clear(comp);
+                cur = 0;
+            }
+            if (count > cur)
+            {
+                if (curType != type)
+                {
+                    comp.SetCompartmentItemType((EItemType)type);
+                    comp.CalculatePositionList();
+                }
+                comp.SpawnItem(count - cur, spawnFromFront: true);
+            }
+            else if (count < cur)
+            {
+                for (int k = 0; k < cur - count; k++)
+                {
+                    var item = comp.GetLastItem();
+                    if (item == null) break;
+                    comp.RemoveItem(item);
+                    ItemSpawnManager.DisableItem(item);
+                }
+            }
+        }
+
+        private static void Clear(ShelfCompartment comp)
+        {
+            for (int guard = 0; guard < 4096 && comp.GetItemCount() > 0; guard++)
+            {
+                var item = comp.GetLastItem();
+                if (item == null) break;
+                comp.RemoveItem(item);
+                ItemSpawnManager.DisableItem(item);
+            }
+        }
+
+        // ---- wire format ----
+
+        public static void WriteEntries(BinaryWriter bw, List<Entry> entries)
+        {
+            bw.Write((ushort)entries.Count);
+            foreach (var e in entries)
+            {
+                bw.Write(e.Key);
+                bw.Write(e.Type);
+                bw.Write((ushort)Math.Max(0, Math.Min(e.Count, ushort.MaxValue)));
+            }
+        }
+
+        public static List<Entry> ReadEntries(BinaryReader br)
+        {
+            int n = br.ReadUInt16();
+            var list = new List<Entry>(n);
+            for (int i = 0; i < n; i++)
+                list.Add(new Entry { Key = br.ReadInt32(), Type = br.ReadInt32(), Count = br.ReadUInt16() });
+            return list;
+        }
+    }
+}
