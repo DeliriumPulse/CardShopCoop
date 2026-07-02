@@ -41,14 +41,18 @@ namespace CardShopCoop.UI
                 GUI.Label(new Rect(Screen.width / 2f - 150f, 4f, 300f, 20f),
                     $"<color=#ffd54a>{core.HostTimeLine} - co-op</color>", style);
             }
-            if (core.RegisterLine.Length > 0)
+            if (core.RegisterLine.Length > 0 || core.PromptLine.Length > 0)
             {
                 var big = new GUIStyle(GUI.skin.label)
                 {
                     alignment = TextAnchor.MiddleCenter, richText = true, fontStyle = FontStyle.Bold
                 };
-                GUI.Label(new Rect(Screen.width / 2f - 300f, Screen.height * 0.62f, 600f, 30f),
-                    $"<size=18><color=#8ef58a>{core.RegisterLine}</color></size>", big);
+                if (core.PromptLine.Length > 0)
+                    GUI.Label(new Rect(Screen.width / 2f - 300f, Screen.height * 0.58f, 600f, 30f),
+                        $"<size=17><color=#7ecbff>{core.PromptLine}</color></size>", big);
+                if (core.RegisterLine.Length > 0)
+                    GUI.Label(new Rect(Screen.width / 2f - 300f, Screen.height * 0.63f, 600f, 30f),
+                        $"<size=18><color=#8ef58a>{core.RegisterLine}</color></size>", big);
             }
             if (!Visible) return;
 

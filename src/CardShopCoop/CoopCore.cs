@@ -31,7 +31,10 @@ namespace CardShopCoop
         private readonly WorldSync _world = new WorldSync();
         private readonly NpcSync _npcs = new NpcSync();
         private readonly CardShelfSync _cardShelves = new CardShelfSync();
+        private readonly Sync.RegisterMirror _registerMirror = new Sync.RegisterMirror();
         private float _npcSweepTimer;
+        private float _regStateTimer;
+        public string PromptLine = "";
         private readonly ConcurrentQueue<Action> _mainThread = new ConcurrentQueue<Action>();
         private UI.CoopUI _ui;
 
@@ -151,6 +154,8 @@ namespace CardShopCoop
             _world.Reset();
             _npcs.Reset();
             _cardShelves.Reset();
+            _registerMirror.Reset();
+            PromptLine = "";
             _lightManager = null;
             _playerTf = null;
             _playerCamTf = null;
@@ -351,6 +356,8 @@ namespace CardShopCoop
             _world.Reset();
             _npcs.Reset();
             _cardShelves.Reset();
+            _registerMirror.Reset();
+            PromptLine = "";
             Application.runInBackground = false; // back to the game's normal behavior
             Role = CoopRole.None;
             if (reason != null)
@@ -469,6 +476,18 @@ namespace CardShopCoop
             if (Role == CoopRole.Client)
             {
                 Guarded("npc-puppets", () => _npcs.TickPuppets(dt, InGameLevel()));
+                Guarded("register-mirror", () =>
+                {
+                    _registerMirror.Tick(dt);
+                    _regStateTimer += dt;
+                    if (_regStateTimer >= 0.5f && InGameLevel())
+                    {
+                        _regStateTimer = 0f;
+                        var tf = ResolvePlayer();
+                        int near = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, 7f, quiet: true) : -1;
+                        PromptLine = _registerMirror.PromptFor(near) ?? "";
+                    }
+                });
 
                 // The save-load path can leave inert vanilla customers standing around on
                 // the client even though their AI is suppressed; sweep them off so only
@@ -627,6 +646,17 @@ namespace CardShopCoop
                     var batch = _npcs.HostCollect(dt);
                     if (batch != null)
                         Broadcast(MsgType.NpcState, bw => bw.Write(batch));
+                });
+                Guarded("register-collect", () =>
+                {
+                    _regStateTimer += dt;
+                    if (_regStateTimer >= 0.5f)
+                    {
+                        _regStateTimer = 0f;
+                        var batch = Sync.RegisterServe.CollectStates();
+                        if (batch != null)
+                            Broadcast(MsgType.RegisterState, bw => bw.Write(batch));
+                    }
                 });
             }
 
@@ -1011,6 +1041,13 @@ namespace CardShopCoop
                         try { CPlayerData.SetCardPrice(card, price); }
                         finally { Patches.GamePatches.ApplyingRemotePrice = false; }
                     }
+                    break;
+                }
+                case MsgType.RegisterState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                        _registerMirror.Apply(Sync.RegisterServe.ReadStates(br));
                     break;
                 }
                 case MsgType.ServeRequest:

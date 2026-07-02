@@ -31,6 +31,7 @@ namespace CardShopCoop.Net
         CardShelfDelta = 24,   // host -> client: authoritative card display slots
         CardShelfRequest = 25, // client -> host: joiner placed/removed a display card
         CardPriceSet = 26,     // both ways: a card's marked price changed
+        RegisterState = 27,    // host -> client: per-counter checkout state + cart items
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>
