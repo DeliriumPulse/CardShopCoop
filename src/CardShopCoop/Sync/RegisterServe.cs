@@ -22,6 +22,9 @@ namespace CardShopCoop.Sync
         private static readonly FieldInfo FiTotalScanned = AccessTools.Field(typeof(InteractableCashierCounter), "m_TotalScannedItemCost");
         private static readonly MethodInfo MiNpcChange = AccessTools.Method(typeof(InteractableCashierCounter), "NPCEvaluateMoneyChange");
         private static readonly MethodInfo MiCreditCard = AccessTools.Method(typeof(InteractableCashierCounter), "EvaluateCreditCard");
+        private static readonly MethodInfo MiCheckChangeReady = AccessTools.Method(typeof(InteractableCashierCounter), "CheckChangeReady");
+        private static readonly MethodInfo MiSpaceBar = AccessTools.Method(typeof(InteractableCashierCounter), "OnPressSpaceBar");
+        private static readonly FieldInfo FiIsChangeReady = AccessTools.Field(typeof(InteractableCashierCounter), "m_IsChangeReady");
         private static readonly FieldInfo FiScannedCount = AccessTools.Field(typeof(Customer), "m_ItemScannedCount");
 
         /// <summary>Client: nearest cashier counter index within reach, or -1.</summary>
@@ -139,14 +142,23 @@ namespace CardShopCoop.Sync
                     bool isCard = FiIsUsingCard?.GetValue(counter) is bool card && card;
                     if (isCard)
                     {
+                        // card: EvaluateCreditCard completes the transaction in one step
                         double totalCost = FiTotalScanned?.GetValue(counter) is double d ? d : 0.0;
                         MiCreditCard?.Invoke(counter, new object[] { totalCost });
+                        CoopPlugin.Log.LogInfo($"{serverName} completed a card sale at register {counterIndex}");
+                        return "sale complete!";
                     }
-                    else
+                    // cash is two-phase, exactly like the worker automation:
+                    // 1) count exact change  2) hand it over (the SPACE action)
+                    bool changeReady = FiIsChangeReady?.GetValue(counter) is bool r && r;
+                    if (!changeReady)
                     {
                         MiNpcChange?.Invoke(counter, null);
+                        MiCheckChangeReady?.Invoke(counter, null);
+                        return "change counted - click again to hand it over";
                     }
-                    CoopPlugin.Log.LogInfo($"{serverName} completed a sale at register {counterIndex}");
+                    MiSpaceBar?.Invoke(counter, null);
+                    CoopPlugin.Log.LogInfo($"{serverName} completed a cash sale at register {counterIndex}");
                     return "sale complete!";
                 }
                 default:
@@ -162,7 +174,8 @@ namespace CardShopCoop.Sync
             public byte State;     // ECashierCounterState
             public byte Scanned;
             public byte Total;
-            public List<int> ItemTypes; // unscanned cart items (for the visual mirror)
+            public List<int> ItemTypes;      // unscanned cart items (for the visual mirror)
+            public List<Vector3> ItemLocal;  // their REAL positions, local to the counter
         }
 
         /// <summary>Host: 2 Hz snapshot of every counter that has a current customer.</summary>
@@ -194,17 +207,24 @@ namespace CardShopCoop.Sync
                     int n = Mathf.Min(items.Count, 12);
                     int written = 0;
                     var typeBuf = new List<int>(n);
+                    var posBuf = new List<Vector3>(n);
+                    var ct = counter.transform;
                     for (int k = 0; k < items.Count && written < n; k++)
                     {
                         var scan = items[k] != null ? items[k].m_InteractableScanItem : null;
                         if (scan != null && scan.IsNotScanned())
                         {
                             typeBuf.Add((int)items[k].GetItemType());
+                            posBuf.Add(ct.InverseTransformPoint(items[k].transform.position));
                             written++;
                         }
                     }
                     bw.Write((byte)typeBuf.Count);
-                    foreach (int t in typeBuf) bw.Write(t);
+                    for (int k = 0; k < typeBuf.Count; k++)
+                    {
+                        bw.Write(typeBuf[k]);
+                        bw.Write(posBuf[k].x); bw.Write(posBuf[k].y); bw.Write(posBuf[k].z);
+                    }
                     count++;
                 }
                 if (count == 0) return null;
@@ -230,7 +250,12 @@ namespace CardShopCoop.Sync
                 };
                 int n = br.ReadByte();
                 ci.ItemTypes = new List<int>(n);
-                for (int k = 0; k < n; k++) ci.ItemTypes.Add(br.ReadInt32());
+                ci.ItemLocal = new List<Vector3>(n);
+                for (int k = 0; k < n; k++)
+                {
+                    ci.ItemTypes.Add(br.ReadInt32());
+                    ci.ItemLocal.Add(new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle()));
+                }
                 list.Add(ci);
             }
             return list;
@@ -367,8 +392,10 @@ namespace CardShopCoop.Sync
                         var item = ItemSpawnManager.GetItem(t);
                         item.SetMesh(meshData.mesh, meshData.material, (EItemType)ci.ItemTypes[k],
                             meshData.meshSecondary, meshData.materialSecondary, meshData.materialList);
-                        // small grid on the counter top
-                        var local = new Vector3(-0.45f + (k % 4) * 0.3f, 1.02f, 0.05f + (k / 4) * 0.3f);
+                        // exactly where the item really sits on the host's counter
+                        var local = k < ci.ItemLocal.Count
+                            ? ci.ItemLocal[k]
+                            : new Vector3(-0.45f + (k % 4) * 0.3f, 1.02f, 0.05f + (k / 4) * 0.3f);
                         item.transform.position = t.TransformPoint(local);
                         item.transform.rotation = t.rotation;
                         item.gameObject.SetActive(true);
