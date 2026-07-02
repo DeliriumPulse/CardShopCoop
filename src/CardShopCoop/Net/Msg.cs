@@ -25,6 +25,7 @@ namespace CardShopCoop.Net
         Activity = 18,     // both ways: short activity ping ("opening a pack!")
         EconContrib = 19,  // client -> host: forwarded money/XP/fame earned by the joiner
         CardDelta = 20,    // both ways: a card entered/left the shared collection
+        NpcState = 21,     // host -> client: batched customer/worker puppet states
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>

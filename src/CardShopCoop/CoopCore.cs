@@ -26,6 +26,8 @@ namespace CardShopCoop
         private Transport _net;
         private readonly AvatarManager _avatars = new AvatarManager();
         private readonly WorldSync _world = new WorldSync();
+        private readonly NpcSync _npcs = new NpcSync();
+        private float _npcSweepTimer;
         private readonly ConcurrentQueue<Action> _mainThread = new ConcurrentQueue<Action>();
         private UI.CoopUI _ui;
 
@@ -134,6 +136,7 @@ namespace CardShopCoop
         {
             _avatars.Clear();
             _world.Reset();
+            _npcs.Reset();
             _lightManager = null;
             _playerTf = null;
             _playerCamTf = null;
@@ -329,6 +332,7 @@ namespace CardShopCoop
             _lastPriceHash = 0;
             _lastProgressSent = long.MinValue;
             _world.Reset();
+            _npcs.Reset();
             Application.runInBackground = false; // back to the game's normal behavior
             Role = CoopRole.None;
             if (reason != null)
@@ -415,6 +419,36 @@ namespace CardShopCoop
             // that feature only, never kill position sync for the whole session.
             Guarded("avatars", () => _avatars.Tick(dt));
             Guarded("world", () => _world.Tick(dt, Role != CoopRole.None && _net.ConnectionCount > 0 && InGameLevel()));
+
+            if (Role == CoopRole.Client)
+            {
+                Guarded("npc-puppets", () => _npcs.TickPuppets(dt, InGameLevel()));
+
+                // The save-load path can leave inert vanilla customers standing around on
+                // the client even though their AI is suppressed; sweep them off so only
+                // the host's mirrored puppets are visible.
+                _npcSweepTimer += dt;
+                if (_npcSweepTimer >= 2f && InGameLevel())
+                {
+                    _npcSweepTimer = 0f;
+                    Guarded("npc-sweep", () =>
+                    {
+                        var cm = FindObjectOfType<CustomerManager>();
+                        if (cm != null)
+                        {
+                            var list = cm.GetCustomerList();
+                            for (int i = 0; i < list.Count; i++)
+                                if (list[i] != null && list[i].gameObject.activeSelf)
+                                    list[i].gameObject.SetActive(false);
+                        }
+                        var workers = WorkerManager.GetWorkerList();
+                        if (workers != null)
+                            for (int i = 0; i < workers.Count; i++)
+                                if (workers[i] != null && workers[i].gameObject.activeSelf)
+                                    workers[i].gameObject.SetActive(false);
+                    });
+                }
+            }
 
             // position updates
             _stateTimer += dt;
@@ -527,6 +561,16 @@ namespace CardShopCoop
         private void HostTick(float dt)
         {
             if (_net.ConnectionCount == 0) return;
+
+            if (InGameLevel())
+            {
+                Guarded("npc-collect", () =>
+                {
+                    var batch = _npcs.HostCollect(dt);
+                    if (batch != null)
+                        Broadcast(MsgType.NpcState, bw => bw.Write(batch));
+                });
+            }
 
             _priceTimer += dt;
             if (_priceTimer >= 3f)
@@ -858,6 +902,13 @@ namespace CardShopCoop
                         }
                         finally { Patches.GamePatches.ApplyingRemoteCards = false; }
                     }
+                    break;
+                }
+                case MsgType.NpcState:
+                {
+                    if (Role != CoopRole.Client) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                        _npcs.ApplyBatch(br, InGameLevel());
                     break;
                 }
                 case MsgType.EconContrib:
