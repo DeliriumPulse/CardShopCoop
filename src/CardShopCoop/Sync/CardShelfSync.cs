@@ -102,6 +102,7 @@ namespace CardShopCoop.Sync
                 if (sm == null) return;
                 Walk(sm.m_CardShelfList, 2, ref changes);
                 Walk(sm.m_CardItemCombiShelfList, 3, ref changes);
+                Walk(sm.m_TournamentPrizeShelfList, 14, ref changes); // prize cards on display
             }
             catch (Exception e)
             {
@@ -203,6 +204,7 @@ namespace CardShopCoop.Sync
             CardShelf shelf = null;
             if (kind == 2 && shelfIdx < sm.m_CardShelfList.Count) shelf = sm.m_CardShelfList[shelfIdx];
             else if (kind == 3 && shelfIdx < sm.m_CardItemCombiShelfList.Count) shelf = sm.m_CardItemCombiShelfList[shelfIdx];
+            else if (kind == 14 && shelfIdx < sm.m_TournamentPrizeShelfList.Count) shelf = sm.m_TournamentPrizeShelfList[shelfIdx];
             if (shelf == null) return null;
             var comps = shelf.GetCardCompartmentList();
             return compIdx < comps.Count ? comps[compIdx] : null;
@@ -252,6 +254,7 @@ namespace CardShopCoop.Sync
             if (sm == null) return full;
             Collect(sm.m_CardShelfList, 2, full);
             Collect(sm.m_CardItemCombiShelfList, 3, full);
+            Collect(sm.m_TournamentPrizeShelfList, 14, full);
             return full;
         }
 

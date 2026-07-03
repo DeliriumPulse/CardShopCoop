@@ -72,6 +72,42 @@ namespace CardShopCoop.Patches
             // modded restock lists can be ordered differently per machine.
             Try(h, typeof(CPlayerData), "SetUnlockItemLicense",
                 prefix: null, postfix: new HarmonyMethod(typeof(GamePatches), nameof(LicenseUnlockPostfix)));
+
+            // Workbench crafting and storage quick-fill remove cards through a direct
+            // array write that never routes through ReduceCard - without this mirror
+            // the shared binder silently keeps cards the other side already consumed.
+            Try(h, typeof(CPlayerData), "ReduceCardUsingIndex",
+                prefix: null, postfix: new HarmonyMethod(typeof(GamePatches), nameof(ReduceCardIndexPostfix)));
+
+            // Domain sync modules register their own patch sets (each guarded internally).
+            TryModule("staff", Sync.StaffSync.ApplyPatches, h);
+            TryModule("shopstate", Sync.ShopStateSync.ApplyPatches, h);
+            TryModule("settings", Sync.SettingsSync.ApplyPatches, h);
+            TryModule("market", Sync.MarketSync.ApplyPatches, h);
+            TryModule("report", Sync.ReportSync.ApplyPatches, h);
+            TryModule("containers", Sync.ContainerSync.ApplyPatches, h);
+            TryModule("tournament", Sync.TournamentSync.ApplyPatches, h);
+            TryModule("grading", Sync.GradingSync.ApplyPatches, h);
+            TryModule("trades", Sync.TradeServe.ApplyPatches, h);
+            TryModule("playtables", Sync.PlayTableSync.ApplyPatches, h);
+        }
+
+        private static void TryModule(string name, Action<Harmony> apply, Harmony h)
+        {
+            try { apply(h); }
+            catch (Exception e) { CoopPlugin.Log.LogWarning($"Module patches failed ({name}): {e.Message}"); }
+        }
+
+        public static void ReduceCardIndexPostfix(int index, ECardExpansionType expansionType, bool isDestiny, int reduceAmount)
+        {
+            if (ApplyingRemoteCards || CoopCore.Role == CoopRole.None) return;
+            try
+            {
+                var card = CPlayerData.GetCardData(index, expansionType, isDestiny);
+                if (card != null)
+                    CoopCore.Instance?.ForwardCardDelta(card, reduceAmount, isAdd: false);
+            }
+            catch { }
         }
 
         public static bool BoxDestroyedPrefix(InteractablePackagingBox_Item __instance)

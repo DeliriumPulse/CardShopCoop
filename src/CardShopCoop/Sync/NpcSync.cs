@@ -56,6 +56,7 @@ namespace CardShopCoop.Sync
             IsSitting = 4,
             IsPlaying = 8,
             IsHoldingBox = 16,
+            Smelly = 32,
         }
 
         // ---------------- host: collect & serialize ----------------
@@ -116,8 +117,12 @@ namespace CardShopCoop.Sync
                 // name would churn the puppet through a bogus re-dress
                 var cc = c.m_CharacterCustom;
                 if (cc == null || string.IsNullOrEmpty(cc.CharacterName)) continue;
+                var flags = CollectFlags(c.m_Anim);
+                // smelly is sim state, not an animator bool - without it the joiner
+                // can't see the stink cloud the host (and the cleansers) react to
+                try { if (c.IsSmelly()) flags |= NpcFlags.Smelly; } catch { }
                 WriteEntry(chunks, hostTime, KindCustomer, (ushort)i, cc.CharacterName,
-                    c.transform, c.m_CurrentMoveSpeed, CollectFlags(c.m_Anim));
+                    c.transform, c.m_CurrentMoveSpeed, flags);
             }
 
             var workers = WorkerManager.GetWorkerList();
@@ -220,6 +225,7 @@ namespace CardShopCoop.Sync
             public GameObject Cash;
             public GameObject CardFan;
             public GameObject CardSingle;
+            public GameObject Smelly;
             public string CharName = "";
             public readonly Snap[] Buf = new Snap[4]; // ring buffer, newest at BufHead
             public int BufHead;
@@ -429,6 +435,7 @@ namespace CardShopCoop.Sync
                     Toggle(p.Cash, (p.Flags & NpcFlags.HandingOverCash) != 0);
                     Toggle(p.CardFan, (p.Flags & NpcFlags.IsPlaying) != 0);
                     Toggle(p.CardSingle, (p.Flags & NpcFlags.IsPlaying) != 0);
+                    Toggle(p.Smelly, (p.Flags & NpcFlags.Smelly) != 0);
                     p.AppliedFlags = (int)p.Flags;
                 }
             }
@@ -527,6 +534,7 @@ namespace CardShopCoop.Sync
                 p.Cash = cust.m_CustomerCash != null ? cust.m_CustomerCash.gameObject : null;
                 p.CardFan = cust.m_GameCardFanOut;
                 p.CardSingle = cust.m_GameCardSingle;
+                p.Smelly = cust.m_SmellyFX; // plain child FX object, survives the strip
                 try
                 {
                     Toggle(p.Bag, false); Toggle(p.Cash, false);

@@ -49,6 +49,22 @@ namespace CardShopCoop.Net
         BoxRemoved = 42,       // client -> host: joiner trashed a loose box (destroy officially)
         LicenseUnlock = 43,    // both ways: a product license was purchased (itemType+size identity)
         LicenseState = 44,     // host -> client: full unlocked-license set (identity-keyed)
+        StaffOp = 45,          // client -> host: hire/fire/manage a worker
+        StaffState = 46,       // host -> client: hired roster + worker settings
+        ShopOp = 47,           // client -> host: pay bill / unlock room / flip a sign
+        ShopState = 48,        // host -> client: bills + room unlocks + sign states
+        SettingsOp = 49,       // client -> host: deco / game event / counter toggles / table numbers
+        SettingsState = 50,    // host -> client: those settings, authoritative
+        MarketState = 51,      // host -> client: market % changes + price history (one shared market)
+        ReportState = 52,      // host -> client: end-of-day report + customer reviews
+        ContainerOp = 53,      // client -> host: container edits (storage/donation/openers/box bank)
+        ContainerState = 54,   // host -> client: container contents, authoritative
+        TournamentState = 55,  // host -> client: tournament schedule/rounds/signups
+        GradingOp = 56,        // client -> host: joiner submits cards for grading (matures on host days)
+        GradingState = 57,     // host -> client: pending grading submissions
+        TradeOp = 58,          // client -> host: joiner accepts/declines a counter trade/sell-in
+        TradeState = 59,       // host -> client: live trade/sell-in offer at a counter
+        TableState = 60,       // host -> client: play-table card layout digest (visuals)
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>

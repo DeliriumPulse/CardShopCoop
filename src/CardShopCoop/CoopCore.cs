@@ -38,6 +38,19 @@ namespace CardShopCoop
         private readonly ObjMoveSync _objMoves = new ObjMoveSync();
         private readonly BoxSync _boxes = new BoxSync();
         private readonly PopulationSync _population = new PopulationSync();
+
+        // domain sync modules (v0.15): each owns one game system end-to-end and talks
+        // through the standard SendOp/BroadcastState/HostApplyOp/ClientApplyState contract
+        private readonly GradingSync _grading = new GradingSync();
+        private readonly TradeServe _trades = new TradeServe();
+        private readonly PlayTableSync _tables = new PlayTableSync();
+        private readonly StaffSync _staff = new StaffSync();
+        private readonly ShopStateSync _shopState = new ShopStateSync();
+        private readonly SettingsSync _settings = new SettingsSync();
+        private readonly MarketSync _market = new MarketSync();
+        private readonly ReportSync _report = new ReportSync();
+        private readonly ContainerSync _containers = new ContainerSync();
+        private readonly TournamentSync _tournament = new TournamentSync();
         private string _lastShopNameSent;
         private float _shopNameTimer = -1.0f; // staggered phase (see _lightSyncTimer note)
         private readonly Sync.RegisterMirror _registerMirror = new Sync.RegisterMirror();
@@ -123,7 +136,7 @@ namespace CardShopCoop
         private bool _syncActive;
         private Action _actNetPump, _actAvatars, _actWorld, _actCardShelves, _actObjMoves,
             _actBoxes, _actPopulation, _actNpcPuppets, _actRegisterMirror, _actNpcSweep,
-            _actStateSend, _actNpcCollect, _actRegisterCollect;
+            _actStateSend, _actNpcCollect, _actRegisterCollect, _actModules;
         private CustomerManager _cmSweep;
         private bool _renamerHandled;
         private int _heldBoxFrame = -1;
@@ -217,6 +230,24 @@ namespace CardShopCoop
             _actStateSend = StateSendTick;
             _actNpcCollect = NpcCollectTick;
             _actRegisterCollect = RegisterCollectTick;
+
+            _grading.SendOp = w => Send(1, MsgType.GradingOp, w);
+            _grading.BroadcastState = w => Broadcast(MsgType.GradingState, w);
+            _trades.SendOp = w => Send(1, MsgType.TradeOp, w);
+            _trades.BroadcastState = w => Broadcast(MsgType.TradeState, w);
+            _tables.BroadcastState = w => Broadcast(MsgType.TableState, w);
+            _staff.SendOp = w => Send(1, MsgType.StaffOp, w);
+            _staff.BroadcastState = w => Broadcast(MsgType.StaffState, w);
+            _shopState.SendOp = w => Send(1, MsgType.ShopOp, w);
+            _shopState.BroadcastState = w => Broadcast(MsgType.ShopState, w);
+            _settings.SendOp = w => Send(1, MsgType.SettingsOp, w);
+            _settings.BroadcastState = w => Broadcast(MsgType.SettingsState, w);
+            _market.BroadcastState = w => Broadcast(MsgType.MarketState, w);
+            _report.BroadcastState = w => Broadcast(MsgType.ReportState, w);
+            _containers.SendOp = w => Send(1, MsgType.ContainerOp, w);
+            _containers.BroadcastState = w => Broadcast(MsgType.ContainerState, w);
+            _tournament.BroadcastState = w => Broadcast(MsgType.TournamentState, w);
+            _actModules = ModulesTick;
             SceneManager.sceneLoaded += OnSceneLoaded;
 
             var args = Environment.GetCommandLineArgs();
@@ -435,6 +466,7 @@ namespace CardShopCoop
             _boxes.Reset();
             _population.Reset();
             _registerMirror.Reset();
+            ModulesReset();
             PromptLine = "";
             _lightManager = null;
             _cmSweep = null;
@@ -455,6 +487,56 @@ namespace CardShopCoop
             return gm != null && gm.m_IsGameLevel;
         }
 
+        private void ModulesTick()
+        {
+            bool inGame = InGameLevel();
+            if (Role == CoopRole.Host)
+            {
+                _grading.HostTick(_dt, inGame);
+                _trades.HostTick(_dt, inGame);
+                _tables.HostTick(_dt, inGame);
+                _staff.HostTick(_dt, inGame);
+                _shopState.HostTick(_dt, inGame);
+                _settings.HostTick(_dt, inGame);
+                _market.HostTick(_dt, inGame);
+                _report.HostTick(_dt, inGame); // per-frame: its report-open flag fires outside the timer
+                _containers.HostTick(_dt, inGame);
+                _tournament.HostTick(_dt, inGame);
+            }
+            else if (Role == CoopRole.Client)
+            {
+                _trades.ClientTick(_dt, inGame); // offer countdown + accept/decline keys
+            }
+        }
+
+        private void ModulesReset()
+        {
+            _grading.Reset();
+            _trades.Reset();
+            _tables.Reset();
+            _staff.Reset();
+            _shopState.Reset();
+            _settings.Reset();
+            _market.Reset();
+            _report.Reset();
+            _containers.Reset();
+            _tournament.Reset();
+        }
+
+        private void ModulesForceResend()
+        {
+            _grading.ForceResend();
+            _trades.ForceResend();
+            _tables.ForceResend();
+            _staff.ForceResend();
+            _shopState.ForceResend();
+            _settings.ForceResend();
+            _market.ForceResend();
+            _report.ForceResend();
+            _containers.ForceResend();
+            _tournament.ForceResend();
+        }
+
         private void RegisterMirrorTick()
         {
             _registerMirror.Tick(_dt);
@@ -464,7 +546,7 @@ namespace CardShopCoop
                 _regStateTimer -= 0.5f;
                 var tf = ResolvePlayer();
                 int near = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, 3.5f, quiet: true) : -1;
-                PromptLine = _registerMirror.PromptFor(near) ?? "";
+                PromptLine = _registerMirror.PromptFor(near) ?? _trades.PromptFor(near) ?? "";
             }
         }
 
@@ -873,6 +955,7 @@ namespace CardShopCoop
             _boxes.Reset();
             _population.Reset();
             _registerMirror.Reset();
+            ModulesReset();
             PromptLine = "";
             _lastShopNameSent = null;
             _steamLobby.Leave();
@@ -942,6 +1025,10 @@ namespace CardShopCoop
                 {
                     var tf = ResolvePlayer();
                     int idx = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, 3.5f, quiet: !serveTap) : -1;
+                    // a live trade/sell-in offer owns this counter: TradeServe's own key
+                    // handling sends the TradeOp; a ServeRequest here would answer
+                    // "no customer" and stomp the trade feedback line
+                    if (idx >= 0 && _trades.HasOffer(idx)) return;
                     if (idx < 0)
                     {
                         if (serveTap) // don't nag every repeat while held
@@ -999,6 +1086,9 @@ namespace CardShopCoop
             while (_net.Connects.TryDequeue(out int joined))
             {
                 CoopPlugin.Log.LogInfo("Connection " + joined + " opened");
+                // fresh joiner: defeat every module's unchanged-hash gate so full
+                // authoritative state goes out on the next tick, not the next heal
+                if (Role == CoopRole.Host) ModulesForceResend();
             }
             while (_net.Disconnects.TryDequeue(out int left))
             {
@@ -1065,6 +1155,7 @@ namespace CardShopCoop
             Guarded("objmoves", _actObjMoves);
             Guarded("boxes", _actBoxes);
             Guarded("population", _actPopulation);
+            Guarded("modules", _actModules);
 
             if (Role == CoopRole.Client)
             {
@@ -1922,6 +2013,102 @@ namespace CardShopCoop
                             }
                         });
                     }
+                    break;
+                }
+                case MsgType.StaffOp:
+                {
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _staff.HostApplyOp(br);
+                    break;
+                }
+                case MsgType.StaffState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _staff.ClientApplyState(br);
+                    break;
+                }
+                case MsgType.ShopOp:
+                {
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _shopState.HostApplyOp(br);
+                    break;
+                }
+                case MsgType.ShopState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _shopState.ClientApplyState(br);
+                    break;
+                }
+                case MsgType.SettingsOp:
+                {
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _settings.HostApplyOp(br);
+                    break;
+                }
+                case MsgType.SettingsState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _settings.ClientApplyState(br);
+                    break;
+                }
+                case MsgType.MarketState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _market.ClientApplyState(br);
+                    break;
+                }
+                case MsgType.ReportState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _report.ClientApplyState(br);
+                    break;
+                }
+                case MsgType.ContainerOp:
+                {
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _containers.HostApplyOp(br);
+                    break;
+                }
+                case MsgType.ContainerState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _containers.ClientApplyState(br);
+                    break;
+                }
+                case MsgType.TournamentState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _tournament.ClientApplyState(br);
+                    break;
+                }
+                case MsgType.GradingOp:
+                {
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _grading.HostApplyOp(br);
+                    break;
+                }
+                case MsgType.GradingState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _grading.ClientApplyState(br);
+                    break;
+                }
+                case MsgType.TradeOp:
+                {
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _trades.HostApplyOp(br);
+                    break;
+                }
+                case MsgType.TradeState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _trades.ClientApplyState(br);
+                    break;
+                }
+                case MsgType.TableState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _tables.ClientApplyState(br);
                     break;
                 }
                 case MsgType.LightState:

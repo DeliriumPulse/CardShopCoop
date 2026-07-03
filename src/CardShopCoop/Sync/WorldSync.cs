@@ -95,6 +95,25 @@ namespace CardShopCoop.Sync
                     for (int j = 0; j < comps.Count; j++)
                         Visit(Key(1, i, j), comps[j], ref changes);
                 }
+                // combi card shelves and tournament prize shelves carry ITEM compartments
+                // too (the bottom half) - they live in their own manager lists, so the
+                // walks above never saw them
+                for (int i = 0; i < sm.m_CardItemCombiShelfList.Count; i++)
+                {
+                    var combi = sm.m_CardItemCombiShelfList[i];
+                    if (combi == null) continue;
+                    var comps = combi.GetItemCompartmentList();
+                    for (int j = 0; j < comps.Count; j++)
+                        Visit(Key(3, i, j), comps[j], ref changes);
+                }
+                for (int i = 0; i < sm.m_TournamentPrizeShelfList.Count; i++)
+                {
+                    var prize = sm.m_TournamentPrizeShelfList[i];
+                    if (prize == null) continue;
+                    var comps = prize.GetItemCompartmentList();
+                    for (int j = 0; j < comps.Count; j++)
+                        Visit(Key(14, i, j), comps[j], ref changes);
+                }
             }
             catch (Exception e)
             {
@@ -149,6 +168,18 @@ namespace CardShopCoop.Sync
             {
                 if (shelfIdx >= sm.m_ShelfList.Count) return null;
                 var comps = sm.m_ShelfList[shelfIdx]?.GetItemCompartmentList();
+                return comps != null && compIdx < comps.Count ? comps[compIdx] : null;
+            }
+            if (kind == 3)
+            {
+                if (shelfIdx >= sm.m_CardItemCombiShelfList.Count) return null;
+                var comps = sm.m_CardItemCombiShelfList[shelfIdx]?.GetItemCompartmentList();
+                return comps != null && compIdx < comps.Count ? comps[compIdx] : null;
+            }
+            if (kind == 14)
+            {
+                if (shelfIdx >= sm.m_TournamentPrizeShelfList.Count) return null;
+                var comps = sm.m_TournamentPrizeShelfList[shelfIdx]?.GetItemCompartmentList();
                 return comps != null && compIdx < comps.Count ? comps[compIdx] : null;
             }
             if (shelfIdx >= sm.m_WarehouseShelfList.Count) return null;
