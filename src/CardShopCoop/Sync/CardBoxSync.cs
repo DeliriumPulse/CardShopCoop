@@ -221,7 +221,7 @@ namespace CardShopCoop.Sync
         }
 
         /// <summary>Host: dispatch a client op (report / collect / removed).</summary>
-        public void HostApplyOp(BinaryReader br)
+        public void HostApplyOp(BinaryReader br, int connId)
         {
             if (CoopCore.Role != CoopRole.Host) return;
             byte kind = br.ReadByte();
@@ -229,7 +229,7 @@ namespace CardShopCoop.Sync
             {
                 case OpReport: HostApplyReport(br); break;
                 case OpCollect: HostApplyCollect(br); break;
-                case OpRemoved: HostApplyRemoved(br); break;
+                case OpRemoved: HostApplyRemoved(br, connId); break;
                 default:
                     CoopPlugin.Log.LogWarning($"CardBoxSync: unknown op {kind}");
                     break;
@@ -301,11 +301,14 @@ namespace CardShopCoop.Sync
             ForceResend();          // the joiner's mirror updates on the next tick
         }
 
-        private void HostApplyRemoved(BinaryReader br)
+        private void HostApplyRemoved(BinaryReader br, int connId)
         {
             int index = br.ReadByte();
             int cardCount = br.ReadByte();
             int cardsHash = br.ReadInt32();
+            // shared budget with item/furn boxes: a reloading client's world-teardown
+            // echoes ALL THREE box lists as removals in one burst
+            if (BoxSync.RemovalFlooded(connId, "card-box")) return;
             var box = FindBox(index, cardCount, cardsHash);
             if (box == null || IsLocallyCarried(box)) return;
             ApplyingRemote = true;

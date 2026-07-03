@@ -150,6 +150,11 @@ namespace CardShopCoop
         /// that window is a player action to forward.</summary>
         public static bool ClientReloading;
         private float _reloadGrace;
+        /// <summary>The pre-scene-load slice of a reload: the OLD world is still live,
+        /// so client box reports would describe a world about to be torn down. Stale
+        /// reports can shrink host box contents - hold them until the new scene lands
+        /// (once the grace is armed, fresh reports flow again immediately).</summary>
+        private bool ClientPreloadHold => ClientReloading && _reloadGrace <= 0f;
         private readonly System.Collections.Generic.List<InMsg> _dispatchBuf
             = new System.Collections.Generic.List<InMsg>(64);
         private readonly System.Collections.Generic.HashSet<long> _dispatchSeen
@@ -253,7 +258,7 @@ namespace CardShopCoop
             _actBoxes = () =>
             {
                 if (Role == CoopRole.Host) _boxes.HostTick(_dt, _syncActive);
-                else if (Role == CoopRole.Client) _boxes.ClientTick(_dt, _syncActive);
+                else if (Role == CoopRole.Client) _boxes.ClientTick(_dt, _syncActive && !ClientPreloadHold);
             };
             _actPopulation = () => { if (Role == CoopRole.Host) _population.HostTick(_dt, _syncActive); };
             _actNpcPuppets = () => _npcs.TickPuppets(_dt, InGameLevel());
@@ -564,8 +569,8 @@ namespace CardShopCoop
             else if (Role == CoopRole.Client)
             {
                 _trades.ClientTick(_dt, inGame); // offer countdown + accept/decline keys
-                _cardBoxes.ClientTick(_dt, inGame); // carried transitions + box moves
-                _furnBoxes.ClientTick(_dt, inGame);
+                _cardBoxes.ClientTick(_dt, inGame && !ClientPreloadHold); // carried transitions + box moves
+                _furnBoxes.ClientTick(_dt, inGame && !ClientPreloadHold);
                 // content mods register their products SECONDS after the scene loads
                 // (and per-save: a host mid-tutorial has none yet) - keep re-digesting
                 // as our catalog changes so the comparison never goes stale
@@ -1911,11 +1916,16 @@ namespace CardShopCoop
                     {
                         CoopPlugin.Log.LogWarning("Sidecar apply failed (continuing): " + e.Message);
                     }
-                    // the game's world-(re)load DESTROYS every existing box via their
-                    // OnDestroyed - on a REJOIN those fire while still "in game" and a
-                    // 1.0.7 client forwarded all ~250 as player trash actions, wiping
-                    // the HOST's boxes (first field report). Suppress until settled.
+                    // the game's world-(re)load teardown (LoadInteractableObjectData ->
+                    // RestockManager.DestroyAllObject) destroys every existing box via
+                    // OnDestroyed - if a world was live (rejoin, or solo save loaded
+                    // while waiting for the invite) a 1.0.7 client forwarded all ~250
+                    // as player trash actions, wiping the HOST's boxes (first field
+                    // report). Suppress until settled. Grace must reset to 0 here: a
+                    // leftover countdown from an aborted join would drain the flag
+                    // DURING the ~16s async load and the massacre would slip through
                     ClientReloading = true;
+                    _reloadGrace = 0f;
                     SaveTransfer.ApplyAndLoad(_pendingSave);
                     _pendingSave = null;
                     break;
@@ -2348,11 +2358,11 @@ namespace CardShopCoop
                     if (Role != CoopRole.Host || !InGameLevel()) break;
                     using (var br = Msg.Reader(msg.Payload))
                     {
-                        int idx = br.ReadInt32();
+                        int id = br.ReadInt32();
                         int type = br.ReadInt32();
                         string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : "player";
-                        CoopPlugin.Log.LogInfo($"{who} trashed box {idx} ({(EItemType)type})");
-                        _boxes.HostApplyRemoval(idx, type);
+                        CoopPlugin.Log.LogInfo($"{who} trashed box id {id} ({(EItemType)type})");
+                        _boxes.HostApplyRemoval(id, type, msg.ConnId);
                     }
                     break;
                 }
@@ -2512,7 +2522,7 @@ namespace CardShopCoop
                 case MsgType.CardBoxOp:
                 {
                     if (Role != CoopRole.Host || !InGameLevel()) break;
-                    using (var br = Msg.Reader(msg.Payload)) _cardBoxes.HostApplyOp(br);
+                    using (var br = Msg.Reader(msg.Payload)) _cardBoxes.HostApplyOp(br, msg.ConnId);
                     break;
                 }
                 case MsgType.CardBoxState:
@@ -2524,7 +2534,7 @@ namespace CardShopCoop
                 case MsgType.FurnBoxOp:
                 {
                     if (Role != CoopRole.Host || !InGameLevel()) break;
-                    using (var br = Msg.Reader(msg.Payload)) _furnBoxes.HostApplyOp(br);
+                    using (var br = Msg.Reader(msg.Payload)) _furnBoxes.HostApplyOp(br, msg.ConnId);
                     break;
                 }
                 case MsgType.FurnBoxState:

@@ -318,7 +318,7 @@ namespace CardShopCoop.Sync
         }
 
         /// <summary>Host: dispatch a client op (report / place / removed).</summary>
-        public void HostApplyOp(BinaryReader br)
+        public void HostApplyOp(BinaryReader br, int connId)
         {
             if (CoopCore.Role != CoopRole.Host) return;
             byte kind = br.ReadByte();
@@ -326,7 +326,7 @@ namespace CardShopCoop.Sync
             {
                 case OpReport: HostApplyReport(br); break;
                 case OpPlace: HostApplyPlace(br); break;
-                case OpRemoved: HostApplyRemoved(br); break;
+                case OpRemoved: HostApplyRemoved(br, connId); break;
                 default:
                     CoopPlugin.Log.LogWarning($"FurnBoxSync: unknown op {kind}");
                     break;
@@ -399,11 +399,15 @@ namespace CardShopCoop.Sync
             _lastHostHash = 0;
         }
 
-        private void HostApplyRemoved(BinaryReader br)
+        private void HostApplyRemoved(BinaryReader br, int connId)
         {
             int idx = br.ReadByte();
             int wireType = br.ReadInt32();
             int nameHash = br.ReadInt32();
+            // shared budget with item/card boxes: a reloading client's world-teardown
+            // echoes ALL THREE box lists as removals in one burst - and each furn-box
+            // removal would take its boxed FURNITURE with it
+            if (BoxSync.RemovalFlooded(connId, "furniture-box")) return;
             var box = FindBox(idx, wireType, nameHash);
             if (box == null || IsLocallyCarried(box)) return;
             // sell/trash: OnDestroyed with m_BoxedObject still set kills the furniture

@@ -8,18 +8,24 @@ namespace CardShopCoop.Sync
 {
     /// <summary>
     /// Mirrors loose delivery/packaging boxes (item boxes) between host and client.
-    /// The host's RestockManager list is the single source of truth, broadcast by index
-    /// every 1.5s; the client reconciles its own live list to match, spawning via the
+    /// The host's RestockManager list is the single source of truth, broadcast every
+    /// 1.5s; the client reconciles its own live list to match, spawning via the
     /// game's own RestockManager.SpawnPackageBoxItem (the exact save-load recipe) and
     /// despawning via the box's own OnDestroyed. Client-side changes (dispensing to a
     /// shelf, carrying, trashing) are detected against the last applied state and sent
     /// as requests the host applies and echoes. The joiner's restock ORDERS are forwarded
     /// separately (GamePatches) so deliveries always spawn host-side, officially.
+    ///
+    /// Every box carries a host-assigned STABLE ID. Identity-by-list-index looked fine
+    /// until any single removal shifted every later index: the client's reconcile then
+    /// destroyed/respawned the whole shifted tail - including the box in a player's
+    /// HANDS (second field report). IDs make removals surgical.
     /// </summary>
     public class BoxSync
     {
         public struct Entry
         {
+            public ushort Id;    // host-assigned, stable for the box's lifetime
             public int Type;
             public int Count;
             public bool IsBig;
@@ -40,13 +46,31 @@ namespace CardShopCoop.Sync
         private static readonly System.Reflection.FieldInfo FiStoredList =
             AccessTools.Field(typeof(ShelfCompartment), "m_StoredItemList");
 
-        private readonly List<Entry> _lastApplied = new List<Entry>(); // client: host truth
-        private readonly HashSet<int> _carriedLastTick = new HashSet<int>();
-        private readonly HashSet<int> _remoteCarried = new HashSet<int>();   // host: client-held boxes
-        private readonly Dictionary<int, double> _recentlyReleased = new Dictionary<int, double>(); // client: ignore stale carried echoes
-        private readonly Dictionary<int, double> _locallyTouched = new Dictionary<int, double>();   // client: my recent edits beat stale echoes
-        private readonly HashSet<int> _hostCarriedLastTick = new HashSet<int>();                    // host: own-carry transitions
-        private readonly Dictionary<int, double> _hostRecentlyReleased = new Dictionary<int, double>(); // host: just set it down; stale client reports must not stomp it
+        // client: host truth + id<->box maps (boxes spawned by our apply, or adopted
+        // from the save-load population by type/order at first snapshot)
+        private readonly List<Entry> _lastApplied = new List<Entry>();
+        private readonly Dictionary<ushort, InteractablePackagingBox_Item> _byId =
+            new Dictionary<ushort, InteractablePackagingBox_Item>();
+        private readonly Dictionary<InteractablePackagingBox_Item, ushort> _idOf =
+            new Dictionary<InteractablePackagingBox_Item, ushort>();
+        private readonly HashSet<ushort> _carriedLastTick = new HashSet<ushort>();
+        private readonly Dictionary<ushort, double> _recentlyReleased = new Dictionary<ushort, double>(); // client: ignore stale carried echoes
+        private readonly Dictionary<ushort, double> _locallyTouched = new Dictionary<ushort, double>();   // client: my recent edits beat stale echoes
+        private readonly HashSet<ushort> _snapshotIds = new HashSet<ushort>();      // scratch
+        private readonly List<ushort> _removeScratch = new List<ushort>();          // scratch
+        private readonly List<InteractablePackagingBox_Item> _orphanScratch =
+            new List<InteractablePackagingBox_Item>();                              // scratch
+
+        // host: id assignment + per-client state
+        private readonly Dictionary<InteractablePackagingBox_Item, ushort> _hostIds =
+            new Dictionary<InteractablePackagingBox_Item, ushort>();
+        private readonly Dictionary<ushort, InteractablePackagingBox_Item> _hostById =
+            new Dictionary<ushort, InteractablePackagingBox_Item>();
+        private ushort _nextId = 1; // 0 = "unassigned"
+        private readonly HashSet<ushort> _remoteCarried = new HashSet<ushort>();    // host: client-held boxes
+        private readonly HashSet<ushort> _hostCarriedLastTick = new HashSet<ushort>();
+        private readonly Dictionary<ushort, double> _hostRecentlyReleased = new Dictionary<ushort, double>(); // host: just set it down; stale client reports must not stomp it
+
         private float _timer;
         private int _lastHostHash;
         private float _hostHeal;
@@ -55,7 +79,7 @@ namespace CardShopCoop.Sync
 
         public Action<List<Entry>> OnHostSnapshot;   // host: broadcast
         public Action<List<Entry>> OnClientChanges;  // client: request
-        public Action<int, int> OnLocalRemoved;      // client: (index, type) I trashed a box
+        public Action<int, int> OnLocalRemoved;      // client: (id, type) I trashed a box
 
         /// <summary>Wired by CoopCore to the OnDestroyed patch: a box was destroyed by
         /// LOCAL gameplay (trash bin, storage) - not by sync reconciliation.</summary>
@@ -68,12 +92,19 @@ namespace CardShopCoop.Sync
         public void Reset()
         {
             _lastApplied.Clear();
+            _byId.Clear();
+            _idOf.Clear();
             _carriedLastTick.Clear();
-            _remoteCarried.Clear();
             _recentlyReleased.Clear();
             _locallyTouched.Clear();
+            _hostIds.Clear();
+            _hostById.Clear();
+            _nextId = 1;
+            _remoteCarried.Clear();
             _hostCarriedLastTick.Clear();
             _hostRecentlyReleased.Clear();
+            _remWindowStart.Clear();
+            _remWindowCount.Clear();
             _timer = -0.6f; // staggered phase vs the other snapshot engines
             _lastHostHash = 0;
             _hostHeal = 0f;
@@ -125,6 +156,33 @@ namespace CardShopCoop.Sync
 
         // ---------------- host ----------------
 
+        private ushort HostIdFor(InteractablePackagingBox_Item box)
+        {
+            if (_hostIds.TryGetValue(box, out ushort id)) return id;
+            do { id = _nextId++; if (_nextId == 0) _nextId = 1; }
+            while (id == 0 || _hostById.ContainsKey(id));
+            _hostIds[box] = id;
+            _hostById[id] = box;
+            return id;
+        }
+
+        private void HostPruneDead()
+        {
+            _removeScratch.Clear();
+            foreach (var kv in _hostById)
+                if (kv.Value == null) _removeScratch.Add(kv.Key);
+            for (int i = 0; i < _removeScratch.Count; i++)
+            {
+                ushort id = _removeScratch[i];
+                if (_hostById.TryGetValue(id, out var dead) && !ReferenceEquals(dead, null))
+                    _hostIds.Remove(dead); // Unity fake-null: reference still hashes
+                _hostById.Remove(id);
+                _remoteCarried.Remove(id);
+                _hostCarriedLastTick.Remove(id);
+                _hostRecentlyReleased.Remove(id);
+            }
+        }
+
         public void HostTick(float dt, bool active)
         {
             if (!active || Rm() == null) return;
@@ -137,14 +195,15 @@ namespace CardShopCoop.Sync
                 for (int i = 0; i < scan.Count; i++)
                 {
                     if (scan[i] == null) continue;
+                    ushort id = HostIdFor(scan[i]);
                     if (IsLocallyCarried(scan[i]))
                     {
-                        if (_hostCarriedLastTick.Add(i)) force = true;
+                        if (_hostCarriedLastTick.Add(id)) force = true;
                     }
-                    else if (_hostCarriedLastTick.Remove(i))
+                    else if (_hostCarriedLastTick.Remove(id))
                     {
                         force = true;
-                        _hostRecentlyReleased[i] = Time.realtimeSinceStartupAsDouble;
+                        _hostRecentlyReleased[id] = Time.realtimeSinceStartupAsDouble;
                     }
                 }
             }
@@ -161,7 +220,8 @@ namespace CardShopCoop.Sync
                 {
                     if (boxes[i] == null) continue;
                     var e = Snapshot(boxes[i]);
-                    if (_remoteCarried.Contains(i)) e.Carried = true; // a client holds it
+                    e.Id = HostIdFor(boxes[i]);
+                    if (_remoteCarried.Contains(e.Id)) e.Carried = true; // a client holds it
                     list.Add(e);
                 }
                 // skip identical snapshots (boxes sit still most of the time); a slow
@@ -170,6 +230,7 @@ namespace CardShopCoop.Sync
                 for (int i = 0; i < list.Count; i++)
                 {
                     var e = list[i];
+                    hash = hash * 31 + e.Id;
                     hash = hash * 31 + e.Type;
                     hash = hash * 31 + e.Count;
                     hash = hash * 31 + ((e.IsBig ? 1 : 0) | (e.IsOpen ? 2 : 0) | (e.Carried ? 4 : 0) | (e.Settled ? 8 : 0));
@@ -179,6 +240,7 @@ namespace CardShopCoop.Sync
                 _hostHeal += 1.5f;
                 if (hash == _lastHostHash && _hostHeal < 10f) return;
                 _lastHostHash = hash;
+                if (_hostHeal >= 10f) HostPruneDead(); // slow housekeeping on the heal beat
                 _hostHeal = 0f;
                 OnHostSnapshot?.Invoke(list);
             }
@@ -188,21 +250,20 @@ namespace CardShopCoop.Sync
         /// <summary>Host: a client asked for box states (their local edits).</summary>
         public void HostApplyRequest(List<Entry> entries)
         {
-            var boxes = LiveBoxes();
-            for (int i = 0; i < entries.Count && i < boxes.Count; i++)
+            for (int i = 0; i < entries.Count; i++)
             {
-                var box = boxes[i];
-                if (box == null) continue;
-                // type must match: index may have shifted between snapshot and request
-                if ((int)box.m_ItemCompartment.GetItemType() != entries[i].Type) continue;
+                var e = entries[i];
+                if (!_hostById.TryGetValue(e.Id, out var box) || box == null) continue;
+                // type sanity: a mangled or ancient request must not restyle a box
+                if ((int)box.m_ItemCompartment.GetItemType() != e.Type) continue;
                 if (IsLocallyCarried(box)) continue; // never stomp a box in the host's hands
                 // just set down: a report the client built while we still carried it is
                 // stale by definition - the race that teleported boxes mid-restock
-                if (_hostRecentlyReleased.TryGetValue(i, out double rel)
+                if (_hostRecentlyReleased.TryGetValue(e.Id, out double rel)
                     && Time.realtimeSinceStartupAsDouble - rel < 6.0) continue;
-                if (entries[i].Carried) _remoteCarried.Add(i);
-                else _remoteCarried.Remove(i);
-                ApplyToBox(box, entries[i]);
+                if (e.Carried) _remoteCarried.Add(e.Id);
+                else _remoteCarried.Remove(e.Id);
+                ApplyToBox(box, e);
             }
             // fan the change out to everyone NOW - with 3+ players the other
             // clients otherwise wait out the periodic tick and the hash gate.
@@ -212,43 +273,54 @@ namespace CardShopCoop.Sync
             _lastHostHash = 0;
         }
 
-        private double _removalWindowStart;
-        private int _removalWindowCount;
+        private static readonly Dictionary<int, double> _remWindowStart = new Dictionary<int, double>();
+        private static readonly Dictionary<int, int> _remWindowCount = new Dictionary<int, int>();
 
-        /// <summary>Host: a client trashed a box - destroy the real one so the next
-        /// broadcast doesn't resurrect it at its old spot. Flood-guarded: a client
-        /// whose world is reloading can echo its ENTIRE box population as "trashed"
-        /// (old clients did exactly that) - no human trashes 5 boxes in 2 seconds.</summary>
-        public void HostApplyRemoval(int index, int type)
+        /// <summary>Shared by ALL box-family modules (item/card/furniture): true if this
+        /// client's removal budget for the current 2s window is spent. No human trashes
+        /// 5 boxes in 2 seconds - but a client whose game is re-running its world-load
+        /// teardown echoes its ENTIRE box population, all three lists, as "trashed"
+        /// (first field incident: 250 boxes in 10ms). Per-connection, so one player's
+        /// flood never eats another player's legitimate trash.</summary>
+        public static bool RemovalFlooded(int connId, string channel)
         {
             double nowT = Time.realtimeSinceStartupAsDouble;
-            if (nowT - _removalWindowStart > 2.0)
+            if (!_remWindowStart.TryGetValue(connId, out double start) || nowT - start > 2.0)
             {
-                _removalWindowStart = nowT;
-                _removalWindowCount = 0;
+                _remWindowStart[connId] = nowT;
+                _remWindowCount[connId] = 0;
             }
-            if (++_removalWindowCount > 4)
-            {
-                if (_removalWindowCount == 5)
-                    CoopPlugin.Log.LogWarning("ignoring box-removal flood from a client (reload echo, not gameplay)");
-                return;
-            }
-            var boxes = LiveBoxes();
-            if (index < 0 || index >= boxes.Count || boxes[index] == null) return;
-            if ((int)boxes[index].m_ItemCompartment.GetItemType() != type) return;
-            if (IsLocallyCarried(boxes[index])) return;
-            ApplyingRemote = true;
-            try { boxes[index].OnDestroyed(); }
-            catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync removal: " + e.Message); }
-            finally { ApplyingRemote = false; }
-            _remoteCarried.Clear(); // indices shifted; holds re-assert within a tick
+            int c = _remWindowCount[connId] = _remWindowCount[connId] + 1;
+            if (c <= 4) return false;
+            if (c == 5 || c % 100 == 0)
+                CoopPlugin.Log.LogWarning($"ignoring {channel} removal flood from client {connId} (reload echo, not gameplay)");
+            return true;
         }
 
-        /// <summary>Host: the host player destroyed a box locally - the index-keyed
-        /// client-held markers have all shifted.</summary>
+        /// <summary>Host: a client trashed a box - destroy the real one so the next
+        /// broadcast doesn't resurrect it at its old spot.</summary>
+        public void HostApplyRemoval(int id, int type, int connId)
+        {
+            if (RemovalFlooded(connId, "item-box")) return;
+            if (!_hostById.TryGetValue((ushort)id, out var box) || box == null) return;
+            if ((int)box.m_ItemCompartment.GetItemType() != type) return;
+            if (IsLocallyCarried(box)) return;
+            ApplyingRemote = true;
+            try { box.OnDestroyed(); }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync removal: " + e.Message); }
+            finally { ApplyingRemote = false; }
+            _hostIds.Remove(box);
+            _hostById.Remove((ushort)id);
+            _remoteCarried.Remove((ushort)id);
+            _hostCarriedLastTick.Remove((ushort)id);
+            _hostRecentlyReleased.Remove((ushort)id);
+        }
+
+        /// <summary>Host: the host player destroyed a box locally - drop its id now
+        /// rather than waiting for the heal-beat prune.</summary>
         public void HostNotifyLocalDestroyed()
         {
-            _remoteCarried.Clear();
+            HostPruneDead();
         }
 
         /// <summary>Client: the local player destroyed a box (trash bin etc.). Tell the
@@ -256,15 +328,21 @@ namespace CardShopCoop.Sync
         /// echo brings it back.</summary>
         public void NotifyLocalDestroyed(InteractablePackagingBox_Item box)
         {
-            int idx = LiveBoxes().IndexOf(box);
-            if (idx < 0) return;
+            if (!_idOf.TryGetValue(box, out ushort id)) return; // never synced; host doesn't know it
             int type = 0;
             try { type = (int)box.m_ItemCompartment.GetItemType(); } catch { }
-            if (idx < _lastApplied.Count) _lastApplied.RemoveAt(idx);
-            _carriedLastTick.Clear();   // index-keyed trackers all shifted;
-            _locallyTouched.Clear();    // they re-establish within a tick
-            _recentlyReleased.Clear();
-            OnLocalRemoved?.Invoke(idx, type);
+            _idOf.Remove(box);
+            _byId.Remove(id);
+            _carriedLastTick.Remove(id);
+            _locallyTouched.Remove(id);
+            _recentlyReleased.Remove(id);
+            for (int i = 0; i < _lastApplied.Count; i++)
+            {
+                if (_lastApplied[i].Id != id) continue;
+                _lastApplied.RemoveAt(i);
+                break;
+            }
+            OnLocalRemoved?.Invoke(id, type);
         }
 
         // ---------------- client ----------------
@@ -279,50 +357,92 @@ namespace CardShopCoop.Sync
 
         private void ClientApplyInner(List<Entry> hostList)
         {
-            var boxes = LiveBoxes();
-
-            // shrink extras (from the end, so indices stay aligned)
-            for (int i = boxes.Count - 1; i >= hostList.Count; i--)
+            // drop map entries whose box died locally (reconcile destroys, scene churn)
+            _removeScratch.Clear();
+            foreach (var kv in _byId)
+                if (kv.Value == null) _removeScratch.Add(kv.Key);
+            for (int i = 0; i < _removeScratch.Count; i++)
             {
-                try { if (boxes[i] != null) boxes[i].OnDestroyed(); } catch { }
+                ushort id = _removeScratch[i];
+                if (_byId.TryGetValue(id, out var dead) && !ReferenceEquals(dead, null))
+                    _idOf.Remove(dead);
+                _byId.Remove(id);
             }
-            // grow / fix / update
+
+            // ADOPT unmapped local boxes (spawned by the save-load or the game's own
+            // post-load drip spawner, so they exist on both sides): pair them with
+            // unmapped snapshot entries by type+size in list order - the client's
+            // load order mirrors the host list the save was written from
+            _orphanScratch.Clear();
+            var live = LiveBoxes();
+            for (int i = 0; i < live.Count; i++)
+            {
+                var b = live[i];
+                if (b != null && !_idOf.ContainsKey(b)) _orphanScratch.Add(b);
+            }
+            if (_orphanScratch.Count > 0)
+            {
+                for (int i = 0; i < hostList.Count; i++)
+                {
+                    var want = hostList[i];
+                    if (_byId.TryGetValue(want.Id, out var mapped) && mapped != null) continue;
+                    for (int j = 0; j < _orphanScratch.Count; j++)
+                    {
+                        var cand = _orphanScratch[j];
+                        if (cand == null) continue;
+                        if ((int)cand.m_ItemCompartment.GetItemType() != want.Type
+                            || cand.m_IsBigBox != want.IsBig) continue;
+                        _byId[want.Id] = cand;
+                        _idOf[cand] = want.Id;
+                        _orphanScratch[j] = null;
+                        break;
+                    }
+                }
+            }
+
+            _snapshotIds.Clear();
+            double now = Time.realtimeSinceStartupAsDouble;
             for (int i = 0; i < hostList.Count; i++)
             {
                 var want = hostList[i];
-                InteractablePackagingBox_Item box = i < boxes.Count ? boxes[i] : null;
+                _snapshotIds.Add(want.Id);
+                _byId.TryGetValue(want.Id, out var box);
                 if (box != null && (box.m_ItemCompartment.GetItemType() != (EItemType)want.Type
                                     || box.m_IsBigBox != want.IsBig))
                 {
+                    // shouldn't happen with stable ids - but never rebuild a box in
+                    // someone's HANDS; wait for the set-down
+                    if (IsLocallyCarried(box)) continue;
+                    _idOf.Remove(box);
                     try { box.OnDestroyed(); } catch { }
                     box = null;
-                    boxes = LiveBoxes(); // list mutated
                 }
                 if (box == null)
                 {
                     try
                     {
                         box = RestockManager.SpawnPackageBoxItem((EItemType)want.Type, want.Count, want.IsBig);
-                        boxes = LiveBoxes();
                     }
                     catch (Exception e)
                     {
                         CoopPlugin.Log.LogWarning("BoxSync spawn: " + e.Message);
                         continue;
                     }
+                    if (box == null) continue;
+                    _byId[want.Id] = box;
+                    _idOf[box] = want.Id;
                 }
                 // a box in MY hands is mine until I put it down; a box in the HOST's
                 // hands has a transient position we don't copy
                 if (IsLocallyCarried(box)) continue;
-                double now = Time.realtimeSinceStartupAsDouble;
                 // a stale "carried" echo about a box I JUST released must not hide it
-                if (want.Carried && _recentlyReleased.TryGetValue(i, out double t) && now - t < 6.0)
+                if (want.Carried && _recentlyReleased.TryGetValue(want.Id, out double t) && now - t < 6.0)
                     continue;
                 // my own recent edits (took an item, kicked it) win over stale echoes;
                 // my report reaches the host and the next echo agrees. VISIBILITY is
                 // exempt: someone else's pickup/set-down must show here immediately,
                 // or their set-down box stays invisible to me for the whole window
-                if (_locallyTouched.TryGetValue(i, out double touched) && now - touched < 6.0)
+                if (_locallyTouched.TryGetValue(want.Id, out double touched) && now - touched < 6.0)
                 {
                     if (!want.Carried && !box.gameObject.activeSelf)
                     {
@@ -338,6 +458,30 @@ namespace CardShopCoop.Sync
                 }
                 ApplyToBox(box, want, applyPosition: !want.Carried);
             }
+
+            // remove local boxes whose id the host no longer lists: with stable ids
+            // this is surgical - ONLY the genuinely-destroyed box dies, never an
+            // index-shifted neighbor (the "vanished out of my hands" bug)
+            _removeScratch.Clear();
+            foreach (var kv in _byId)
+                if (!_snapshotIds.Contains(kv.Key)) _removeScratch.Add(kv.Key);
+            for (int i = 0; i < _removeScratch.Count; i++)
+            {
+                ushort id = _removeScratch[i];
+                if (!_byId.TryGetValue(id, out var box)) continue;
+                if (box != null)
+                {
+                    if (IsLocallyCarried(box))
+                        CoopPlugin.Log.LogWarning($"host removed the box in your hands (id {id}, {(EItemType)(int)box.m_ItemCompartment.GetItemType()}) - it was consumed host-side");
+                    _idOf.Remove(box);
+                    try { box.OnDestroyed(); } catch { }
+                }
+                _byId.Remove(id);
+                _carriedLastTick.Remove(id);
+                _locallyTouched.Remove(id);
+                _recentlyReleased.Remove(id);
+            }
+
             // remember the applied truth for local-change detection
             _lastApplied.Clear();
             _lastApplied.AddRange(hostList);
@@ -353,19 +497,17 @@ namespace CardShopCoop.Sync
             bool force = false;
             try
             {
-                var scan = LiveBoxes();
-                int n = Mathf.Min(scan.Count, _lastApplied.Count);
-                for (int i = 0; i < n; i++)
+                foreach (var kv in _idOf)
                 {
-                    if (scan[i] == null) continue;
-                    if (IsLocallyCarried(scan[i]))
+                    if (kv.Key == null) continue;
+                    if (IsLocallyCarried(kv.Key))
                     {
-                        if (_carriedLastTick.Add(i)) force = true; // pickup transition
+                        if (_carriedLastTick.Add(kv.Value)) force = true; // pickup transition
                     }
-                    else if (_carriedLastTick.Remove(i))
+                    else if (_carriedLastTick.Remove(kv.Value))
                     {
                         force = true; // set-down transition
-                        _recentlyReleased[i] = Time.realtimeSinceStartupAsDouble;
+                        _recentlyReleased[kv.Value] = Time.realtimeSinceStartupAsDouble;
                     }
                 }
             }
@@ -375,48 +517,48 @@ namespace CardShopCoop.Sync
             if (_timer >= 1.5f) _timer -= 1.5f;
             try
             {
-                var boxes = LiveBoxes();
                 bool changed = force;
                 _reportBuf.Clear(); // serialized synchronously by the callback; safe to reuse
                 var list = _reportBuf;
                 double nowT = Time.realtimeSinceStartupAsDouble;
                 for (int i = 0; i < _lastApplied.Count; i++)
                 {
-                    if (i < boxes.Count && boxes[i] != null)
+                    var truth = _lastApplied[i];
+                    _byId.TryGetValue(truth.Id, out var box);
+                    if (box == null)
                     {
-                        // while I'M carrying it: tell the host (so everyone else hides
-                        // their copy) but keep reporting the last settled position
-                        if (IsLocallyCarried(boxes[i]))
-                        {
-                            var held = _lastApplied[i];
-                            held.Carried = true;
-                            list.Add(held);
-                            continue;
-                        }
-                        // hidden because ANOTHER player carries it: no local truth to
-                        // report (its transform is parked at the hide spot, contents
-                        // stale) - UNLESS I just set it down myself: that report IS the
-                        // set-down, and skipping it deadlocks the box as carried-forever
-                        if (_lastApplied[i].Carried
-                            && !(_recentlyReleased.TryGetValue(i, out double rr) && nowT - rr < 6.0))
-                        {
-                            list.Add(_lastApplied[i]);
-                            continue;
-                        }
-                        var now = Snapshot(boxes[i]);
-                        if (Differs(now, _lastApplied[i]))
-                        {
-                            changed = true;
-                            _locallyTouched[i] = nowT;
-                        }
-                        list.Add(now);
+                        // dead or unmapped locally: parrot the host truth; if we trashed
+                        // it, the BoxRemoved message (sent separately) settles it
+                        list.Add(truth);
+                        continue;
                     }
-                    else
+                    // while I'M carrying it: tell the host (so everyone else hides
+                    // their copy) but keep reporting the last settled position
+                    if (IsLocallyCarried(box))
                     {
-                        // list shrank without OnDestroyed telling us (trash is forwarded
-                        // separately) - stop and let the next host snapshot re-align
-                        break;
+                        var held = truth;
+                        held.Carried = true;
+                        list.Add(held);
+                        continue;
                     }
+                    // hidden because ANOTHER player carries it: no local truth to
+                    // report (its transform is parked at the hide spot, contents
+                    // stale) - UNLESS I just set it down myself: that report IS the
+                    // set-down, and skipping it deadlocks the box as carried-forever
+                    if (truth.Carried
+                        && !(_recentlyReleased.TryGetValue(truth.Id, out double rr) && nowT - rr < 6.0))
+                    {
+                        list.Add(truth);
+                        continue;
+                    }
+                    var now = Snapshot(box);
+                    now.Id = truth.Id;
+                    if (Differs(now, truth))
+                    {
+                        changed = true;
+                        _locallyTouched[truth.Id] = nowT;
+                    }
+                    list.Add(now);
                 }
                 if (changed) OnClientChanges?.Invoke(list);
             }
@@ -517,6 +659,7 @@ namespace CardShopCoop.Sync
             for (int i = 0; i < entries.Count && i < 250; i++)
             {
                 var e = entries[i];
+                bw.Write(e.Id);
                 bw.Write(e.Type);
                 bw.Write((ushort)Mathf.Clamp(e.Count, 0, ushort.MaxValue));
                 bw.Write((byte)((e.IsBig ? 1 : 0) | (e.IsOpen ? 2 : 0) | (e.Carried ? 4 : 0) | (e.Settled ? 8 : 0)));
@@ -531,7 +674,7 @@ namespace CardShopCoop.Sync
             var list = new List<Entry>(n);
             for (int i = 0; i < n; i++)
             {
-                var e = new Entry { Type = br.ReadInt32(), Count = br.ReadUInt16() };
+                var e = new Entry { Id = br.ReadUInt16(), Type = br.ReadInt32(), Count = br.ReadUInt16() };
                 byte f = br.ReadByte();
                 e.IsBig = (f & 1) != 0;
                 e.IsOpen = (f & 2) != 0;
