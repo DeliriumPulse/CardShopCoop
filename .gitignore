@@ -5,4 +5,7 @@ tools/Decomp/obj/
 decompiled/
 backup/
 diag/
-dist/release/
+# dist/ holds personal deployment kits and release packaging - releases ship
+# via GitHub Releases and Nexus, not the source tree
+dist/
+tools/coop-vanilla-profile.ps1
