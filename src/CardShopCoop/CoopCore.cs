@@ -74,6 +74,7 @@ namespace CardShopCoop
         // host price sync
         private float _priceTimer = -0.45f;
         private int _lastPriceHash;
+        private float _priceHeal;
 
         // timers
         private float _stateTimer;
@@ -1602,9 +1603,15 @@ namespace CardShopCoop
                         hash = hash * 31 + i;
                         hash = hash * 31 + prices[i].GetHashCode();
                     }
-                    if (hash != _lastPriceHash)
+                    // heal beat: the hash updates BEFORE the send, so a single failed
+                    // or lost broadcast used to leave those prices stale FOREVER (tag
+                    // stuck at "-" on the joiner until the next unrelated price change).
+                    // Every other snapshot engine already has a slow heal; now this does
+                    _priceHeal += 3f;
+                    if (hash != _lastPriceHash || _priceHeal >= 30f)
                     {
                         _lastPriceHash = hash;
+                        _priceHeal = 0f;
                         Broadcast(MsgType.PriceList, bw =>
                         {
                             int nonZero = 0;
@@ -1967,7 +1974,7 @@ namespace CardShopCoop
                         try
                         {
                             _incomingPriced.Clear();
-                            int grown = 0;
+                            int grown = 0, changed = 0;
                             for (int k = 0; k < n; k++)
                             {
                                 int i = br.ReadInt32();
@@ -1981,11 +1988,15 @@ namespace CardShopCoop
                                 if (Math.Abs(prices[i] - v) > 0.0001f)
                                 {
                                     prices[i] = v;
+                                    changed++;
                                     CEventManager.QueueEvent(new CEventPlayer_ItemPriceChanged((EItemType)i, v));
                                 }
                             }
                             if (grown > 0)
                                 CoopPlugin.Log.LogInfo($"price apply: grew the price table by {grown} entries for modded items");
+                            // stale-price reports were undiagnosable: applies were silent
+                            else if (changed > 0)
+                                CoopPlugin.Log.LogInfo($"price apply: {changed} price(s) updated from host");
                             // a price the host CLEARED is absent from the sparse set
                             foreach (int i in _clientPriced)
                                 if (!_incomingPriced.Contains(i) && i >= 0 && i < prices.Count && prices[i] != 0f)
