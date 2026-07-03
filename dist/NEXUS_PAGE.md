@@ -54,7 +54,7 @@ If your modded card database differs from the host's, the mod syncs it automatic
 [*]Staff management beyond hiring (fire/tasks/bonuses) is host-only — the game offers no joiner-side path to those screens.
 [*]Steam achievements progress per-player.
 [*]The joiner can't sit down for the play-table minigame (needs the live simulation); table layouts are mirrored visually.
-[*]Content packs installed mid-save price themselves on the host — if modded items show $0, the host can press F11 (PTCGO Economics price reset) and correct values sync over.
+[*]Content packs installed mid-save price themselves on the host — if modded items show $0, the host can use PTCGO Economics' price-reset hotkey (rebindable in [font=Courier New]BepInEx/config/ptcgo.economics.cfg[/font]) and correct values sync over.
 [/list]
 
 [size=4][b]Troubleshooting[/b][/size]
