@@ -128,6 +128,7 @@ namespace CardShopCoop
         private float _licenseSyncTimer = -3.7f;
         private double _lastLicenseBuyTime = -999.0;
         private string _lastLightJson;
+        private float _lightHeal;
         private int _lastLicenseHash;
         private float _licenseHeal;
 
@@ -1612,9 +1613,14 @@ namespace CardShopCoop
                     {
                         MiUpdateLightData.Invoke(_lightManager, null); // refresh bundle from live state
                         string lightJson = JsonUtility.ToJson(CPlayerData.m_LightTimeData);
-                        if (lightJson != _lastLightJson) // skip the broadcast+client parse when static
+                        // the client CORRECTS ITS DRIFT only when a packet arrives - a pure
+                        // changed-only gate silenced the corrector whenever the host's sky
+                        // was static (pre-open mornings) and the joiner drifted to sunset
+                        _lightHeal += 5f;
+                        if (lightJson != _lastLightJson || _lightHeal >= 15f)
                         {
                             _lastLightJson = lightJson;
+                            _lightHeal = 0f;
                             Broadcast(MsgType.LightState, bw => bw.Write(lightJson));
                         }
                     }
