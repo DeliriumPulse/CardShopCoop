@@ -66,6 +66,10 @@
       <HintPath>$(ManagedPath)\com.rlabrecque.steamworks.net.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="UnityEngine.JSONSerializeModule">
+      <HintPath>$(ManagedPath)\UnityEngine.JSONSerializeModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
   <Target Name="DeployToPlugins" AfterTargets="Build" Condition="'$(SkipDeploy)' != 'true'">
