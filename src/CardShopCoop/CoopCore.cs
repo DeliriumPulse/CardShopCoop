@@ -1678,6 +1678,9 @@ namespace CardShopCoop
                             {
                                 bw.Write((int)rd.itemType);
                                 bw.Write(rd.isBigBox);
+                                // NAME identity: modded enum ints can drift between
+                                // machines; the heal must still map the unlock
+                                bw.Write(Fnv(rd.name ?? ""));
                             }
                         });
                     }
@@ -2331,11 +2334,14 @@ namespace CardShopCoop
                         bool scanner = br.ReadBoolean();
                         int n = br.ReadUInt16();
                         var wanted = new HashSet<long>();
+                        var wantedNames = new HashSet<long>();
                         for (int i = 0; i < n; i++)
                         {
                             int t = br.ReadInt32();
                             bool big = br.ReadBoolean();
+                            int nameFnv = br.ReadInt32();
                             wanted.Add(((long)t << 1) | (big ? 1L : 0L));
+                            wantedNames.Add(((long)(uint)nameFnv << 1) | (big ? 1L : 0L));
                         }
                         // don't re-lock during the window where our own purchase is
                         // still round-tripping to the host
@@ -2350,8 +2356,9 @@ namespace CardShopCoop
                             for (int i = 0; i < rl.Count && i < flags.Count; i++)
                             {
                                 if (rl[i] == null) continue;
-                                bool should = wanted.Contains(
-                                    ((long)(int)rl[i].itemType << 1) | (rl[i].isBigBox ? 1L : 0L));
+                                long big = rl[i].isBigBox ? 1L : 0L;
+                                bool should = wanted.Contains(((long)(int)rl[i].itemType << 1) | big)
+                                    || wantedNames.Contains(((long)(uint)Fnv(rl[i].name ?? "") << 1) | big);
                                 if (should && !flags[i])
                                 {
                                     Patches.GamePatches.ApplyingRemoteLicense = true;
