@@ -139,6 +139,16 @@ namespace CardShopCoop
                 Broadcast(MsgType.BoxState, bw => BoxSync.WriteEntries(bw, list));
             _boxes.OnClientChanges = list =>
                 Send(1, MsgType.BoxRequest, bw => BoxSync.WriteEntries(bw, list));
+            BoxSync.IsLocallyCarried = box =>
+            {
+                if (_playerIpc == null || box == null) return false;
+                try
+                {
+                    return ReferenceEquals(FiHoldItemBox?.GetValue(_playerIpc), box)
+                        || ReferenceEquals(FiHoldBox?.GetValue(_playerIpc), box);
+                }
+                catch { return false; }
+            };
             SceneManager.sceneLoaded += OnSceneLoaded;
 
             var args = Environment.GetCommandLineArgs();

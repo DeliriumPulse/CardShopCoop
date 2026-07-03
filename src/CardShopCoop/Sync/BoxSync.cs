@@ -24,9 +24,13 @@ namespace CardShopCoop.Sync
             public int Count;
             public bool IsBig;
             public bool IsOpen;
+            public bool Carried; // in someone's hands: position is transient, don't apply
             public Vector3 Pos;
             public float Yaw;
         }
+
+        /// <summary>Set by CoopCore: is this box currently in the LOCAL player's hands?</summary>
+        public static Func<InteractablePackagingBox_Item, bool> IsLocallyCarried = _ => false;
 
         private static readonly System.Reflection.MethodInfo MiSetOpenClose =
             AccessTools.Method(typeof(InteractablePackagingBox_Item), "SetOpenCloseBox");
@@ -64,6 +68,7 @@ namespace CardShopCoop.Sync
                 Count = box.m_ItemCompartment.GetItemCount(),
                 IsBig = box.m_IsBigBox,
                 IsOpen = box.IsBoxOpened(),
+                Carried = IsLocallyCarried(box),
                 Pos = box.transform.position,
                 Yaw = box.transform.eulerAngles.y,
             };
@@ -104,6 +109,7 @@ namespace CardShopCoop.Sync
                 if (box == null) continue;
                 // type must match: index may have shifted between snapshot and request
                 if ((int)box.m_ItemCompartment.GetItemType() != entries[i].Type) continue;
+                if (IsLocallyCarried(box)) continue; // never stomp a box in the host's hands
                 ApplyToBox(box, entries[i]);
             }
         }
@@ -145,7 +151,10 @@ namespace CardShopCoop.Sync
                         continue;
                     }
                 }
-                ApplyToBox(box, want);
+                // a box in MY hands is mine until I put it down; a box in the HOST's
+                // hands has a transient position we don't copy
+                if (IsLocallyCarried(box)) continue;
+                ApplyToBox(box, want, applyPosition: !want.Carried);
             }
             // remember the applied truth for local-change detection
             _lastApplied.Clear();
@@ -168,6 +177,13 @@ namespace CardShopCoop.Sync
                 {
                     if (i < boxes.Count && boxes[i] != null)
                     {
+                        // while I'M carrying it, report the last settled state - the
+                        // in-hand position is transient and would ping-pong
+                        if (IsLocallyCarried(boxes[i]))
+                        {
+                            list.Add(_lastApplied[i]);
+                            continue;
+                        }
                         var now = Snapshot(boxes[i]);
                         if (Differs(now, _lastApplied[i])) changed = true;
                         list.Add(now);
@@ -188,7 +204,7 @@ namespace CardShopCoop.Sync
 
         // ---------------- shared apply ----------------
 
-        private static void ApplyToBox(InteractablePackagingBox_Item box, Entry want)
+        private static void ApplyToBox(InteractablePackagingBox_Item box, Entry want, bool applyPosition = true)
         {
             try
             {
@@ -219,11 +235,14 @@ namespace CardShopCoop.Sync
                 {
                     try { MiSetOpenClose.Invoke(box, null); } catch { }
                 }
-                var t = box.transform;
-                if ((t.position - want.Pos).sqrMagnitude > 0.01f
-                    || Mathf.Abs(Mathf.DeltaAngle(t.eulerAngles.y, want.Yaw)) > 3f)
+                if (applyPosition)
                 {
-                    t.SetPositionAndRotation(want.Pos, Quaternion.Euler(0f, want.Yaw, 0f));
+                    var t = box.transform;
+                    if ((t.position - want.Pos).sqrMagnitude > 0.01f
+                        || Mathf.Abs(Mathf.DeltaAngle(t.eulerAngles.y, want.Yaw)) > 3f)
+                    {
+                        t.SetPositionAndRotation(want.Pos, Quaternion.Euler(0f, want.Yaw, 0f));
+                    }
                 }
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync apply: " + e.Message); }
@@ -239,7 +258,7 @@ namespace CardShopCoop.Sync
                 var e = entries[i];
                 bw.Write(e.Type);
                 bw.Write((ushort)Mathf.Clamp(e.Count, 0, ushort.MaxValue));
-                bw.Write((byte)((e.IsBig ? 1 : 0) | (e.IsOpen ? 2 : 0)));
+                bw.Write((byte)((e.IsBig ? 1 : 0) | (e.IsOpen ? 2 : 0) | (e.Carried ? 4 : 0)));
                 bw.Write(e.Pos.x); bw.Write(e.Pos.y); bw.Write(e.Pos.z);
                 bw.Write(e.Yaw);
             }
@@ -255,6 +274,7 @@ namespace CardShopCoop.Sync
                 byte f = br.ReadByte();
                 e.IsBig = (f & 1) != 0;
                 e.IsOpen = (f & 2) != 0;
+                e.Carried = (f & 4) != 0;
                 e.Pos = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
                 e.Yaw = br.ReadSingle();
                 list.Add(e);
