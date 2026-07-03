@@ -4,3 +4,5 @@ tools/Decomp/bin/
 tools/Decomp/obj/
 decompiled/
 backup/
+diag/
+dist/release/

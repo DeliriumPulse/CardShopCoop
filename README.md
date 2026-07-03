@@ -1,63 +1,74 @@
 # CardShopCoop
 
-LAN co-op mod for **TCG Card Shop Simulator** (BepInEx 5, Unity 2021.3 Mono).
-Built from scratch for a modded install (PTCGO / Pokemon overhaul + EPL stack) —
-it syncs by game IDs and never touches card content, so content mods keep working.
+**True co-op multiplayer for TCG Card Shop Simulator.** Run the shop together — shared
+money, XP, collection, and customers — over Steam (invites or a public lobby browser)
+or LAN. Built mod-first: it syncs by game IDs and plays nice with the PTCGO / Enhanced
+Prefab Loader content-mod stack, including automatic card-database alignment between
+players.
 
-## How it works
+BepInEx 5 plugin, Unity 2021.3 Mono, no game assets redistributed.
 
-- **Host-authoritative**: the host runs the only real simulation. The joiner receives
-  a byte-perfect copy of the host's save (base JSON + all per-slot mod sidecar files,
-  slot-renamed) at join time and loads it through the game's own load path into a
-  dedicated co-op slot (default 7) — the joiner's own saves are never written.
-- **Transport**: dependency-free TCP (port 27886), length-prefixed frames, background
-  reader + keepalive threads (immune to Unity main-thread freezes during scene loads),
-  30s timeout.
-- **Avatars**: the game's customer prefab, dressed via `Customer.RandomizeCharacterMesh()`
-  (the game's own wardrobe pipeline), then stripped of all AI/physics same-call so it
-  never simulates. Driven by 12 Hz position/yaw/speed/hold packets; walk cycle via the
-  `MoveSpeed` animator param; carry pose via `IsHoldingBox` + a prop cube.
-- **World sync**: snapshot-diff engine over shelf/warehouse compartments
-  (`(shelfIdx, compartmentIdx) -> (itemType, count)` at 0.75s cadence). Host diffs are
-  authoritative broadcasts; client diffs (the joiner's own restocking) are requests the
-  host applies and echoes. No per-interaction Harmony patches needed.
-- **Economy/time**: host wallet broadcast through the game's own event bus
-  (`CEventPlayer_SetCoin`), item price table sync, day/time mirrored into `LightManager`.
-- **Client sim suppression** (Harmony): customers, workers and day-end events are
-  disabled on the joiner; all joiner saves reroute to the co-op slot.
+## Features
+
+- **Steam lobbies**: friends-list invites, or a browsable/searchable public lobby list
+  with optional passwords. LAN/TCP fallback (port 27886). 2 players primary; extra
+  joiners supported via host relay.
+- **One shop, one truth** (host-authoritative): money, XP, level, fame, the card
+  collection (including graded cards), item and card prices, shelf stock, card display
+  walls, loose boxes (carry them, throw them, trash them), placed furniture, licenses,
+  bills, room expansions, decorations, signs, tournaments, grading, the daily market,
+  and the end-of-day report are all shared.
+- **Both players can work**: the joiner serves the register (click-to-scan or hold V),
+  runs customer trade-ins/sell-ins through the game's real trade screen, restocks,
+  prices, orders stock and furniture, hires staff, pays bills, and buys licenses and
+  expansions — everything lands in the host's real simulation and echoes back.
+- **Live world**: customers and workers mirrored as motion-smoothed puppets
+  (snapshot-interpolated, not jittery extrapolation), full day/night cycle and lighting
+  sync, avatars with real carried items (boxes with product, card fans, binders).
+- **Mod-stack aware**: plugin-set and card-ID-registry parity checks at join with
+  readable rejections, automatic `enum_values.json` sync (backup + install + "restart
+  and rejoin"), product-catalog diffing with plain-language warnings, refunds when an
+  ordered product doesn't exist on the host.
+- **Joiners risk nothing**: the joiner receives the host's save at join, plays in a
+  dedicated scratch slot, and never writes their own saves.
+
+## Install
+
+1. Install [BepInEx 5](https://github.com/BepInEx/BepInEx) (5.4.23 x64) into the game
+   folder — most modded installs already have it.
+2. Drop `CardShopCoop.dll` into `BepInEx/plugins/` on **both** PCs.
+3. Both players must run the **same CardShopCoop version** and the **same mod set**
+   (including content data packs) — the join handshake tells you exactly what differs
+   if not.
+4. In game, press **F2** for the co-op window. Host: load your save, click Host.
+   Friend: Join via Steam invite, the lobby browser, or LAN IP.
 
 ## Repo layout
 
 - `src/CardShopCoop/` — plugin source. Build: `dotnet build -c Release`
-  (auto-deploys the DLL into the game's `BepInEx/plugins/CardShopCoop/`; pass
-  `/p:SkipDeploy=true` while the game is running).
-- `dist/` — `PLAY_GUIDE.md`, `Stage-ModsToUSB.ps1` (dad's PC), `Setup-SonPC.ps1` (son's PC).
-- `decompiled/` — ILSpy output of the game's `Assembly-CSharp.dll` (build 22936874),
-  the reference for every hook. Not redistributable; local use only.
-- `backup/` — pre-co-op save backup.
+  (auto-deploys into the game's plugins; pass `/p:SkipDeploy=true` while the game runs).
+  Set `<GamePath>` in the csproj to your install.
+- `dist/` — play guide, remote-friend setup kit, release packaging.
+- `decompiled/` (not in repo) — ILSpy output of the game assembly used as hook
+  reference; regenerate locally with `tools/Decomp`.
 
-## Testing without a second PC
+## Architecture notes
 
-`Card Shop Simulator.exe -coopautohost=0` and a second instance with
-`-coopautojoin=127.0.0.1` (requires `steam_appid.txt` in the game folder for direct-exe
-launch). Per-process logs: `BepInEx/CardShopCoop_<pid>.log`.
+- **Host-authoritative everywhere**: the host runs the only real simulation; the client
+  suppresses its own customers/workers/day-end via Harmony and mirrors state. Client
+  actions forward as ops the host executes through vanilla code paths, then authoritative
+  state echoes back (hash-gated snapshot-diff engines with staggered timers).
+- **Two network lanes**: reliable ordered frames for state, unreliable no-delay for
+  15 Hz positions and 8 Hz NPC batches (chunked under Steam's 1200-byte datagram limit).
+  Remote motion renders ~150 ms behind on a snapshot ring buffer.
+- **Identity over indexes**: anything that crosses the wire is keyed by item identity
+  (type + size + name), never by list position — content mods can order their
+  registries differently per machine.
+- Game gotchas that cost us dearly (see `Patches/GamePatches.cs` and git history):
+  dead statics (`CGameManager.Player`), auto-creating `CSingleton<T>.Instance`,
+  `SpawnItem` being a save-loader not an adder, price tags living in separate canvas
+  groups, and raw-`itemType`-indexed tables ~200k entries long under content mods.
 
-## Gotchas discovered (for future maintenance)
+## License
 
-- `CGameManager.Player` and `InteractionPlayerController.m_Instance` are **dead statics**
-  — declared, never assigned. Resolve the player via `FindObjectOfType`.
-- `CSingleton<T>.Instance` **auto-creates** an empty object when none exists — never
-  call it from the title screen for scene-bound managers.
-- Save files are plain JsonUtility JSON (`savedGames_Release{slot}.json`); mods keep
-  per-slot sidecars in `LocalLow/OPNeonGames/Card Shop Simulator/<Mod>/<Name>_{slot}.*`;
-  EPL's `enum_values.json` is a machine-global custom-item ID registry — never overwrite
-  an existing, differing copy.
-- Two instances share one save dir when loopback-testing: the client save-guard patch is
-  what makes that safe.
-
-## Roadmap
-
-- v0.3: mirror host customers/workers as puppets on the client; sync loose/stored boxes
-  and card shelves; forward client restock purchases to the host wallet.
-- v0.4: pack-opening and card-table visibility; Steam-lobby transport option
-  (game already ships Steamworks.NET + Heathen) for play over the internet.
+MIT — see [LICENSE](LICENSE).
