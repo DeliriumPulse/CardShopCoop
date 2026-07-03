@@ -60,6 +60,14 @@ namespace CardShopCoop.Sync
         private float _heal;
         private int _reviewSeq; // client: m_CustomerReviewCount high-water mark (dedup key)
 
+        // NEVER CSingleton<>.Instance for these: the open-screen broadcast can land
+        // during the client's reload loading screen, where the getter fabricates a
+        // fake empty DontDestroyOnLoad object that shadows the real screen/controller
+        // for the rest of the run (see WorldSync.ResolveShelfManager). Static because
+        // TryOpenReportScreen is; Unity fake-null re-resolves after scene loads.
+        private static EndOfDayReportScreen _screen;
+        private static InteractionPlayerController _ipc;
+
         public void Reset()
         {
             _timer = -4.1f; // staggered phase vs the other snapshot engines
@@ -68,6 +76,8 @@ namespace CardShopCoop.Sync
             _reviewSeq = -1;
             s_openPending = false;
             s_reviewsDirty = false;
+            _screen = null;
+            _ipc = null;
         }
 
         public void ForceResend()
@@ -377,11 +387,14 @@ namespace CardShopCoop.Sync
         {
             try
             {
-                var screen = CSingleton<EndOfDayReportScreen>.Instance;
-                if (screen == null) return;
+                // a REAL screen in the scene means the vanilla statics below resolve
+                // it too; without one they would auto-create a fake (see class fields)
+                if (_screen == null) _screen = UnityEngine.Object.FindObjectOfType<EndOfDayReportScreen>();
+                if (_screen == null) return;
                 if (EndOfDayReportScreen.IsActive()) return; // OpenScreen is a toggle: don't close it
 
-                var pc = CSingleton<InteractionPlayerController>.Instance;
+                if (_ipc == null) _ipc = UnityEngine.Object.FindObjectOfType<InteractionPlayerController>();
+                var pc = _ipc;
                 if (pc != null)
                 {
                     // the phone owns the same cursor/move locks; fighting it corrupts UI

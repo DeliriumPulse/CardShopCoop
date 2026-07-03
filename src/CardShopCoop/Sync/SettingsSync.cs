@@ -47,6 +47,28 @@ namespace CardShopCoop.Sync
         private readonly MemoryStream _stateMs = new MemoryStream(1024);
         private BinaryWriter _stateBw;
 
+        // NEVER CSingleton<>.Instance for these: touched while no real manager exists
+        // (client reload loading screen, host mid-session save load - ?. does NOT
+        // protect, the auto-create happens before it evaluates) the getter fabricates
+        // a fake empty DontDestroyOnLoad manager that shadows the real one for the
+        // rest of the run (see WorldSync.ResolveShelfManager). Static because the
+        // wire writers and patch postfixes are static; Unity fake-null re-resolves
+        // after scene loads.
+        private static ShelfManager _sm;
+        private static InventoryBase _inv;
+
+        private static ShelfManager Sm()
+        {
+            if (_sm == null) _sm = UnityEngine.Object.FindObjectOfType<ShelfManager>();
+            return _sm;
+        }
+
+        private static InventoryBase Inv()
+        {
+            if (_inv == null) _inv = UnityEngine.Object.FindObjectOfType<InventoryBase>();
+            return _inv;
+        }
+
         public SettingsSync()
         {
             Instance = this;
@@ -59,6 +81,8 @@ namespace CardShopCoop.Sync
             _lastHash = 0;
             _heal = 0f;
             ApplyingRemote = false;
+            _sm = null;
+            _inv = null;
         }
 
         public void ForceResend()
@@ -144,7 +168,7 @@ namespace CardShopCoop.Sync
                     {
                         int idx = br.ReadByte();
                         byte flags = br.ReadByte();
-                        var counters = CSingleton<ShelfManager>.Instance?.m_CashierCounterList;
+                        var counters = Sm()?.m_CashierCounterList;
                         if (counters != null && idx < counters.Count && counters[idx] != null)
                         {
                             ApplyingRemote = true;
@@ -163,7 +187,7 @@ namespace CardShopCoop.Sync
                     {
                         int idx = br.ReadByte();
                         int number = br.ReadInt32();
-                        var tables = CSingleton<ShelfManager>.Instance?.m_PlayTableList;
+                        var tables = Sm()?.m_PlayTableList;
                         if (tables != null && idx < tables.Count && tables[idx] != null)
                         {
                             ApplyingRemote = true;
@@ -190,7 +214,7 @@ namespace CardShopCoop.Sync
         /// comes from OUR data lists - never from the wire.</summary>
         private void HostBuyDeco(int category, int index)
         {
-            var so = CSingleton<InventoryBase>.Instance?.m_ObjectData_SO;
+            var so = Inv()?.m_ObjectData_SO;
             if (so == null || category < 0 || category > 2) return;
             List<ShopDecoData> list =
                 category == 0 ? so.m_WallDecoDataList :
@@ -247,7 +271,7 @@ namespace CardShopCoop.Sync
                         CPlayerData.m_SetGameEventPriceList[i] = fee;
                 }
 
-                var counters = CSingleton<ShelfManager>.Instance?.m_CashierCounterList;
+                var counters = Sm()?.m_CashierCounterList;
                 int cn = br.ReadByte();
                 for (int i = 0; i < cn; i++)
                 {
@@ -260,7 +284,7 @@ namespace CardShopCoop.Sync
                     if (counters[i].CanTradeCard() != trade) counters[i].SetCanTradeCard(trade);
                 }
 
-                var tables = CSingleton<ShelfManager>.Instance?.m_PlayTableList;
+                var tables = Sm()?.m_PlayTableList;
                 int tn = br.ReadByte();
                 for (int i = 0; i < tn; i++)
                 {
@@ -291,7 +315,7 @@ namespace CardShopCoop.Sync
         /// touch shared assets, no reason to churn them every snapshot).</summary>
         private static void ApplyEquips(int wall, int wallB, int floor, int floorB, int ceiling, int ceilingB)
         {
-            var so = CSingleton<InventoryBase>.Instance?.m_ObjectData_SO;
+            var so = Inv()?.m_ObjectData_SO;
             if (so == null) return;
             if (wall != CPlayerData.m_EquippedWallDecoIndex && wall >= 0 && wall < so.m_WallDecoDataList.Count)
             {
@@ -346,7 +370,7 @@ namespace CardShopCoop.Sync
             int fn = Mathf.Min(fees.Count, 255);
             bw.Write((byte)fn);
             for (int i = 0; i < fn; i++) bw.Write(fees[i]);
-            var counters = CSingleton<ShelfManager>.Instance?.m_CashierCounterList;
+            var counters = Sm()?.m_CashierCounterList;
             int cn = counters == null ? 0 : Mathf.Min(counters.Count, 255);
             bw.Write((byte)cn);
             for (int i = 0; i < cn; i++)
@@ -357,7 +381,7 @@ namespace CardShopCoop.Sync
                     flags = (byte)((counters[i].CanCheckout() ? 1 : 0) | (counters[i].CanTradeCard() ? 2 : 0));
                 bw.Write(flags);
             }
-            var tables = CSingleton<ShelfManager>.Instance?.m_PlayTableList;
+            var tables = Sm()?.m_PlayTableList;
             int tn = tables == null ? 0 : Mathf.Min(tables.Count, 255);
             bw.Write((byte)tn);
             for (int i = 0; i < tn; i++)
@@ -488,7 +512,7 @@ namespace CardShopCoop.Sync
             if (ApplyingRemote || CoopCore.Role != CoopRole.Client) return;
             var inst = Instance;
             if (inst?.SendOp == null) return;
-            var counters = CSingleton<ShelfManager>.Instance?.m_CashierCounterList;
+            var counters = Sm()?.m_CashierCounterList;
             if (counters == null) return;
             int idx = counters.IndexOf(__instance);
             if (idx < 0 || idx > 254) return;
@@ -501,7 +525,7 @@ namespace CardShopCoop.Sync
             if (ApplyingRemote || CoopCore.Role != CoopRole.Client) return;
             var inst = Instance;
             if (inst?.SendOp == null) return;
-            var tables = CSingleton<ShelfManager>.Instance?.m_PlayTableList;
+            var tables = Sm()?.m_PlayTableList;
             if (tables == null) return;
             int idx = tables.IndexOf(__instance);
             if (idx < 0 || idx > 254) return;

@@ -88,6 +88,9 @@ namespace CardShopCoop.Sync
         private int _lastHostHash;
         private float _hostHeal;
         private RestockManager _rm;
+        private InteractionPlayerController _ipc; // NEVER CSingleton<>.Instance: it fabricates
+                                                  // a fake manager if touched while no real one
+                                                  // exists (see WorldSync.ResolveShelfManager)
         private Transform _spawnAnchor; // reusable Transform for SpawnPackageBoxCard
 
         public CardBoxSync()
@@ -107,6 +110,7 @@ namespace CardShopCoop.Sync
             _lastHostHash = 0;
             _hostHeal = 0f;
             _rm = null;
+            _ipc = null;
         }
 
         public void ForceResend()
@@ -119,6 +123,12 @@ namespace CardShopCoop.Sync
         {
             if (_rm == null) _rm = UnityEngine.Object.FindObjectOfType<RestockManager>();
             return _rm;
+        }
+
+        private InteractionPlayerController Ipc()
+        {
+            if (_ipc == null) _ipc = UnityEngine.Object.FindObjectOfType<InteractionPlayerController>();
+            return _ipc;
         }
 
         private static List<InteractablePackagingBox_Card> LiveBoxes()
@@ -535,7 +545,7 @@ namespace CardShopCoop.Sync
             _recentlyReleased.Clear();
 
             // the reveal moment, minus the hold-card handout (see class comment)
-            try { CSingleton<InteractionPlayerController>.Instance.OnExitHoldBoxMode(); } catch { }
+            try { Ipc()?.OnExitHoldBoxMode(); } catch { }
             try { box.m_BoxAnim.Play("Open"); } catch { }
             try { SoundManager.PlayAudio("SFX_BoxOpen", 0.5f); } catch { }
             if (CoopCore.Instance != null)

@@ -109,7 +109,11 @@ namespace CardShopCoop.Sync
 
         private WorkerManager Wm()
         {
-            if (_wm == null) _wm = CSingleton<WorkerManager>.Instance;
+            // NEVER CSingleton<WorkerManager>.Instance: resolved while no real manager
+            // exists (host mid-session save load) the getter fabricates a fake empty
+            // DontDestroyOnLoad manager that shadows the real one for the rest of the
+            // run (see WorldSync.ResolveShelfManager)
+            if (_wm == null) _wm = UnityEngine.Object.FindObjectOfType<WorkerManager>();
             return _wm;
         }
 

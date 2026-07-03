@@ -73,6 +73,12 @@ namespace CardShopCoop.Sync
         /// <summary>Scene-wide lookup is milliseconds in a full shop; cache it and let the
         /// Unity fake-null re-resolve after scene loads.</summary>
         private static RestockManager _restock;
+        // NEVER CSingleton<CustomerManager>.Instance: avatars tick every frame, including
+        // the client's world-reload loading screen, where the getter would fabricate a
+        // fake empty DontDestroyOnLoad CustomerManager that shadows the real one for the
+        // rest of the run - killing avatar respawn, TradeServe and TournamentSync after
+        // a rejoin (see WorldSync.ResolveShelfManager). Cached like _restock above.
+        private static CustomerManager _customers;
 
         private readonly Dictionary<int, RemoteAvatar> _avatars = new Dictionary<int, RemoteAvatar>();
         private bool _loggedAnimParams;
@@ -569,7 +575,8 @@ namespace CardShopCoop.Sync
 
         private void TrySpawn(RemoteAvatar av)
         {
-            var cm = CSingleton<CustomerManager>.Instance;
+            if (_customers == null) _customers = Object.FindObjectOfType<CustomerManager>();
+            var cm = _customers;
             if (cm == null) return;
 
             // stable gender pick per player name, so dad & son each keep a consistent look

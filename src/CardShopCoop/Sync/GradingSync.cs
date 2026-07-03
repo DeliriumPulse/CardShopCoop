@@ -59,6 +59,19 @@ namespace CardShopCoop.Sync
         private float _heal;
         private GradeCardWebsiteUIScreen _website; // cached lookup (client UI refresh)
 
+        // NEVER CSingleton<InventoryBase>.Instance: touched while no real manager
+        // exists (host mid-session save load) the getter fabricates a fake empty
+        // DontDestroyOnLoad InventoryBase that shadows the real one for the rest of
+        // the run (see WorldSync.ResolveShelfManager). Static because ClientSubmit
+        // is static; Unity fake-null re-resolves after scene loads.
+        private static InventoryBase _inv;
+
+        private static InventoryBase Inv()
+        {
+            if (_inv == null) _inv = UnityEngine.Object.FindObjectOfType<InventoryBase>();
+            return _inv;
+        }
+
         public GradingSync()
         {
             Instance = this;
@@ -70,6 +83,7 @@ namespace CardShopCoop.Sync
             _lastHash = 0;
             _heal = 0f;
             _website = null;
+            _inv = null;
         }
 
         public void ForceResend()
@@ -143,7 +157,9 @@ namespace CardShopCoop.Sync
             }
 
             int serviceLevel = set.m_ServiceLevel;
-            var svc = CSingleton<InventoryBase>.Instance.m_MonsterData_SO.GetGradeCardServiceData(serviceLevel);
+            var inv = Inv();
+            if (inv == null) return; // no live world = nothing vanilla could price either
+            var svc = inv.m_MonsterData_SO.GetGradeCardServiceData(serviceLevel);
             float total = DeliveryFee + svc.m_CostPerCard * picked.Count;
             if (CPlayerData.m_CoinAmountDouble < (double)total)
             {
@@ -262,7 +278,14 @@ namespace CardShopCoop.Sync
 
             try
             {
-                var svc = CSingleton<InventoryBase>.Instance.m_MonsterData_SO.GetGradeCardServiceData(serviceLevel);
+                var inv = Inv();
+                if (inv == null)
+                {
+                    // same outcome as the old fee-lookup failure, minus the fake manager
+                    CoopPlugin.Log.LogWarning("GradingSync: no InventoryBase (world loading?) - submission dropped");
+                    return;
+                }
+                var svc = inv.m_MonsterData_SO.GetGradeCardServiceData(serviceLevel);
                 float total = DeliveryFee + svc.m_CostPerCard * cards.Count;
                 if (Mathf.Abs(total - clientFee) > 0.01f)
                     CoopPlugin.Log.LogWarning($"GradingSync: fee mismatch (client {clientFee}, host {total}) - using host value");

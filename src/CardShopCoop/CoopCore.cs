@@ -531,6 +531,8 @@ namespace CardShopCoop
             PromptLine = "";
             _lightManager = null;
             _cmSweep = null;
+            _inventory = null;
+            _cashScreen = null;
             _renamerHandled = false;
             _catalogSent = false;
             if (ClientReloading) _reloadGrace = 10f; // countdown starts once in-game
@@ -548,6 +550,22 @@ namespace CardShopCoop
         {
             var gm = CSingleton<CGameManager>.Instance;
             return gm != null && gm.m_IsGameLevel;
+        }
+
+        // NEVER CSingleton<>.Instance for scene-lifetime managers (CGameManager above
+        // is a REAL persistent singleton and stays on the getter): touched while no
+        // real manager exists (client reload loading screen - InGameLevel() stays true
+        // there - or host mid-session save load) the getter fabricates a fake empty
+        // DontDestroyOnLoad manager that shadows the real one for the rest of the run
+        // (see WorldSync.ResolveShelfManager). Cached; the Unity fake-null re-resolves
+        // after scene loads, and OnSceneLoaded clears them besides.
+        private static InventoryBase _inventory;
+        private static UI_CashCounterScreen _cashScreen;
+
+        private static InventoryBase Inv()
+        {
+            if (_inventory == null) _inventory = FindObjectOfType<InventoryBase>();
+            return _inventory;
         }
 
         private void ModulesTick()
@@ -595,7 +613,7 @@ namespace CardShopCoop
         {
             try
             {
-                var list = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
+                var list = Inv().m_StockItemData_SO.m_RestockDataList;
                 int h = 17;
                 foreach (var rd in list)
                     if (rd != null) h = h * 31 + (((int)rd.itemType << 1) | (rd.isBigBox ? 1 : 0));
@@ -978,7 +996,7 @@ namespace CardShopCoop
             sizeDiffers = false;
             try
             {
-                var list = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
+                var list = Inv().m_StockItemData_SO.m_RestockDataList;
                 for (int i = 0; i < list.Count; i++)
                     if (list[i] != null && (int)list[i].itemType == itemType && list[i].isBigBox == isBig)
                         return i;
@@ -1071,7 +1089,7 @@ namespace CardShopCoop
         {
             try
             {
-                var list = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
+                var list = Inv().m_StockItemData_SO.m_RestockDataList;
                 var entries = new List<RestockData>(list.Count);
                 // blank-name entries are mod UI placeholders (Collection Tracker's
                 // restock-shop replacement adds two) - not orderable, not comparable
@@ -1102,7 +1120,9 @@ namespace CardShopCoop
                 int nameHash = br.ReadInt32();
                 joiner.Add(CatalogKey(t, big, nameHash));
             }
-            var list = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
+            var inv = Inv();
+            if (inv == null) return; // no live world to compare against; the next digest retries
+            var list = inv.m_StockItemData_SO.m_RestockDataList;
             int hostOnly = 0, shared = 0;
             var examples = new List<string>();
             foreach (var rd in list)
@@ -1147,7 +1167,7 @@ namespace CardShopCoop
             {
                 if (string.IsNullOrEmpty(name)) return;
                 string probe = name.Split(' ')[0];
-                var list = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
+                var list = Inv().m_StockItemData_SO.m_RestockDataList;
                 var found = new List<string>();
                 foreach (var rd in list)
                 {
@@ -1716,7 +1736,7 @@ namespace CardShopCoop
                 _licenseSyncTimer -= 10f;
                 try
                 {
-                    var rl = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
+                    var rl = Inv().m_StockItemData_SO.m_RestockDataList;
                     var flags = CPlayerData.m_IsItemLicenseUnlocked;
                     var unlocked = new List<RestockData>();
                     for (int i = 0; i < rl.Count && i < flags.Count; i++)
@@ -2330,7 +2350,7 @@ namespace CardShopCoop
                             // the money is already in the shared wallet (the charge fired
                             // before the spawn call we intercept) - give it back loudly
                             int hostCatalog = 0;
-                            try { hostCatalog = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList.Count; } catch { }
+                            try { hostCatalog = Inv().m_StockItemData_SO.m_RestockDataList.Count; } catch { }
                             CoopPlugin.Log.LogWarning($"{who} ordered unknown product type {itemType} '{rdName}' - refunding {cost:F0} (host catalog: {hostCatalog} products)");
                             LogCatalogCandidates(rdName);
                             if (cost > 0f && cost < 100000f)
@@ -2437,7 +2457,7 @@ namespace CardShopCoop
                         Guarded("license-apply", () =>
                         {
                             CPlayerData.m_IsScannerRestockUnlocked |= scanner;
-                            var rl = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
+                            var rl = Inv().m_StockItemData_SO.m_RestockDataList;
                             var flags = CPlayerData.m_IsItemLicenseUnlocked;
                             bool anyUnlocked = false;
                             for (int i = 0; i < rl.Count && i < flags.Count; i++)
@@ -2754,8 +2774,18 @@ namespace CardShopCoop
                     if (RegisterLine == "sale complete!")
                     {
                         // clear the vanilla checkout screen AND the counters' running
-                        // totals for the next customer
-                        try { CSingleton<UI_CashCounterScreen>.Instance.ResetCounter(); } catch { }
+                        // totals for the next customer. Each counter spawns its OWN
+                        // screen and deactivates it between checkouts
+                        // (InteractableCashierCounter.OnExit...:473), so the plain
+                        // overload misses them - include inactive. One arbitrary
+                        // screen, exactly like the old CSingleton lookup picked.
+                        try
+                        {
+                            if (_cashScreen == null)
+                                _cashScreen = FindObjectOfType<UI_CashCounterScreen>(true);
+                            if (_cashScreen != null) _cashScreen.ResetCounter();
+                        }
+                        catch { }
                         Guarded("reset-totals", Sync.RegisterServe.ClientResetTotals);
                     }
                     break;

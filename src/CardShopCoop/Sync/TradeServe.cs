@@ -139,7 +139,14 @@ namespace CardShopCoop.Sync
         private float _heal;
         private byte _resultSeq;
         private string _result = "";
+        // NEVER CSingleton<>.Instance for these three: touched while no real manager
+        // exists (client reload loading screen, host mid-session save load) the getter
+        // fabricates a fake empty DontDestroyOnLoad manager that shadows the real one
+        // for the rest of the run (see WorldSync.ResolveShelfManager). Cached; Unity
+        // fake-null re-resolves after scene loads.
         private ShelfManager _sm;
+        private CustomerManager _cm;
+        private InteractionPlayerController _ipc;
         private readonly List<Offer> _hostBuf = new List<Offer>();
         private readonly HashSet<int> _preRollFailed = new HashSet<int>();   // customer ids; warn once
         private readonly HashSet<int> _unknownLogged = new HashSet<int>();   // customer ids; log known=false once
@@ -163,6 +170,8 @@ namespace CardShopCoop.Sync
             _resultSeq = 0;
             _result = "";
             _sm = null;
+            _cm = null;
+            _ipc = null;
             _hostBuf.Clear();
             _preRollFailed.Clear();
             _unknownLogged.Clear();
@@ -273,7 +282,7 @@ namespace CardShopCoop.Sync
             FiPausing?.SetValue(__instance, false);
             try
             {
-                var ipc = CSingleton<InteractionPlayerController>.Instance;
+                var ipc = _live != null ? _live.Ipc() : null;
                 if (ipc != null)
                 {
                     ipc.ExitWorkerInteractMode();
@@ -315,6 +324,18 @@ namespace CardShopCoop.Sync
         {
             if (_sm == null) _sm = UnityEngine.Object.FindObjectOfType<ShelfManager>();
             return _sm;
+        }
+
+        private CustomerManager Cm()
+        {
+            if (_cm == null) _cm = UnityEngine.Object.FindObjectOfType<CustomerManager>();
+            return _cm;
+        }
+
+        private InteractionPlayerController Ipc()
+        {
+            if (_ipc == null) _ipc = UnityEngine.Object.FindObjectOfType<InteractionPlayerController>();
+            return _ipc;
         }
 
         private static string CardName(CardData c)
@@ -361,7 +382,7 @@ namespace CardShopCoop.Sync
             _timer -= Cadence;
             try
             {
-                var cm = CSingleton<CustomerManager>.Instance;
+                var cm = Cm();
                 var sm = Sm();
                 if (cm == null || sm == null) return;
 
@@ -537,7 +558,7 @@ namespace CardShopCoop.Sync
 
         private void HostApplyOpInner(byte op, int idx, float price)
         {
-            var cm = CSingleton<CustomerManager>.Instance;
+            var cm = Cm();
             var sm = Sm();
             if (cm == null || sm == null || idx < 0 || idx >= sm.m_CashierCounterList.Count)
             {
@@ -778,7 +799,7 @@ namespace CardShopCoop.Sync
         private Transform PlayerBody()
         {
             if (_playerTf != null) return _playerTf;
-            var ipc = CSingleton<InteractionPlayerController>.Instance;
+            var ipc = Ipc();
             if (ipc == null) return null;
             _playerTf = ipc.m_WalkerCtrl != null ? ipc.m_WalkerCtrl.transform : ipc.transform;
             return _playerTf;
@@ -809,7 +830,7 @@ namespace CardShopCoop.Sync
         /// market data.</summary>
         private void OpenNativeScreen(int idx, Offer offer)
         {
-            var cm = CSingleton<CustomerManager>.Instance;
+            var cm = Cm();
             var screen = cm != null ? cm.m_CustomerTradeCardScreen : null;
             if (screen == null) throw new InvalidOperationException("no CustomerTradeCardScreen");
             if (screen.IsScreenOpened()) return;
@@ -833,7 +854,7 @@ namespace CardShopCoop.Sync
             // fill BEFORE touching input state: a throw here leaves nothing to unwind
             // (bar m_IsPlayerTrading, which the caller's catch resets)
             screen.SetCustomer(carrier, data);
-            var ipc = CSingleton<InteractionPlayerController>.Instance;
+            var ipc = Ipc();
             if (ipc == null) throw new InvalidOperationException("no InteractionPlayerController");
             ipc.EnterWorkerInteractMode();
             ipc.EnterUIMode();
@@ -880,7 +901,7 @@ namespace CardShopCoop.Sync
             // served them, walk-off)
             if (_pendingCounter >= 0)
             {
-                var cm = CSingleton<CustomerManager>.Instance;
+                var cm = Cm();
                 var screen = cm != null ? cm.m_CustomerTradeCardScreen : null;
                 if (screen == null || !screen.IsScreenOpened())
                 {
@@ -952,7 +973,7 @@ namespace CardShopCoop.Sync
                     _pendingCounter = -1;
                     try
                     {
-                        var cm = CSingleton<CustomerManager>.Instance;
+                        var cm = Cm();
                         if (cm != null) cm.m_IsPlayerTrading = false; // SetCustomer may have set it
                     }
                     catch { }

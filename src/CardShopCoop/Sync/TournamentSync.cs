@@ -32,11 +32,25 @@ namespace CardShopCoop.Sync
         private int _lastHash;      // host: last broadcast / client: last applied
         private float _heal;
 
+        // NEVER CSingleton<CustomerManager>.Instance: touched while no real manager
+        // exists (client reload loading screen, host mid-session save load) the getter
+        // fabricates a fake empty DontDestroyOnLoad manager that shadows the real one
+        // for the rest of the run (see WorldSync.ResolveShelfManager). Static because
+        // the wire writer and hash are static; fake-null re-resolves after scene loads.
+        private static CustomerManager _cm;
+
+        private static CustomerManager Cm()
+        {
+            if (_cm == null) _cm = UnityEngine.Object.FindObjectOfType<CustomerManager>();
+            return _cm;
+        }
+
         public void Reset()
         {
             _timer = -6.1f; // staggered phase vs the other snapshot engines
             _lastHash = 0;
             _heal = 0f;
+            _cm = null;
         }
 
         public void ForceResend()
@@ -213,7 +227,7 @@ namespace CardShopCoop.Sync
         /// here, exactly the way TournamentPrizeShelf.CheckTournamentScreenVisibility does.</summary>
         private void RefreshBoards(TournamentData td, List<PairingEntry> digest, bool visibilityChanged)
         {
-            var cm = CSingleton<CustomerManager>.Instance;
+            var cm = Cm();
             if (cm == null || cm.m_TournamentPairingScreen == null) return;
             var screen = cm.m_TournamentPairingScreen;
             bool showBoard = td.m_IsTournamentDay || td.m_IsTournamentDayOver;
@@ -312,7 +326,7 @@ namespace CardShopCoop.Sync
 
             // bracket digest straight from the host's live sorted list (the same list
             // the vanilla pairing board renders from)
-            var cm = CSingleton<CustomerManager>.Instance;
+            var cm = Cm();
             var sorted = cm != null ? cm.m_TournamentSortedCustomerList : null;
             int n = sorted != null ? Mathf.Min(sorted.Count, 64) : 0;
             bw.Write((byte)n);
@@ -379,7 +393,7 @@ namespace CardShopCoop.Sync
             // host side only: fold the live bracket so round results retrigger a send
             if (CoopCore.Role == CoopRole.Host)
             {
-                var cm = CSingleton<CustomerManager>.Instance;
+                var cm = Cm();
                 var sorted = cm != null ? cm.m_TournamentSortedCustomerList : null;
                 if (sorted != null)
                 {
