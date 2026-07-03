@@ -68,6 +68,8 @@ namespace CardShopCoop.Net
         CardBoxOp = 61,        // client -> host: joiner collects/moves a graded-returns card box
         CardBoxState = 62,     // host -> client: card packaging box population (graded returns)
         EnumSync = 63,         // host -> client: the host's enum_values.json (card-ID registry)
+        Toast = 64,            // host -> client: one-line on-screen notice
+        CatalogDigest = 65,    // client -> host: restock catalog identities (mismatch diagnosis)
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>

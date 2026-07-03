@@ -497,6 +497,7 @@ namespace CardShopCoop
             _lightManager = null;
             _cmSweep = null;
             _renamerHandled = false;
+            _catalogSent = false;
             _playerTf = null;
             _playerCamTf = null;
             _playerIpc = null;
@@ -534,6 +535,11 @@ namespace CardShopCoop
             {
                 _trades.ClientTick(_dt, inGame); // offer countdown + accept/decline keys
                 _cardBoxes.ClientTick(_dt, inGame); // carried transitions + box moves
+                if (!_catalogSent && inGame)
+                {
+                    _catalogSent = true;
+                    SendCatalogDigest();
+                }
             }
         }
 
@@ -864,12 +870,22 @@ namespace CardShopCoop
                 CoopPlugin.Log.LogWarning($"order: bad restock index {restockIndex}");
                 return;
             }
+            // the vanilla line cost rides along so a failed delivery can be REFUNDED -
+            // the wallet charge already went through before the spawn call we intercept
+            float lineCost = 0f;
+            try
+            {
+                lineCost = CPlayerData.GetItemCost(rd.itemType)
+                    * RestockManager.GetMaxItemCountInBox(rd.itemType, rd.isBigBox) * count;
+            }
+            catch { }
             Send(1, MsgType.OrderRequest, bw =>
             {
                 bw.Write((int)rd.itemType);
                 bw.Write(rd.isBigBox);
                 bw.Write(rd.name ?? "");
                 bw.Write(count);
+                bw.Write(lineCost);
             });
         }
 
@@ -890,10 +906,13 @@ namespace CardShopCoop
                 Send(1, MsgType.LicenseUnlock, bw => { bw.Write(itemType); bw.Write(isBig); bw.Write(rdName); });
         }
 
-        /// <summary>Find OUR restock entry for a partner's (itemType, boxSize) identity;
-        /// falls back to the entry name for mods whose enum ints don't line up.</summary>
-        private static int ResolveRestockIndex(int itemType, bool isBig, string name)
+        /// <summary>Find OUR restock entry for a partner's (itemType, boxSize) identity.
+        /// Tiered: exact -> name+size -> same product any size -> name any size. Content
+        /// DATA packs are invisible to the plugin-parity hash, so catalogs CAN differ
+        /// between machines - a near-match beats a silently lost order.</summary>
+        private static int ResolveRestockIndex(int itemType, bool isBig, string name, out bool sizeDiffers)
         {
+            sizeDiffers = false;
             try
             {
                 var list = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
@@ -904,6 +923,14 @@ namespace CardShopCoop
                     for (int i = 0; i < list.Count; i++)
                         if (list[i] != null && list[i].name == name && list[i].isBigBox == isBig)
                             return i;
+                sizeDiffers = true;
+                for (int i = 0; i < list.Count; i++)
+                    if (list[i] != null && (int)list[i].itemType == itemType)
+                        return i;
+                if (!string.IsNullOrEmpty(name))
+                    for (int i = 0; i < list.Count; i++)
+                        if (list[i] != null && list[i].name == name)
+                            return i;
             }
             catch { }
             return -1;
@@ -911,7 +938,7 @@ namespace CardShopCoop
 
         private void ApplyLicenseUnlock(int itemType, bool isBig, string name)
         {
-            int idx = ResolveRestockIndex(itemType, isBig, name);
+            int idx = ResolveRestockIndex(itemType, isBig, name, out _);
             if (idx < 0)
             {
                 CoopPlugin.Log.LogWarning($"license unlock: no local product for type {itemType} big={isBig} '{name}'");
@@ -926,6 +953,112 @@ namespace CardShopCoop
             }
             finally { Patches.GamePatches.ApplyingRemoteLicense = false; }
             CoopPlugin.Log.LogInfo($"license unlocked by partner: {(EItemType)itemType} big={isBig}");
+        }
+
+        // ---- product catalog diagnosis: content DATA packs (PTCGO expansions) are
+        // invisible to the plugin-parity hash, so both sides can pass the handshake
+        // while selling different product lists - orders for the missing ones fail.
+        // The joiner sends its catalog once; the host reports any difference loudly. ----
+
+        private bool _catalogSent;
+
+        private void SendCatalogDigest()
+        {
+            try
+            {
+                var list = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
+                var entries = new List<RestockData>(list.Count);
+                foreach (var rd in list) if (rd != null) entries.Add(rd);
+                Send(1, MsgType.CatalogDigest, bw =>
+                {
+                    int cnt = Mathf.Min(entries.Count, ushort.MaxValue);
+                    bw.Write((ushort)cnt);
+                    for (int i = 0; i < cnt; i++)
+                    {
+                        bw.Write((int)entries[i].itemType);
+                        bw.Write(entries[i].isBigBox);
+                        bw.Write(Fnv(entries[i].name ?? ""));
+                    }
+                });
+            }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("catalog digest: " + e.Message); }
+        }
+
+        private void CompareCatalogs(System.IO.BinaryReader br, int connId)
+        {
+            int n = br.ReadUInt16();
+            var joiner = new HashSet<long>();
+            for (int i = 0; i < n; i++)
+            {
+                int t = br.ReadInt32();
+                bool big = br.ReadBoolean();
+                int nameHash = br.ReadInt32();
+                joiner.Add(CatalogKey(t, big, nameHash));
+            }
+            var list = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
+            int hostOnly = 0, shared = 0;
+            var examples = new List<string>();
+            foreach (var rd in list)
+            {
+                if (rd == null) continue;
+                if (joiner.Contains(CatalogKey((int)rd.itemType, rd.isBigBox, Fnv(rd.name ?? ""))))
+                {
+                    shared++;
+                    continue;
+                }
+                hostOnly++;
+                if (examples.Count < 6) examples.Add(rd.name);
+            }
+            int joinerOnly = joiner.Count - shared;
+            if (hostOnly == 0 && joinerOnly == 0)
+            {
+                CoopPlugin.Log.LogInfo($"catalog check: identical ({shared} products)");
+                return;
+            }
+            string who = PeerNames.TryGetValue(connId, out var nm) ? nm : "joiner";
+            string summary = $"heads-up: product catalogs differ ({hostOnly} only on host, {joinerOnly} only on {who}) - mismatched items can't be ordered; match your content packs";
+            CoopPlugin.Log.LogWarning("catalog check: " + summary
+                + (examples.Count > 0 ? " | host-only e.g.: " + string.Join(" / ", examples.ToArray()) : ""));
+            RegisterLine = summary;
+            RegisterLineTimer = 10f;
+            Send(connId, MsgType.Toast, bw => bw.Write(summary));
+        }
+
+        private void LogCatalogCandidates(string name)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(name)) return;
+                string probe = name.Split(' ')[0];
+                var list = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
+                var found = new List<string>();
+                foreach (var rd in list)
+                {
+                    if (found.Count >= 8) break;
+                    if (rd?.name != null && rd.name.IndexOf(probe, StringComparison.OrdinalIgnoreCase) >= 0)
+                        found.Add($"{rd.name} (type {(int)rd.itemType}, big={rd.isBigBox})");
+                }
+                CoopPlugin.Log.LogInfo(found.Count > 0
+                    ? "similar host entries: " + string.Join(" | ", found.ToArray())
+                    : $"no host entries resembling '{probe}'");
+            }
+            catch { }
+        }
+
+        private static long CatalogKey(int type, bool big, int nameHash)
+        {
+            return ((long)type << 33) ^ ((long)(uint)nameHash << 1) ^ (big ? 1L : 0L);
+        }
+
+        /// <summary>Deterministic across machines (string.GetHashCode is not).</summary>
+        private static int Fnv(string s)
+        {
+            unchecked
+            {
+                uint h = 2166136261;
+                for (int i = 0; i < s.Length; i++) { h ^= s[i]; h *= 16777619; }
+                return (int)h;
+            }
         }
 
         /// <summary>Client: the joiner bought furniture - deliver it on the host.</summary>
@@ -1974,16 +2107,46 @@ namespace CardShopCoop
                         bool isBig = br.ReadBoolean();
                         string rdName = br.ReadString();
                         int count = br.ReadInt32();
+                        float cost = br.ReadSingle();
                         string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : "player";
-                        int idx = ResolveRestockIndex(itemType, isBig, rdName);
+                        int idx = ResolveRestockIndex(itemType, isBig, rdName, out bool sizeDiffers);
                         if (idx >= 0)
                         {
-                            CoopPlugin.Log.LogInfo($"{who} ordered {(EItemType)itemType} big={isBig} x{count} -> restock {idx}");
+                            CoopPlugin.Log.LogInfo($"{who} ordered {(EItemType)itemType} big={isBig} x{count} -> restock {idx}{(sizeDiffers ? " (size fallback)" : "")}");
                             RestockManager.SpawnPackageBoxItemMultipleFrame(idx, count);
+                            if (sizeDiffers)
+                                Send(msg.ConnId, MsgType.Toast, bw => bw.Write(
+                                    $"'{rdName}' delivered in the host's box size (catalogs differ slightly)"));
                         }
                         else
-                            CoopPlugin.Log.LogWarning($"{who} ordered unknown product type {itemType} '{rdName}' - skipped");
+                        {
+                            // the money is already in the shared wallet (the charge fired
+                            // before the spawn call we intercept) - give it back loudly
+                            CoopPlugin.Log.LogWarning($"{who} ordered unknown product type {itemType} '{rdName}' - refunding {cost:F0}");
+                            LogCatalogCandidates(rdName);
+                            if (cost > 0f && cost < 100000f)
+                                CEventManager.QueueEvent(new CEventPlayer_AddCoin(cost));
+                            Send(msg.ConnId, MsgType.Toast, bw => bw.Write(
+                                $"'{rdName}' isn't in the host's catalog - refunded ${cost:F0}. Match your content packs to order it."));
+                        }
                     }
+                    break;
+                }
+                case MsgType.Toast:
+                {
+                    if (Role != CoopRole.Client) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        RegisterLine = br.ReadString();
+                        RegisterLineTimer = 8f;
+                    }
+                    break;
+                }
+                case MsgType.CatalogDigest:
+                {
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                        CompareCatalogs(br, msg.ConnId);
                     break;
                 }
                 case MsgType.BoxRemoved:
