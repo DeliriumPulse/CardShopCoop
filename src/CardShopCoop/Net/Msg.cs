@@ -38,6 +38,11 @@ namespace CardShopCoop.Net
         RelayTag = 31,         // host -> clients: another client's emote/activity [senderId + kind]
         ObjMoveDelta = 32,     // host -> client: authoritative placed-object transforms
         ObjMoveRequest = 33,   // client -> host: joiner moved a shelf/counter/decoration
+        BoxState = 34,         // host -> client: full loose-box population snapshot
+        BoxRequest = 35,       // client -> host: joiner's box edits (dispense/carry/trash)
+        OrderRequest = 36,     // client -> host: joiner bought restock (spawn officially)
+        ShopName = 37,         // host -> client: the shop's name
+        ItemPriceContrib = 38, // client -> host: joiner set an item price
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>

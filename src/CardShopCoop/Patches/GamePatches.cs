@@ -46,6 +46,34 @@ namespace CardShopCoop.Patches
             // refresh event itself, so mirroring the call keeps tags in step on both sides.
             Try(h, typeof(CPlayerData), "SetCardPrice",
                 prefix: null, postfix: new HarmonyMethod(typeof(GamePatches), nameof(SetCardPricePostfix)));
+
+            // The joiner's restock ORDERS spawn on the HOST (officially, visible to all,
+            // mirrored back by BoxSync) instead of as local phantoms.
+            Try(h, typeof(RestockManager), "SpawnPackageBoxItemMultipleFrame",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(OrderPrefix)));
+
+            // The shop already has a name (the host's); the joiner's copy must neither
+            // prompt for one nor let it be changed.
+            Try(h, typeof(ShopRenamer), "ShowRenameShopScreen",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(RenamerBlockPrefix)));
+        }
+
+        public static bool OrderPrefix(int restockIndex, int count)
+        {
+            if (CoopCore.Role != CoopRole.Client) return true;
+            CoopCore.Instance?.ForwardOrder(restockIndex, count);
+            return false; // no local phantom boxes; the host's delivery mirrors back
+        }
+
+        public static bool RenamerBlockPrefix()
+        {
+            if (CoopCore.Role != CoopRole.Client) return true;
+            if (CoopCore.Instance != null)
+            {
+                CoopCore.Instance.RegisterLine = "the host names the shop";
+                CoopCore.Instance.RegisterLineTimer = 3f;
+            }
+            return false;
         }
 
         public static bool ApplyingRemotePrice;
@@ -141,6 +169,13 @@ namespace CardShopCoop.Patches
             {
                 CoopCore.Instance?.ForwardContribution(4, addFame.m_FameValue);
                 return false;
+            }
+            // The joiner set an item price: apply locally AND tell the host, whose price
+            // table is authoritative and echoes to everyone (guarded against the echo).
+            if (evt is CEventPlayer_ItemPriceChanged priceEvt && !ApplyingRemotePrice)
+            {
+                CoopCore.Instance?.ForwardItemPrice(priceEvt.m_ItemType, priceEvt.m_Price);
+                return true; // let it apply locally too - instant feedback
             }
             return true;
         }

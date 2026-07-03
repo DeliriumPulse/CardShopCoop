@@ -36,6 +36,9 @@ namespace CardShopCoop
         private readonly NpcSync _npcs = new NpcSync();
         private readonly CardShelfSync _cardShelves = new CardShelfSync();
         private readonly ObjMoveSync _objMoves = new ObjMoveSync();
+        private readonly BoxSync _boxes = new BoxSync();
+        private string _lastShopNameSent;
+        private float _shopNameTimer;
         private readonly Sync.RegisterMirror _registerMirror = new Sync.RegisterMirror();
         private float _npcSweepTimer;
         private float _regStateTimer;
@@ -127,6 +130,10 @@ namespace CardShopCoop
                 else if (Role == CoopRole.Client)
                     Send(1, MsgType.ObjMoveRequest, bw => ObjMoveSync.WriteEntries(bw, changes));
             };
+            _boxes.OnHostSnapshot = list =>
+                Broadcast(MsgType.BoxState, bw => BoxSync.WriteEntries(bw, list));
+            _boxes.OnClientChanges = list =>
+                Send(1, MsgType.BoxRequest, bw => BoxSync.WriteEntries(bw, list));
             SceneManager.sceneLoaded += OnSceneLoaded;
 
             var args = Environment.GetCommandLineArgs();
@@ -310,6 +317,7 @@ namespace CardShopCoop
             _npcs.Reset();
             _cardShelves.Reset();
             _objMoves.Reset();
+            _boxes.Reset();
             _registerMirror.Reset();
             PromptLine = "";
             _lightManager = null;
@@ -501,6 +509,20 @@ namespace CardShopCoop
             });
         }
 
+        /// <summary>Client: the joiner bought restock - spawn the delivery on the host.</summary>
+        public void ForwardOrder(int restockIndex, int count)
+        {
+            if (Role != CoopRole.Client || _net == null) return;
+            Send(1, MsgType.OrderRequest, bw => { bw.Write(restockIndex); bw.Write(count); });
+        }
+
+        /// <summary>Client: the joiner set an item price - the host's table is authoritative.</summary>
+        public void ForwardItemPrice(EItemType itemType, float price)
+        {
+            if (Role != CoopRole.Client || _net == null) return;
+            Send(1, MsgType.ItemPriceContrib, bw => { bw.Write((int)itemType); bw.Write(price); });
+        }
+
         /// <summary>Both roles: mirror a marked-card-price change.</summary>
         public void ForwardCardPrice(CardData card, float price)
         {
@@ -536,8 +558,10 @@ namespace CardShopCoop
             _npcs.Reset();
             _cardShelves.Reset();
             _objMoves.Reset();
+            _boxes.Reset();
             _registerMirror.Reset();
             PromptLine = "";
+            _lastShopNameSent = null;
             _steamLobby.Leave();
             IsSteamSession = false;
             HostPassword = "";
@@ -597,7 +621,7 @@ namespace CardShopCoop
                 Guarded("serve", () =>
                 {
                     var tf = ResolvePlayer();
-                    int idx = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, 7f, quiet: !serveTap) : -1;
+                    int idx = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, 3.5f, quiet: !serveTap) : -1;
                     if (idx < 0)
                     {
                         if (serveTap) // don't nag every repeat while held
@@ -630,7 +654,7 @@ namespace CardShopCoop
                         return;
                     }
                     var tf = ResolvePlayer();
-                    int near = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, 7f, quiet: true) : -1;
+                    int near = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, 3.5f, quiet: true) : -1;
                     if (near >= 0 && _registerMirror.IsPaymentPhase(near))
                     {
                         _serveThrottle = 0.3f;
@@ -694,6 +718,11 @@ namespace CardShopCoop
             Guarded("world", () => _world.Tick(dt, syncActive));
             Guarded("cardshelves", () => _cardShelves.Tick(dt, syncActive));
             Guarded("objmoves", () => _objMoves.Tick(dt, syncActive));
+            Guarded("boxes", () =>
+            {
+                if (Role == CoopRole.Host) _boxes.HostTick(dt, syncActive);
+                else if (Role == CoopRole.Client) _boxes.ClientTick(dt, syncActive);
+            });
 
             if (Role == CoopRole.Client)
             {
@@ -706,7 +735,7 @@ namespace CardShopCoop
                     {
                         _regStateTimer = 0f;
                         var tf = ResolvePlayer();
-                        int near = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, 7f, quiet: true) : -1;
+                        int near = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, 3.5f, quiet: true) : -1;
                         PromptLine = _registerMirror.PromptFor(near) ?? "";
                     }
                 });
@@ -938,6 +967,18 @@ namespace CardShopCoop
                 catch (Exception e) { CoopPlugin.Log.LogWarning("price sync: " + e.Message); }
             }
 
+            _shopNameTimer += dt;
+            if (_shopNameTimer >= 3f)
+            {
+                _shopNameTimer = 0f;
+                string name = CPlayerData.GetPlayerName();
+                if (name != _lastShopNameSent)
+                {
+                    _lastShopNameSent = name;
+                    Broadcast(MsgType.ShopName, bw => bw.Write(name));
+                }
+            }
+
             _econTimer += dt;
             if (_econTimer >= 0.5f)
             {
@@ -1131,15 +1172,20 @@ namespace CardShopCoop
                     {
                         int n = br.ReadUInt16();
                         var prices = CPlayerData.m_SetItemPriceList;
-                        for (int i = 0; i < n && i < prices.Count; i++)
+                        Patches.GamePatches.ApplyingRemotePrice = true; // don't echo these back
+                        try
                         {
-                            float v = br.ReadSingle();
-                            if (Math.Abs(prices[i] - v) > 0.0001f)
+                            for (int i = 0; i < n && i < prices.Count; i++)
                             {
-                                prices[i] = v;
-                                CEventManager.QueueEvent(new CEventPlayer_ItemPriceChanged((EItemType)i, v));
+                                float v = br.ReadSingle();
+                                if (Math.Abs(prices[i] - v) > 0.0001f)
+                                {
+                                    prices[i] = v;
+                                    CEventManager.QueueEvent(new CEventPlayer_ItemPriceChanged((EItemType)i, v));
+                                }
                             }
                         }
+                        finally { Patches.GamePatches.ApplyingRemotePrice = false; }
                     }
                     break;
                 }
@@ -1385,6 +1431,66 @@ namespace CardShopCoop
                     if (Role != CoopRole.Host || !InGameLevel()) break;
                     using (var br = Msg.Reader(msg.Payload))
                         _cardShelves.ApplyRemote(CardShelfSync.ReadEntries(br));
+                    break;
+                }
+                case MsgType.BoxState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                        _boxes.ClientApply(BoxSync.ReadEntries(br));
+                    break;
+                }
+                case MsgType.BoxRequest:
+                {
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                        _boxes.HostApplyRequest(BoxSync.ReadEntries(br));
+                    break;
+                }
+                case MsgType.OrderRequest:
+                {
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        int restockIndex = br.ReadInt32();
+                        int count = br.ReadInt32();
+                        string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : "player";
+                        CoopPlugin.Log.LogInfo($"{who} ordered restock {restockIndex} x{count}");
+                        RestockManager.SpawnPackageBoxItemMultipleFrame(restockIndex, count);
+                    }
+                    break;
+                }
+                case MsgType.ShopName:
+                {
+                    if (Role != CoopRole.Client) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        string name = br.ReadString();
+                        if (name.Length > 0 && CPlayerData.GetPlayerName() != name)
+                        {
+                            CPlayerData.PlayerName = name;
+                            CoopPlugin.Log.LogInfo("shop name synced: " + name);
+                        }
+                    }
+                    break;
+                }
+                case MsgType.ItemPriceContrib:
+                {
+                    if (Role != CoopRole.Host) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        int itemType = br.ReadInt32();
+                        float price = br.ReadSingle();
+                        var prices = CPlayerData.m_SetItemPriceList;
+                        if (itemType >= 0 && itemType < prices.Count)
+                        {
+                            prices[itemType] = price;
+                            Patches.GamePatches.ApplyingRemotePrice = true;
+                            try { CEventManager.QueueEvent(new CEventPlayer_ItemPriceChanged((EItemType)itemType, price)); }
+                            finally { Patches.GamePatches.ApplyingRemotePrice = false; }
+                            // the periodic PriceList broadcast echoes this to every client
+                        }
+                    }
                     break;
                 }
                 case MsgType.ObjMoveDelta:

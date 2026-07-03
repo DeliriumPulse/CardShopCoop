@@ -28,7 +28,7 @@ namespace CardShopCoop.Sync
         private static readonly FieldInfo FiScannedCount = AccessTools.Field(typeof(Customer), "m_ItemScannedCount");
 
         /// <summary>Client: nearest cashier counter index within reach, or -1.</summary>
-        public static int FindNearestCounter(Vector3 playerPos, float maxDist = 7f, bool quiet = false)
+        public static int FindNearestCounter(Vector3 playerPos, float maxDist = 3.5f, bool quiet = false)
         {
             var sm = Object.FindObjectOfType<ShelfManager>();
             if (sm == null) { if (!quiet) CoopPlugin.Log.LogInfo("serve: no ShelfManager"); return -1; }
