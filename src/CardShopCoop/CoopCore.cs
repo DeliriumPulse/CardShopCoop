@@ -103,6 +103,11 @@ namespace CardShopCoop
         private static readonly FieldInfo FiTimeMinFloat = typeof(LightManager).GetField("m_TimeMinFloat", BindingFlags.NonPublic | BindingFlags.Instance);
         private static readonly FieldInfo FiHasDayEnded = typeof(LightManager).GetField("m_HasDayEnded", BindingFlags.NonPublic | BindingFlags.Instance);
         private static readonly System.Reflection.MethodInfo MiDayReset = typeof(LightManager).GetMethod("DelayUpdateEnv", BindingFlags.NonPublic | BindingFlags.Instance);
+        private static readonly FieldInfo FiTimeOfDayIdx = typeof(LightManager).GetField("m_TImeOfDayIndex", BindingFlags.NonPublic | BindingFlags.Instance);
+        private static readonly FieldInfo FiFinishLoading = typeof(LightManager).GetField("m_FinishLoading", BindingFlags.NonPublic | BindingFlags.Instance);
+        private static readonly System.Reflection.MethodInfo MiLightInit = typeof(LightManager).GetMethod("Init", BindingFlags.NonPublic | BindingFlags.Instance);
+        private static readonly System.Reflection.MethodInfo MiUpdateLightData = typeof(LightManager).GetMethod("UpdateLightTimeData", BindingFlags.NonPublic | BindingFlags.Instance);
+        private float _lightSyncTimer;
         private LightManager _lightManager;
 
         // headless auto-test / shortcut args: -coopautohost=SLOT  -coopautojoin=IP
@@ -1002,6 +1007,25 @@ namespace CardShopCoop
                 }
             }
 
+            // full lighting-state sync: the sky phase runs on internal timers the clock
+            // sync can't correct (the "night at 11 AM" drift)
+            _lightSyncTimer += dt;
+            if (_lightSyncTimer >= 5f)
+            {
+                _lightSyncTimer = 0f;
+                try
+                {
+                    if (_lightManager == null) _lightManager = FindObjectOfType<LightManager>();
+                    if (_lightManager != null && MiUpdateLightData != null && CPlayerData.m_LightTimeData != null)
+                    {
+                        MiUpdateLightData.Invoke(_lightManager, null); // refresh bundle from live state
+                        string lightJson = JsonUtility.ToJson(CPlayerData.m_LightTimeData);
+                        Broadcast(MsgType.LightState, bw => bw.Write(lightJson));
+                    }
+                }
+                catch (Exception e) { CoopPlugin.Log.LogWarning("light sync: " + e.Message); }
+            }
+
             _dayTimer += dt;
             if (_dayTimer >= 2f)
             {
@@ -1457,6 +1481,35 @@ namespace CardShopCoop
                         string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : "player";
                         CoopPlugin.Log.LogInfo($"{who} ordered restock {restockIndex} x{count}");
                         RestockManager.SpawnPackageBoxItemMultipleFrame(restockIndex, count);
+                    }
+                    break;
+                }
+                case MsgType.LightState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        var data = JsonUtility.FromJson<LightTimeData>(br.ReadString());
+                        if (data == null) break;
+                        try
+                        {
+                            if (_lightManager == null) _lightManager = FindObjectOfType<LightManager>();
+                            if (_lightManager == null) break;
+                            int localIdx = FiTimeOfDayIdx?.GetValue(_lightManager) is int idx ? idx : -1;
+                            int localHour = FiTimeHour?.GetValue(_lightManager) is int h ? h : -1;
+                            int localMin = FiTimeMin?.GetValue(_lightManager) is int m2 ? m2 : 0;
+                            int driftMin = Math.Abs((data.m_TimeHour * 60 + data.m_TimeMin) - (localHour * 60 + localMin));
+                            // re-run the game's own lighting restore only when the sky
+                            // phase actually differs (avoids music/blend churn)
+                            if (localIdx != data.m_TImeOfDayIndex || driftMin > 4)
+                            {
+                                CPlayerData.m_LightTimeData = data;
+                                FiFinishLoading?.SetValue(_lightManager, false);
+                                MiLightInit?.Invoke(_lightManager, null);
+                                CoopPlugin.Log.LogInfo($"lighting re-synced (phase {localIdx}->{data.m_TImeOfDayIndex}, drift {driftMin}min)");
+                            }
+                        }
+                        catch (Exception e) { CoopPlugin.Log.LogWarning("light apply: " + e.Message); }
                     }
                     break;
                 }
