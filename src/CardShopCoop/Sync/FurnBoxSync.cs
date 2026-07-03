@@ -770,6 +770,18 @@ namespace CardShopCoop.Sync
                 {
                     t.SetPositionAndRotation(pos, Quaternion.Euler(0f, yaw, 0f));
                     ObjMoveSync.SyncTagGroup(t); // box price tags ride in their own group
+                    try
+                    {
+                        // a sleeping rigidbody teleported mid-air hangs there frozen
+                        var rb = box.GetComponentInChildren<Rigidbody>();
+                        if (rb != null && !rb.isKinematic)
+                        {
+                            rb.velocity = Vector3.zero;
+                            rb.angularVelocity = Vector3.zero;
+                            rb.WakeUp();
+                        }
+                    }
+                    catch { }
                 }
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("FurnBoxSync apply: " + e.Message); }

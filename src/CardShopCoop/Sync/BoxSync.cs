@@ -25,6 +25,7 @@ namespace CardShopCoop.Sync
             public bool IsBig;
             public bool IsOpen;
             public bool Carried; // in someone's hands: position is transient, don't apply
+            public bool Settled; // physics at rest: only settled poses are applied
             public Vector3 Pos;
             public float Yaw;
         }
@@ -92,6 +93,17 @@ namespace CardShopCoop.Sync
 
         private static Entry Snapshot(InteractablePackagingBox_Item box)
         {
+            // mid-tumble poses must never be broadcast: applying them teleports the
+            // other side's copy through the air (and a teleported SLEEPING body
+            // freezes there) - only settled poses cross the wire
+            bool settled = true;
+            try
+            {
+                var rb = box.GetComponentInChildren<Rigidbody>();
+                settled = rb == null || rb.isKinematic || rb.IsSleeping()
+                    || rb.velocity.sqrMagnitude < 0.04f;
+            }
+            catch { }
             return new Entry
             {
                 Type = (int)box.m_ItemCompartment.GetItemType(),
@@ -99,6 +111,7 @@ namespace CardShopCoop.Sync
                 IsBig = box.m_IsBigBox,
                 IsOpen = box.IsBoxOpened(),
                 Carried = IsLocallyCarried(box),
+                Settled = settled,
                 Pos = box.transform.position,
                 Yaw = box.transform.eulerAngles.y,
             };
@@ -159,7 +172,7 @@ namespace CardShopCoop.Sync
                     var e = list[i];
                     hash = hash * 31 + e.Type;
                     hash = hash * 31 + e.Count;
-                    hash = hash * 31 + ((e.IsBig ? 1 : 0) | (e.IsOpen ? 2 : 0) | (e.Carried ? 4 : 0));
+                    hash = hash * 31 + ((e.IsBig ? 1 : 0) | (e.IsOpen ? 2 : 0) | (e.Carried ? 4 : 0) | (e.Settled ? 8 : 0));
                     hash = hash * 31 + (int)(e.Pos.x * 8f);
                     hash = hash * 31 + (int)(e.Pos.z * 8f);
                 }
@@ -452,7 +465,7 @@ namespace CardShopCoop.Sync
                         FiAmountToSpawn?.SetValue(box, want.Count);
                     }
                 }
-                if (applyPosition)
+                if (applyPosition && want.Settled)
                 {
                     var t = box.transform;
                     if ((t.position - want.Pos).sqrMagnitude > 0.01f
@@ -460,6 +473,19 @@ namespace CardShopCoop.Sync
                     {
                         t.SetPositionAndRotation(want.Pos, Quaternion.Euler(0f, want.Yaw, 0f));
                         ObjMoveSync.SyncTagGroup(t); // box price tags ride in their own group
+                        try
+                        {
+                            // kill local tumble and WAKE the body: a sleeping rigidbody
+                            // teleported mid-air hangs there frozen until poked
+                            var rb = box.GetComponentInChildren<Rigidbody>();
+                            if (rb != null && !rb.isKinematic)
+                            {
+                                rb.velocity = Vector3.zero;
+                                rb.angularVelocity = Vector3.zero;
+                                rb.WakeUp();
+                            }
+                        }
+                        catch { }
                     }
                 }
             }
@@ -476,7 +502,7 @@ namespace CardShopCoop.Sync
                 var e = entries[i];
                 bw.Write(e.Type);
                 bw.Write((ushort)Mathf.Clamp(e.Count, 0, ushort.MaxValue));
-                bw.Write((byte)((e.IsBig ? 1 : 0) | (e.IsOpen ? 2 : 0) | (e.Carried ? 4 : 0)));
+                bw.Write((byte)((e.IsBig ? 1 : 0) | (e.IsOpen ? 2 : 0) | (e.Carried ? 4 : 0) | (e.Settled ? 8 : 0)));
                 bw.Write(e.Pos.x); bw.Write(e.Pos.y); bw.Write(e.Pos.z);
                 bw.Write(e.Yaw);
             }
@@ -493,6 +519,7 @@ namespace CardShopCoop.Sync
                 e.IsBig = (f & 1) != 0;
                 e.IsOpen = (f & 2) != 0;
                 e.Carried = (f & 4) != 0;
+                e.Settled = (f & 8) != 0;
                 e.Pos = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
                 e.Yaw = br.ReadSingle();
                 list.Add(e);
