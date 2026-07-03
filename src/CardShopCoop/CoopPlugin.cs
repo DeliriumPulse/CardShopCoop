@@ -11,7 +11,7 @@ namespace CardShopCoop
     {
         public const string Guid = "com.zwhit.cardshopcoop";
         public const string Name = "CardShopCoop";
-        public const string Version = "0.11.0";
+        public const string Version = "0.11.1";
 
         public static ManualLogSource Log;
 

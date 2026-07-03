@@ -80,6 +80,29 @@ namespace CardShopCoop.Net
             return new BinaryReader(new MemoryStream(payload, writable: false));
         }
 
+        /// <summary>World/bundle transfers are gzipped: the EPL sidecar json compresses
+        /// ~5-10x, turning a minutes-long relay transfer into seconds.</summary>
+        public static byte[] Gzip(byte[] data)
+        {
+            using (var ms = new MemoryStream())
+            {
+                using (var gz = new System.IO.Compression.GZipStream(ms, System.IO.Compression.CompressionLevel.Fastest))
+                    gz.Write(data, 0, data.Length);
+                return ms.ToArray();
+            }
+        }
+
+        public static byte[] Gunzip(byte[] data)
+        {
+            using (var src = new MemoryStream(data, writable: false))
+            using (var gz = new System.IO.Compression.GZipStream(src, System.IO.Compression.CompressionMode.Decompress))
+            using (var dst = new MemoryStream())
+            {
+                gz.CopyTo(dst);
+                return dst.ToArray();
+            }
+        }
+
         /// <summary>Shared CardData wire format (used by CardDelta, CardShelfDelta, CardPriceSet).</summary>
         public static void WriteCard(BinaryWriter bw, CardData card)
         {

@@ -70,6 +70,7 @@
       <HintPath>$(ManagedPath)\UnityEngine.JSONSerializeModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="System.IO.Compression" />
   </ItemGroup>
 
   <Target Name="DeployToPlugins" AfterTargets="Build" Condition="'$(SkipDeploy)' != 'true'">

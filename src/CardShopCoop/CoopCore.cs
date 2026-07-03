@@ -275,6 +275,38 @@ namespace CardShopCoop
             }
         }
 
+        // card/price mirrors that arrived during a scene load, flushed once in-game
+        private struct PendingCard { public bool IsAdd; public int Amount; public CardData Card; }
+        private readonly List<PendingCard> _pendingCardDeltas = new List<PendingCard>();
+        private readonly List<KeyValuePair<CardData, float>> _pendingCardPrices = new List<KeyValuePair<CardData, float>>();
+
+        private static void ApplyCardDelta(bool isAdd, int amount, CardData card)
+        {
+            Patches.GamePatches.ApplyingRemoteCards = true;
+            try
+            {
+                if (isAdd) CPlayerData.AddCard(card, amount);
+                else CPlayerData.ReduceCard(card, amount);
+            }
+            finally { Patches.GamePatches.ApplyingRemoteCards = false; }
+        }
+
+        private void FlushPendingCardWork()
+        {
+            if (!InGameLevel() || (_pendingCardDeltas.Count == 0 && _pendingCardPrices.Count == 0)) return;
+            Guarded("pending-cards", () =>
+            {
+                foreach (var p in _pendingCardDeltas) ApplyCardDelta(p.IsAdd, p.Amount, p.Card);
+                if (_pendingCardDeltas.Count > 0)
+                    CoopPlugin.Log.LogInfo($"applied {_pendingCardDeltas.Count} card change(s) held during loading");
+                _pendingCardDeltas.Clear();
+                Patches.GamePatches.ApplyingRemotePrice = true;
+                try { foreach (var p in _pendingCardPrices) CPlayerData.SetCardPrice(p.Key, p.Value); }
+                finally { Patches.GamePatches.ApplyingRemotePrice = false; }
+                _pendingCardPrices.Clear();
+            });
+        }
+
         private void RelayTagToOthers(int senderConn, byte kind, int extra = -1)
         {
             if (Role != CoopRole.Host || _net == null || _net.ConnectionCount <= 1) return;
@@ -725,6 +757,8 @@ namespace CardShopCoop
 
             // Every stage is individually armored: one failing subsystem must degrade
             // that feature only, never kill position sync for the whole session.
+            FlushPendingCardWork();
+
             Guarded("avatars", () => _avatars.Tick(dt));
             bool syncActive = Role != CoopRole.None && _net.ConnectionCount > 0 && InGameLevel();
             Guarded("world", () => _world.Tick(dt, syncActive));
@@ -1129,6 +1163,8 @@ namespace CardShopCoop
                         int len = br.ReadInt32();
                         var bytes = br.ReadBytes(len);
                         _saveBuf.Write(bytes, 0, bytes.Length);
+                        if (_saveExpected > 0)
+                            StatusLine = $"downloading shop... {Math.Min(100, _saveBuf.Length * 100 / _saveExpected)}%";
                     }
                     break;
                 }
@@ -1137,15 +1173,27 @@ namespace CardShopCoop
                     if (Role != CoopRole.Client || _saveBuf == null || _worldRequested) break;
                     var data = _saveBuf.ToArray();
                     _saveBuf = null;
-                    if ((_saveExpected >= 0 && data.Length != _saveExpected)
-                        || data.Length < 1024 || data[0] != (byte)'{')
+                    if (_saveExpected >= 0 && data.Length != _saveExpected)
                     {
                         ErrorLine = $"World download looked corrupted ({data.Length}/{_saveExpected} bytes) - try again.";
                         Shutdown("bad download");
                         break;
                     }
+                    try { data = Msg.Gunzip(data); }
+                    catch
+                    {
+                        ErrorLine = "World download could not be unpacked - try again.";
+                        Shutdown("bad download");
+                        break;
+                    }
+                    if (data.Length < 1024 || data[0] != (byte)'{')
+                    {
+                        ErrorLine = "World download looked corrupted - try again.";
+                        Shutdown("bad download");
+                        break;
+                    }
                     _pendingSave = data;
-                    StatusLine = "Shop received - waiting for mod data...";
+                    StatusLine = "shop received - downloading mod data...";
                     break;
                 }
                 case MsgType.BundleChunk:
@@ -1157,6 +1205,8 @@ namespace CardShopCoop
                         int len = br.ReadInt32();
                         var bytes = br.ReadBytes(len);
                         _bundleBuf.Write(bytes, 0, bytes.Length);
+                        if (_bundleExpected > 0)
+                            StatusLine = $"downloading mod data... {Math.Min(100, _bundleBuf.Length * 100 / _bundleExpected)}%";
                     }
                     break;
                 }
@@ -1169,6 +1219,7 @@ namespace CardShopCoop
                     StatusLine = "World received - loading...";
                     try
                     {
+                        if (bundle.Length > 0) bundle = Msg.Gunzip(bundle);
                         SidecarTransfer.ApplyBundle(bundle, _hostSlot, SaveTransfer.CoopSlot);
                     }
                     catch (Exception e)
@@ -1433,13 +1484,14 @@ namespace CardShopCoop
                             cardGrade = br.ReadInt32(),
                             gradedCardIndex = br.ReadInt32(),
                         };
-                        Patches.GamePatches.ApplyingRemoteCards = true;
-                        try
+                        if (!InGameLevel())
                         {
-                            if (isAdd) CPlayerData.AddCard(card, amount);
-                            else CPlayerData.ReduceCard(card, amount);
+                            // applying mid-scene-load crashes into uninitialized card data;
+                            // hold it and flush once the world is up (nothing is lost)
+                            _pendingCardDeltas.Add(new PendingCard { IsAdd = isAdd, Amount = amount, Card = card });
+                            break;
                         }
-                        finally { Patches.GamePatches.ApplyingRemoteCards = false; }
+                        ApplyCardDelta(isAdd, amount, card);
                     }
                     break;
                 }
@@ -1573,6 +1625,11 @@ namespace CardShopCoop
                     {
                         var card = Msg.ReadCard(br);
                         float price = br.ReadSingle();
+                        if (!InGameLevel())
+                        {
+                            _pendingCardPrices.Add(new KeyValuePair<CardData, float>(card, price));
+                            break;
+                        }
                         Patches.GamePatches.ApplyingRemotePrice = true;
                         try { CPlayerData.SetCardPrice(card, price); }
                         finally { Patches.GamePatches.ApplyingRemotePrice = false; }
@@ -1691,8 +1748,13 @@ namespace CardShopCoop
             try
             {
                 hostSlot = CSingleton<CGameManager>.Instance.m_CurrentSaveLoadSlotSelectedIndex;
-                payload = SaveTransfer.BuildHostPayload();
-                try { bundle = SidecarTransfer.BuildBundle(hostSlot); }
+                payload = Msg.Gzip(SaveTransfer.BuildHostPayload());
+                try
+                {
+                    var raw = SidecarTransfer.BuildBundle(hostSlot);
+                    bundle = raw.Length > 0 ? Msg.Gzip(raw) : raw;
+                    CoopPlugin.Log.LogInfo($"transfer: save {payload.Length / 1024} KB, mod data {bundle.Length / 1024} KB (compressed)");
+                }
                 catch (Exception e)
                 {
                     CoopPlugin.Log.LogWarning("Sidecar bundle failed (sending base save only): " + e.Message);
