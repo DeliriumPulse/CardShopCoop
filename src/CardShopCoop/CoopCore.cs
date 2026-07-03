@@ -230,7 +230,11 @@ namespace CardShopCoop
                     _cardShelves.InvalidateBaseline();
             };
             _actNetPump = () => _net.PumpMainThread();
-            _actAvatars = () => _avatars.Tick(_dt);
+            _actAvatars = () =>
+            {
+                AvatarManager.ViewCamera = _playerCamTf; // the camera the player SEES through
+                _avatars.Tick(_dt);
+            };
             _actWorld = () => _world.Tick(_dt, _syncActive);
             _actCardShelves = () =>
             {

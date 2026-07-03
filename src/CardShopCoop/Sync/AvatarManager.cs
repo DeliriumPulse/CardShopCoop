@@ -29,8 +29,8 @@ namespace CardShopCoop.Sync
             public Animator Anim;
             public bool HasMoveSpeed;
             public bool HasHoldingBox;
-            public TextMesh NameTag;
-            public TextMesh EmoteTag;
+            public TMPro.TMP_Text NameTag;
+            public TMPro.TMP_Text EmoteTag;
             public GameObject HoldProp;
             public Material HoldPropMat;  // instanced by the tint at spawn; Destroy(Go) alone leaks it
             public string Name = "Player";
@@ -332,7 +332,10 @@ namespace CardShopCoop.Sync
                           && CSingleton<CGameManager>.Instance.m_IsGameLevel;
             if (!inGame) return;
 
-            var cam = Camera.main; // one lookup per Tick, not per avatar
+            // billboard against the camera the player actually SEES THROUGH - the game
+            // runs several cameras, and Camera.main can be one of the others, which
+            // left name tags facing a phantom viewpoint (mirrored from one side)
+            var cam = ViewCamera != null ? ViewCamera : Camera.main?.transform;
 
             foreach (var av in _avatars.Values)
             {
@@ -495,10 +498,10 @@ namespace CardShopCoop.Sync
                 {
                     if (av.NameTag != null)
                         av.NameTag.transform.rotation =
-                            Quaternion.LookRotation(av.NameTag.transform.position - cam.transform.position);
+                            Quaternion.LookRotation(av.NameTag.transform.position - cam.position);
                     if (av.EmoteTag != null)
                         av.EmoteTag.transform.rotation =
-                            Quaternion.LookRotation(av.EmoteTag.transform.position - cam.transform.position);
+                            Quaternion.LookRotation(av.EmoteTag.transform.position - cam.position);
                 }
 
                 if (av.EmoteTimer > 0f)
@@ -695,35 +698,40 @@ namespace CardShopCoop.Sync
             }
         }
 
-        private static TextMesh MakeTag(Transform parent, string text, float height, Color color)
+        /// <summary>Set by CoopCore each frame: the transform of the camera the player
+        /// actually renders through (Camera.main can be a different, stationary one).</summary>
+        public static Transform ViewCamera;
+
+        private static TMPro.TMP_FontAsset _tagFont;
+
+        /// <summary>World-space TextMeshPro label. TMP's distance-field material is
+        /// depth-tested, so walls occlude the tag (the legacy TextMesh font shader drew
+        /// on top of everything), and the SDF glyphs stay crisp at any distance.</summary>
+        private static TMPro.TMP_Text MakeTag(Transform parent, string text, float height, Color color)
         {
             var go = new GameObject("CoopTag");
             go.transform.SetParent(parent, worldPositionStays: false);
             go.transform.localPosition = new Vector3(0f, height, 0f);
-            var tm = go.AddComponent<TextMesh>();
-            tm.text = text;
-            tm.anchor = TextAnchor.MiddleCenter;
-            tm.alignment = TextAlignment.Center;
-            tm.characterSize = 0.02f;
-            tm.fontSize = 96;
-            tm.color = color;
-            Font font = null;
-            try { font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf"); } catch { }
-            if (font == null)
+            var tmp = go.AddComponent<TMPro.TextMeshPro>();
+            tmp.text = text;
+            tmp.alignment = TMPro.TextAlignmentOptions.Center;
+            tmp.fontSize = 1.8f;
+            tmp.color = color;
+            tmp.enableWordWrapping = false;
+            tmp.overflowMode = TMPro.TextOverflowModes.Overflow;
+            tmp.rectTransform.sizeDelta = new Vector2(4f, 1f);
+            if (_tagFont == null)
             {
-                try { font = Resources.GetBuiltinResource<Font>("Arial.ttf"); } catch { }
+                _tagFont = TMPro.TMP_Settings.defaultFontAsset;
+                if (_tagFont == null)
+                {
+                    // borrow the font any of the game's own TMP labels use
+                    var any = UnityEngine.Object.FindObjectOfType<TMPro.TMP_Text>(true);
+                    if (any != null) _tagFont = any.font;
+                }
             }
-            if (font != null)
-            {
-                tm.font = font;
-                var mr = go.GetComponent<MeshRenderer>();
-                if (mr != null) mr.material = font.material;
-            }
-            else
-            {
-                CoopPlugin.Log.LogWarning("No builtin font found - name tags will be invisible");
-            }
-            return tm;
+            if (_tagFont != null) tmp.font = _tagFont;
+            return tmp;
         }
     }
 }
