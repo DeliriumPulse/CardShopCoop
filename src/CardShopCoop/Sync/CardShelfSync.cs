@@ -150,6 +150,27 @@ namespace CardShopCoop.Sync
             }
         }
 
+        /// <summary>Remove a displayed card the way the vanilla purchase path does:
+        /// DisableAllCard alone despawns the card but leaves the slot's PRICE TAG
+        /// showing the sold card's price forever (the "stuck tag" bug). Mirrors
+        /// InteractableCardCompartment.RemoveCardFromShelf's tag bookkeeping.</summary>
+        private static void ClearSlot(InteractableCardCompartment comp)
+        {
+            comp.DisableAllCard(); // game's own card3d cleanup
+            try
+            {
+                comp.m_StoredCardList.Clear();
+                for (int i = 0; i < comp.m_InteractablePriceTagList.Count; i++)
+                    comp.m_InteractablePriceTagList[i].SetPriceChecked(isPriceSet: false);
+                comp.SetPriceTagCardData(null);
+                comp.SetPriceTagVisibility(isVisible: false);
+            }
+            catch (Exception ex)
+            {
+                CoopPlugin.Log.LogWarning("CardShelfSync tag clear: " + ex.Message);
+            }
+        }
+
         /// <summary>False = state unknown right now (a stored card's pooled UI is
         /// distance-culled or detached) - callers must NOT treat that as empty.</summary>
         private static bool TryReadSlot(InteractableCardCompartment comp, out CardData card)
@@ -215,7 +236,7 @@ namespace CardShopCoop.Sync
             bool hasCard = comp.m_StoredCardList.Count > 0;
             if (!e.Occupied)
             {
-                if (hasCard) comp.DisableAllCard(); // game's own cleanup path
+                if (hasCard) ClearSlot(comp);
                 return;
             }
             if (hasCard)
@@ -225,7 +246,7 @@ namespace CardShopCoop.Sync
                 if (TryReadSlot(comp, out CardData current) && current != null
                     && SlotState.From(current).Matches(e.Card))
                     return;
-                comp.DisableAllCard();
+                ClearSlot(comp);
             }
 
             // The game's save-load recipe for putting a card on display (CardShelf.LoadCardCompartment)

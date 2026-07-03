@@ -209,22 +209,35 @@ namespace CardShopCoop.Sync
         // ---------------- wire helpers ----------------
 
         // Percent changes are game-clamped to [-80, 200]; x100 fits a short, and 0.01%
-        // resolution is beyond anything the UI displays. Halves the snapshot size.
+        // resolution is beyond anything the UI displays. The list is indexed by RAW
+        // itemType and EPL registers modded items at huge enum values (~200k entries),
+        // so only non-zero entries ship, as (index, pct) pairs - a dense send both
+        // truncated past 65535 (modded items never synced) and wasted ~128KB per roll.
         private static void WritePercents(BinaryWriter bw, List<float> list)
         {
-            int n = Mathf.Min(list?.Count ?? 0, ushort.MaxValue);
-            bw.Write((ushort)n);
-            for (int i = 0; i < n; i++)
-                bw.Write((short)Mathf.Clamp(Mathf.RoundToInt(list[i] * 100f), short.MinValue, short.MaxValue));
+            int nonZero = 0;
+            if (list != null)
+                for (int i = 0; i < list.Count; i++) if (list[i] != 0f) nonZero++;
+            bw.Write(nonZero);
+            if (list != null)
+                for (int i = 0; i < list.Count; i++)
+                    if (list[i] != 0f)
+                    {
+                        bw.Write(i);
+                        bw.Write((short)Mathf.Clamp(Mathf.RoundToInt(list[i] * 100f), short.MinValue, short.MaxValue));
+                    }
         }
 
         private static void ReadPercentsInto(BinaryReader br, List<float> list)
         {
-            int n = br.ReadUInt16();
-            for (int i = 0; i < n; i++)
+            if (list != null)
+                for (int i = 0; i < list.Count; i++) list[i] = 0f; // absent = no change rolled
+            int n = br.ReadInt32();
+            for (int k = 0; k < n; k++)
             {
+                int i = br.ReadInt32();
                 float v = br.ReadInt16() / 100f; // always consume the wire bytes
-                if (list != null && i < list.Count) list[i] = v;
+                if (list != null && i >= 0 && i < list.Count) list[i] = v;
             }
         }
 

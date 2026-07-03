@@ -961,6 +961,8 @@ namespace CardShopCoop
         // The joiner sends its catalog once; the host reports any difference loudly. ----
 
         private bool _catalogSent;
+        private HashSet<int> _clientPriced = new HashSet<int>();   // itemTypes the host has priced
+        private HashSet<int> _incomingPriced = new HashSet<int>(); // scratch, swapped per apply
 
         private void SendCatalogDigest()
         {
@@ -1469,17 +1471,32 @@ namespace CardShopCoop
                 _priceTimer -= 3f;
                 try
                 {
+                    // the table is indexed by RAW itemType and EPL registers modded items
+                    // at huge enum values (~200k entries) - ship only the set prices as
+                    // (index, price) pairs; the old whole-table send truncated its count
+                    // to 16 bits and modded prices never arrived
                     var prices = CPlayerData.m_SetItemPriceList;
                     int hash = 17;
                     for (int i = 0; i < prices.Count; i++)
+                    {
+                        if (prices[i] == 0f) continue;
+                        hash = hash * 31 + i;
                         hash = hash * 31 + prices[i].GetHashCode();
+                    }
                     if (hash != _lastPriceHash)
                     {
                         _lastPriceHash = hash;
                         Broadcast(MsgType.PriceList, bw =>
                         {
-                            bw.Write((ushort)prices.Count);
-                            for (int i = 0; i < prices.Count; i++) bw.Write(prices[i]);
+                            int nonZero = 0;
+                            for (int i = 0; i < prices.Count; i++) if (prices[i] != 0f) nonZero++;
+                            bw.Write(nonZero);
+                            for (int i = 0; i < prices.Count; i++)
+                                if (prices[i] != 0f)
+                                {
+                                    bw.Write(i);
+                                    bw.Write(prices[i]);
+                                }
                         });
                     }
                 }
@@ -1799,20 +1816,33 @@ namespace CardShopCoop
                     if (Role != CoopRole.Client) break;
                     using (var br = Msg.Reader(msg.Payload))
                     {
-                        int n = br.ReadUInt16();
+                        int n = br.ReadInt32();
                         var prices = CPlayerData.m_SetItemPriceList;
                         Patches.GamePatches.ApplyingRemotePrice = true; // don't echo these back
                         try
                         {
-                            for (int i = 0; i < n && i < prices.Count; i++)
+                            _incomingPriced.Clear();
+                            for (int k = 0; k < n; k++)
                             {
+                                int i = br.ReadInt32();
                                 float v = br.ReadSingle();
-                                if (Math.Abs(prices[i] - v) > 0.0001f)
+                                _incomingPriced.Add(i);
+                                if (i >= 0 && i < prices.Count && Math.Abs(prices[i] - v) > 0.0001f)
                                 {
                                     prices[i] = v;
                                     CEventManager.QueueEvent(new CEventPlayer_ItemPriceChanged((EItemType)i, v));
                                 }
                             }
+                            // a price the host CLEARED is absent from the sparse set
+                            foreach (int i in _clientPriced)
+                                if (!_incomingPriced.Contains(i) && i >= 0 && i < prices.Count && prices[i] != 0f)
+                                {
+                                    prices[i] = 0f;
+                                    CEventManager.QueueEvent(new CEventPlayer_ItemPriceChanged((EItemType)i, 0f));
+                                }
+                            var tmp = _clientPriced;
+                            _clientPriced = _incomingPriced;
+                            _incomingPriced = tmp;
                         }
                         finally { Patches.GamePatches.ApplyingRemotePrice = false; }
                     }
