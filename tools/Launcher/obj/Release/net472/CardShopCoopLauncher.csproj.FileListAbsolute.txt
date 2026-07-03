@@ -1,0 +1,11 @@
+C:\Users\zwhit\CardShopCoop\tools\Launcher\bin\Release\net472\CardShopCoopLauncher.exe.config
+C:\Users\zwhit\CardShopCoop\tools\Launcher\bin\Release\net472\CardShopCoopLauncher.exe
+C:\Users\zwhit\CardShopCoop\tools\Launcher\bin\Release\net472\CardShopCoopLauncher.pdb
+C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\CardShopCoopLauncher.csproj.AssemblyReference.cache
+C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\CardShopCoopLauncher.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\CardShopCoopLauncher.AssemblyInfoInputs.cache
+C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\CardShopCoopLauncher.AssemblyInfo.cs
+C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\CardShopCoopLauncher.csproj.CoreCompileInputs.cache
+C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\CardShopCoopLauncher.sourcelink.json
+C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\CardShopCoopLauncher.exe
+C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\CardShopCoopLauncher.pdb
