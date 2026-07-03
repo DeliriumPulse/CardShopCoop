@@ -1,13 +1,24 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
+    <OutputType>WinExe</OutputType>
     <TargetFramework>net472</TargetFramework>
+    <UseWPF>true</UseWPF>
     <LangVersion>9</LangVersion>
-    <Version>1.0.0</Version>
+    <Version>2.0.0</Version>
     <AssemblyName>CardShopCoopLauncher</AssemblyName>
     <RootNamespace>CardShopCoopLauncher</RootNamespace>
-    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <ApplicationIcon>launcher.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- complete, honest metadata: AV/SmartScreen heuristics penalize anonymous
+         binaries; a fully-described assembly reads as legitimate software -->
+    <Company>CardShopCoop</Company>
+    <Product>CardShopCoop Launcher</Product>
+    <Authors>DeliriumPulse</Authors>
+    <Description>Auto-updating launcher for the CardShopCoop co-op mod for TCG Card Shop Simulator. Open source: github.com/DeliriumPulse/CardShopCoop</Description>
+    <Copyright>(c) 2026 DeliriumPulse - MIT License</Copyright>
+    <AssemblyTitle>CardShopCoop Launcher</AssemblyTitle>
+    <NeutralLanguage>en</NeutralLanguage>
   </PropertyGroup>
 
   <ItemGroup>

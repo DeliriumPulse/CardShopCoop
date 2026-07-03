@@ -9,3 +9,9 @@ C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\CardShopCoopLaunch
 C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\CardShopCoopLauncher.sourcelink.json
 C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\CardShopCoopLauncher.exe
 C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\CardShopCoopLauncher.pdb
+C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\CardShopCoopLauncher.exe.config
+C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\MainWindow.baml
+C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\MainWindow.g.cs
+C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\App.g.cs
+C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\CardShopCoopLauncher_MarkupCompile.cache
+C:\Users\zwhit\CardShopCoop\tools\Launcher\obj\Release\net472\CardShopCoopLauncher.g.resources

@@ -1,0 +1,207 @@
+<Window x:Class="CardShopCoopLauncher.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="CardShopCoop Launcher" Width="480" Height="600"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        ResizeMode="NoResize" WindowStartupLocation="CenterScreen"
+        TextOptions.TextRenderingMode="ClearType">
+
+  <Window.Resources>
+    <SolidColorBrush x:Key="Ink" Color="#e8f1fb"/>
+    <SolidColorBrush x:Key="InkDim" Color="#8aa3c0"/>
+    <SolidColorBrush x:Key="Green" Color="#2ec484"/>
+    <SolidColorBrush x:Key="GreenHi" Color="#57e6a1"/>
+    <SolidColorBrush x:Key="Blue" Color="#54a0ff"/>
+    <SolidColorBrush x:Key="Card" Color="#16233a"/>
+    <SolidColorBrush x:Key="CardEdge" Color="#24344f"/>
+
+    <Style x:Key="TitleBtn" TargetType="Button">
+      <Setter Property="Width" Value="34"/>
+      <Setter Property="Height" Value="28"/>
+      <Setter Property="Foreground" Value="{StaticResource InkDim}"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bg" Background="{TemplateBinding Background}" CornerRadius="6">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bg" Property="Background" Value="#22314b"/>
+                <Setter Property="Foreground" Value="{StaticResource Ink}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style x:Key="LinkBtn" TargetType="Button">
+      <Setter Property="Foreground" Value="{StaticResource InkDim}"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <TextBlock x:Name="txt" Text="{TemplateBinding Content}" Foreground="{TemplateBinding Foreground}"/>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="txt" Property="Foreground" Value="#7ecbff"/>
+                <Setter TargetName="txt" Property="TextDecorations" Value="Underline"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+
+  <!-- window chrome -->
+  <Border CornerRadius="16" BorderThickness="1" BorderBrush="#2a3d5c">
+    <Border.Background>
+      <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+        <GradientStop Color="#111e33" Offset="0"/>
+        <GradientStop Color="#0d1522" Offset="0.55"/>
+        <GradientStop Color="#0b1a20" Offset="1"/>
+      </LinearGradientBrush>
+    </Border.Background>
+    <Border.Effect>
+      <DropShadowEffect BlurRadius="26" ShadowDepth="0" Color="#000000" Opacity="0.65"/>
+    </Border.Effect>
+
+    <Grid Margin="22">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>  <!-- title bar -->
+        <RowDefinition Height="Auto"/>  <!-- logo -->
+        <RowDefinition Height="Auto"/>  <!-- version chips -->
+        <RowDefinition Height="Auto"/>  <!-- status card -->
+        <RowDefinition Height="*"/>     <!-- changelog -->
+        <RowDefinition Height="Auto"/>  <!-- play button -->
+        <RowDefinition Height="Auto"/>  <!-- footer -->
+      </Grid.RowDefinitions>
+
+      <!-- draggable title bar -->
+      <Grid Grid.Row="0" Background="Transparent" MouseLeftButtonDown="OnDragWindow">
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+          <Button Style="{StaticResource TitleBtn}" Content="—" Click="OnMinimize"/>
+          <Button Style="{StaticResource TitleBtn}" Content="✕" Click="OnClose"/>
+        </StackPanel>
+      </Grid>
+
+      <!-- logo -->
+      <StackPanel Grid.Row="1" Margin="2,2,0,2">
+        <TextBlock FontSize="34" FontWeight="ExtraBold">
+          <Run Text="CardShop" Foreground="{StaticResource Ink}"/><Run Text="Coop" Foreground="{StaticResource GreenHi}"/>
+        </TextBlock>
+        <TextBlock Text="run one shop together" FontSize="14" Foreground="{StaticResource InkDim}" Margin="2,0,0,0"/>
+      </StackPanel>
+
+      <!-- version chips -->
+      <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,14,0,0">
+        <Border Background="{StaticResource Card}" BorderBrush="{StaticResource CardEdge}" BorderThickness="1" CornerRadius="999" Padding="12,5">
+          <TextBlock x:Name="InstalledChip" Text="installed: —" FontSize="12" Foreground="{StaticResource InkDim}"/>
+        </Border>
+        <Border Background="{StaticResource Card}" BorderBrush="{StaticResource CardEdge}" BorderThickness="1" CornerRadius="999" Padding="12,5" Margin="8,0,0,0">
+          <TextBlock x:Name="LatestChip" Text="latest: checking…" FontSize="12" Foreground="{StaticResource InkDim}"/>
+        </Border>
+      </StackPanel>
+
+      <!-- status card -->
+      <Border Grid.Row="3" Background="{StaticResource Card}" BorderBrush="{StaticResource CardEdge}"
+              BorderThickness="1" CornerRadius="12" Padding="16,13" Margin="0,16,0,0">
+        <StackPanel>
+          <StackPanel Orientation="Horizontal">
+            <Ellipse x:Name="StatusDot" Width="10" Height="10" Fill="{StaticResource Blue}" VerticalAlignment="Center"/>
+            <TextBlock x:Name="StatusText" Text="checking for updates…" FontSize="14" FontWeight="SemiBold"
+                       Foreground="{StaticResource Ink}" Margin="10,0,0,0" TextWrapping="Wrap" MaxWidth="360"/>
+          </StackPanel>
+          <ProgressBar x:Name="Progress" Height="6" Margin="0,12,0,2" Minimum="0" Maximum="100"
+                       IsIndeterminate="True" Background="#0d1729" BorderThickness="0" Foreground="{StaticResource Green}">
+            <ProgressBar.Template>
+              <ControlTemplate TargetType="ProgressBar">
+                <Border Background="{TemplateBinding Background}" CornerRadius="3">
+                  <Grid x:Name="PART_Track" ClipToBounds="True">
+                    <Border x:Name="PART_Indicator" Background="{TemplateBinding Foreground}" CornerRadius="3" HorizontalAlignment="Left"/>
+                  </Grid>
+                </Border>
+              </ControlTemplate>
+            </ProgressBar.Template>
+          </ProgressBar>
+        </StackPanel>
+      </Border>
+
+      <!-- changelog -->
+      <Border Grid.Row="4" Background="{StaticResource Card}" BorderBrush="{StaticResource CardEdge}"
+              BorderThickness="1" CornerRadius="12" Padding="16,12" Margin="0,12,0,0">
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+          </Grid.RowDefinitions>
+          <TextBlock Grid.Row="0" x:Name="NotesTitle" Text="what's new" FontSize="12" FontWeight="Bold"
+                     Foreground="{StaticResource Blue}" Margin="0,0,0,8"/>
+          <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+            <TextBlock x:Name="NotesText" Text="" FontSize="12.5" Foreground="{StaticResource InkDim}"
+                       TextWrapping="Wrap" LineHeight="19"/>
+          </ScrollViewer>
+        </Grid>
+      </Border>
+
+      <!-- play button -->
+      <Button Grid.Row="5" x:Name="PlayBtn" Height="56" Margin="0,16,0,0" Cursor="Hand"
+              IsEnabled="False" Click="OnPlay">
+        <Button.Template>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bg" CornerRadius="12">
+              <Border.Background>
+                <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                  <GradientStop Color="#2ec484" Offset="0"/>
+                  <GradientStop Color="#1fa46a" Offset="1"/>
+                </LinearGradientBrush>
+              </Border.Background>
+              <TextBlock x:Name="label" Text="{TemplateBinding Content}" FontSize="19" FontWeight="ExtraBold"
+                         Foreground="#06231733" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter TargetName="bg" Property="Background" Value="#1b2940"/>
+                <Setter TargetName="label" Property="Foreground" Value="#54688a"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="True">
+                <Setter TargetName="label" Property="Foreground" Value="#04170e"/>
+              </Trigger>
+              <MultiTrigger>
+                <MultiTrigger.Conditions>
+                  <Condition Property="IsMouseOver" Value="True"/>
+                  <Condition Property="IsEnabled" Value="True"/>
+                </MultiTrigger.Conditions>
+                <Setter TargetName="bg" Property="Effect">
+                  <Setter.Value>
+                    <DropShadowEffect BlurRadius="24" ShadowDepth="0" Color="#2ec484" Opacity="0.55"/>
+                  </Setter.Value>
+                </Setter>
+              </MultiTrigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Button.Template>
+        <Button.Content>PLAY</Button.Content>
+      </Button>
+
+      <!-- footer -->
+      <Grid Grid.Row="6" Margin="2,14,2,0">
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Left">
+          <Button Style="{StaticResource LinkBtn}" Content="GitHub" Click="OnOpenGitHub"/>
+          <TextBlock Text="  ·  " Foreground="#3a4d6b" FontSize="12"/>
+          <Button Style="{StaticResource LinkBtn}" Content="change game folder" Click="OnChangeFolder"/>
+        </StackPanel>
+        <TextBlock x:Name="LauncherVer" Text="launcher 2.0" FontSize="11" Foreground="#3a4d6b" HorizontalAlignment="Right"/>
+      </Grid>
+    </Grid>
+  </Border>
+</Window>
