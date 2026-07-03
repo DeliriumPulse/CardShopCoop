@@ -115,9 +115,31 @@ namespace CardShopCoop.Sync
         public void HostTick(float dt, bool active)
         {
             if (!active || Rm() == null) return;
+            // carry transitions broadcast IMMEDIATELY - a box that still looks
+            // on-the-floor invites another player to grab it too
+            bool force = false;
+            try
+            {
+                var scan = LiveBoxes();
+                for (int i = 0; i < scan.Count; i++)
+                {
+                    if (scan[i] == null) continue;
+                    if (IsLocallyCarried(scan[i]))
+                    {
+                        if (_hostCarriedLastTick.Add(i)) force = true;
+                    }
+                    else if (_hostCarriedLastTick.Remove(i))
+                    {
+                        force = true;
+                        _hostRecentlyReleased[i] = Time.realtimeSinceStartupAsDouble;
+                    }
+                }
+            }
+            catch { }
             _timer += dt;
-            if (_timer < 1.5f) return;
-            _timer -= 1.5f;
+            if (!force && _timer < 1.5f) return;
+            if (_timer >= 1.5f) _timer -= 1.5f;
+            if (force) _lastHostHash = 0; // transitions bypass the unchanged-gate
             try
             {
                 var boxes = LiveBoxes();
@@ -126,14 +148,6 @@ namespace CardShopCoop.Sync
                 {
                     if (boxes[i] == null) continue;
                     var e = Snapshot(boxes[i]);
-                    if (e.Carried)
-                    {
-                        _hostCarriedLastTick.Add(i);
-                    }
-                    else if (_hostCarriedLastTick.Remove(i))
-                    {
-                        _hostRecentlyReleased[i] = Time.realtimeSinceStartupAsDouble;
-                    }
                     if (_remoteCarried.Contains(i)) e.Carried = true; // a client holds it
                     list.Add(e);
                 }
@@ -177,6 +191,10 @@ namespace CardShopCoop.Sync
                 else _remoteCarried.Remove(i);
                 ApplyToBox(box, entries[i]);
             }
+            // fan the change out to everyone NOW - with 3+ players the other
+            // clients otherwise wait out the periodic tick and the hash gate
+            _timer = 99f;
+            _lastHostHash = 0;
         }
 
         /// <summary>Host: a client trashed a box - destroy the real one so the next
@@ -283,15 +301,39 @@ namespace CardShopCoop.Sync
         public void ClientTick(float dt, bool active)
         {
             if (!active || Rm() == null || _lastApplied.Count == 0) return;
+            // carry transitions are detected EVERY FRAME and reported immediately -
+            // the periodic diff alone left pickups/set-downs invisible for seconds,
+            // long enough for someone else to try grabbing the same box
+            bool force = false;
+            try
+            {
+                var scan = LiveBoxes();
+                int n = Mathf.Min(scan.Count, _lastApplied.Count);
+                for (int i = 0; i < n; i++)
+                {
+                    if (scan[i] == null) continue;
+                    if (IsLocallyCarried(scan[i]))
+                    {
+                        if (_carriedLastTick.Add(i)) force = true; // pickup transition
+                    }
+                    else if (_carriedLastTick.Remove(i))
+                    {
+                        force = true; // set-down transition
+                        _recentlyReleased[i] = Time.realtimeSinceStartupAsDouble;
+                    }
+                }
+            }
+            catch { }
             _timer += dt;
-            if (_timer < 1.5f) return;
-            _timer -= 1.5f;
+            if (!force && _timer < 1.5f) return;
+            if (_timer >= 1.5f) _timer -= 1.5f;
             try
             {
                 var boxes = LiveBoxes();
-                bool changed = false;
+                bool changed = force;
                 _reportBuf.Clear(); // serialized synchronously by the callback; safe to reuse
                 var list = _reportBuf;
+                double nowT = Time.realtimeSinceStartupAsDouble;
                 for (int i = 0; i < _lastApplied.Count; i++)
                 {
                     if (i < boxes.Count && boxes[i] != null)
@@ -302,21 +344,15 @@ namespace CardShopCoop.Sync
                         {
                             var held = _lastApplied[i];
                             held.Carried = true;
-                            if (_carriedLastTick.Add(i)) changed = true; // pickup transition
                             list.Add(held);
                             continue;
                         }
-                        if (_carriedLastTick.Remove(i))
-                        {
-                            changed = true; // set-down transition
-                            _recentlyReleased[i] = Time.realtimeSinceStartupAsDouble;
-                        }
-                        // a box hidden because a REMOTE player carries it has no local
-                        // truth to report: its transform is parked at the hide spot and
-                        // its contents are stale. Diffing it "changed" every tick echoed
-                        // that stale state at the host - teleporting the HOST's box back
-                        // to the pickup spot the moment they set it down mid-restock
-                        if (_lastApplied[i].Carried)
+                        // hidden because ANOTHER player carries it: no local truth to
+                        // report (its transform is parked at the hide spot, contents
+                        // stale) - UNLESS I just set it down myself: that report IS the
+                        // set-down, and skipping it deadlocks the box as carried-forever
+                        if (_lastApplied[i].Carried
+                            && !(_recentlyReleased.TryGetValue(i, out double rr) && nowT - rr < 6.0))
                         {
                             list.Add(_lastApplied[i]);
                             continue;
@@ -325,7 +361,7 @@ namespace CardShopCoop.Sync
                         if (Differs(now, _lastApplied[i]))
                         {
                             changed = true;
-                            _locallyTouched[i] = Time.realtimeSinceStartupAsDouble;
+                            _locallyTouched[i] = nowT;
                         }
                         list.Add(now);
                     }

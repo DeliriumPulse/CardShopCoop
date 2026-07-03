@@ -11,7 +11,7 @@ namespace CardShopCoop
     {
         public const string Guid = "com.zwhit.cardshopcoop";
         public const string Name = "CardShopCoop";
-        public const string Version = "1.0.5";
+        public const string Version = "1.0.6";
 
         public static ManualLogSource Log;
 
@@ -25,6 +25,7 @@ namespace CardShopCoop
         public static ConfigEntry<KeyCode> ServeKey;
         public static ConfigEntry<int> ClientWorldSlot;
         public static ConfigEntry<bool> AutoSyncCardDatabase;
+        public static ConfigEntry<float> ServeReach;
 
         private void Awake()
         {
@@ -56,6 +57,8 @@ namespace CardShopCoop
                 "Save slot the co-op world uses when JOINING someone (your own slots 0-3 are never touched). On a PC dedicated to co-op you can set 0 for maximum mod-data fidelity.");
             AutoSyncCardDatabase = Config.Bind("Network", "AutoSyncCardDatabase", true,
                 "When your modded-card ID registry (EPL enum_values.json) differs from the host's, automatically install the host's copy (yours is backed up beside it) so you only need to restart and rejoin. Set false to handle the file yourself.");
+            ServeReach = Config.Bind("Player", "ServeReach", 1.6f,
+                "How close (meters, to the counter's center) a JOINER must stand to serve the register or a trade customer. The counter itself is ~1m wide, so values below ~1.2 make it unreachable.");
 
             var harmony = new Harmony(Guid);
             Patches.GamePatches.ApplyAll(harmony);

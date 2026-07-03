@@ -605,7 +605,7 @@ namespace CardShopCoop
             {
                 _regStateTimer -= 0.5f;
                 var tf = ResolvePlayer();
-                int near = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, 3.5f, quiet: true) : -1;
+                int near = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, CoopPlugin.ServeReach.Value, quiet: true) : -1;
                 PromptLine = _registerMirror.PromptFor(near) ?? _trades.PromptFor(near) ?? "";
             }
         }
@@ -1023,6 +1023,7 @@ namespace CardShopCoop
         private bool _catalogSent;
         private float _catalogTimer;
         private int _lastCatalogSentHash;
+        private readonly Dictionary<int, string> _rosterNames = new Dictionary<int, string>();
         private HashSet<int> _clientPriced = new HashSet<int>();   // itemTypes the host has priced
         private HashSet<int> _incomingPriced = new HashSet<int>(); // scratch, swapped per apply
 
@@ -1251,7 +1252,7 @@ namespace CardShopCoop
                 Guarded("serve", () =>
                 {
                     var tf = ResolvePlayer();
-                    int idx = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, 3.5f, quiet: !serveTap) : -1;
+                    int idx = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, CoopPlugin.ServeReach.Value, quiet: !serveTap) : -1;
                     // a live trade/sell-in offer owns this counter: TradeServe's own key
                     // handling sends the TradeOp; a ServeRequest here would answer
                     // "no customer" and stomp the trade feedback line
@@ -1288,7 +1289,7 @@ namespace CardShopCoop
                         return;
                     }
                     var tf = ResolvePlayer();
-                    int near = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, 3.5f, quiet: true) : -1;
+                    int near = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, CoopPlugin.ServeReach.Value, quiet: true) : -1;
                     if (near >= 0 && _registerMirror.IsPaymentPhase(near))
                     {
                         _serveThrottle = 0.3f;
@@ -1875,7 +1876,15 @@ namespace CardShopCoop
                 {
                     if (Role != CoopRole.Host || !InGameLevel()) break;
                     using (var br = Msg.Reader(msg.Payload))
-                        _world.ApplyRemote(WorldSync.ReadEntries(br));
+                    {
+                        var entries = WorldSync.ReadEntries(br);
+                        _world.ApplyRemote(entries);
+                        // applying updates the host's diff baseline, so its own tick
+                        // never re-detects this change - with 3+ players the OTHER
+                        // clients must be told explicitly
+                        if (_net.ConnectionCount > 1)
+                            Broadcast(MsgType.ShelfDelta, bw => WorldSync.WriteEntries(bw, entries));
+                    }
                     break;
                 }
                 case MsgType.PriceList:
@@ -2071,6 +2080,7 @@ namespace CardShopCoop
                             string name = br.ReadString();
                             if (id == _selfId) continue;
                             seen.Add(id);
+                            _rosterNames[id] = name; // re-applied on every relay packet
                             if (_relayIds.Add(id)) CoopPlugin.Log.LogInfo($"peer in shop: {name}");
                             _avatars.SetName(1000 + id, name);
                         }
@@ -2095,7 +2105,13 @@ namespace CardShopCoop
                         byte hold = br.ReadByte();
                         ReadHoldPayload(br, hold, out var holdTypes, out var holdCards);
                         if (senderId != _selfId)
+                        {
                             _avatars.UpdateState(1000 + senderId, pos, yaw, speed, hold, holdTypes, holdCards);
+                            // the avatar may have spawned AFTER the roster named it - a
+                            // relayed peer then wore the default "Player" tag forever
+                            if (_rosterNames.TryGetValue(senderId, out var rn))
+                                _avatars.SetName(1000 + senderId, rn);
+                        }
                     }
                     break;
                 }
@@ -2165,7 +2181,12 @@ namespace CardShopCoop
                 {
                     if (Role != CoopRole.Host || !InGameLevel()) break;
                     using (var br = Msg.Reader(msg.Payload))
-                        _cardShelves.ApplyRemote(CardShelfSync.ReadEntries(br));
+                    {
+                        var entries = CardShelfSync.ReadEntries(br);
+                        _cardShelves.ApplyRemote(entries);
+                        if (_net.ConnectionCount > 1) // see ShelfRequest note
+                            Broadcast(MsgType.CardShelfDelta, bw => CardShelfSync.WriteEntries(bw, entries));
+                    }
                     break;
                 }
                 case MsgType.BoxState:
@@ -2561,7 +2582,12 @@ namespace CardShopCoop
                 {
                     if (Role != CoopRole.Host || !InGameLevel()) break;
                     using (var br = Msg.Reader(msg.Payload))
-                        _objMoves.ApplyRemote(ObjMoveSync.ReadEntries(br));
+                    {
+                        var entries = ObjMoveSync.ReadEntries(br);
+                        _objMoves.ApplyRemote(entries);
+                        if (_net.ConnectionCount > 1) // see ShelfRequest note
+                            Broadcast(MsgType.ObjMoveDelta, bw => ObjMoveSync.WriteEntries(bw, entries));
+                    }
                     break;
                 }
                 case MsgType.CardPriceSet:

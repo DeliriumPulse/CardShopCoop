@@ -78,7 +78,7 @@ namespace CardShopCoop.Sync
         private const float Cadence = 0.5f;      // host scan/broadcast gate
         private const float HealInterval = 6f;   // unchanged-state re-broadcast
         private const float StaleAfter = 13f;    // client: > 2x heal + margin
-        private const float Reach = 3.5f;        // same reach as RegisterServe
+        private static float Reach => CoopPlugin.ServeReach.Value; // same reach as RegisterServe
         private const float VanillaWait = 60f;   // Customer.cs WaitingToTradeCard timeout
         private const int MaxOffers = 32;
 
