@@ -36,6 +36,7 @@ namespace CardShopCoop.Sync
             AccessTools.Method(typeof(InteractablePackagingBox_Item), "SetOpenCloseBox");
 
         private readonly List<Entry> _lastApplied = new List<Entry>(); // client: host truth
+        private readonly HashSet<int> _carriedLastTick = new HashSet<int>();
         private float _timer;
         private RestockManager _rm;
 
@@ -68,7 +69,8 @@ namespace CardShopCoop.Sync
                 Count = box.m_ItemCompartment.GetItemCount(),
                 IsBig = box.m_IsBigBox,
                 IsOpen = box.IsBoxOpened(),
-                Carried = IsLocallyCarried(box),
+                // carried locally, or hidden because a remote player carries it
+                Carried = IsLocallyCarried(box) || !box.gameObject.activeSelf,
                 Pos = box.transform.position,
                 Yaw = box.transform.eulerAngles.y,
             };
@@ -177,13 +179,17 @@ namespace CardShopCoop.Sync
                 {
                     if (i < boxes.Count && boxes[i] != null)
                     {
-                        // while I'M carrying it, report the last settled state - the
-                        // in-hand position is transient and would ping-pong
+                        // while I'M carrying it: tell the host (so everyone else hides
+                        // their copy) but keep reporting the last settled position
                         if (IsLocallyCarried(boxes[i]))
                         {
-                            list.Add(_lastApplied[i]);
+                            var held = _lastApplied[i];
+                            held.Carried = true;
+                            if (_carriedLastTick.Add(i)) changed = true; // pickup transition
+                            list.Add(held);
                             continue;
                         }
+                        if (_carriedLastTick.Remove(i)) changed = true; // set-down transition
                         var now = Snapshot(boxes[i]);
                         if (Differs(now, _lastApplied[i])) changed = true;
                         list.Add(now);
@@ -208,6 +214,15 @@ namespace CardShopCoop.Sync
         {
             try
             {
+                // someone (remote) is carrying it: their avatar shows the box in hand,
+                // so the world copy disappears until it's set down
+                if (want.Carried)
+                {
+                    if (box.gameObject.activeSelf) box.gameObject.SetActive(false);
+                    return;
+                }
+                if (!box.gameObject.activeSelf) box.gameObject.SetActive(true);
+
                 var comp = box.m_ItemCompartment;
                 int cur = comp.GetItemCount();
                 if (cur != want.Count)

@@ -122,6 +122,7 @@ namespace CardShopCoop.Sync
                     var t = Resolve(sm, e.Key);
                     if (t == null) continue;
                     t.SetPositionAndRotation(e.Pos, e.Rot);
+                    SyncTagGroup(t);
                     _sent[e.Key] = new Pose { P = e.Pos, R = e.Rot, Valid = true };
                     _candidate.Remove(e.Key);
                 }
@@ -130,6 +131,26 @@ namespace CardShopCoop.Sync
                     CoopPlugin.Log.LogWarning($"ObjMoveSync apply {e.Key:X}: {ex.Message}");
                 }
             }
+        }
+
+        // Price tags live in a SEPARATE canvas group (m_Shelf_WorldUIGrp) that the game
+        // only drags along during its own move mode - a remote transform set leaves the
+        // tags floating at the old spot unless we move the group too.
+        private static readonly Dictionary<Type, System.Reflection.FieldInfo> _tagGrpFields
+            = new Dictionary<Type, System.Reflection.FieldInfo>();
+
+        private static void SyncTagGroup(Transform objTransform)
+        {
+            var comp = objTransform.GetComponent<InteractableObject>();
+            if (comp == null) return;
+            var type = comp.GetType();
+            if (!_tagGrpFields.TryGetValue(type, out var fi))
+            {
+                fi = HarmonyLib.AccessTools.Field(type, "m_Shelf_WorldUIGrp");
+                _tagGrpFields[type] = fi; // may be null for kinds without tags
+            }
+            if (fi?.GetValue(comp) is Transform grp && grp != null)
+                grp.SetPositionAndRotation(objTransform.position, objTransform.rotation);
         }
 
         private static Transform Resolve(ShelfManager sm, int key)
