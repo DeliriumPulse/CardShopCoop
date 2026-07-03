@@ -249,12 +249,32 @@ namespace CardShopCoop.Sync
                     Object.DestroyImmediate(rb);
                 foreach (var col in clone.GetComponentsInChildren<Collider>(true))
                     Object.DestroyImmediate(col);
-                clone.transform.SetParent(av.Go.transform, worldPositionStays: false);
-                clone.transform.localPosition = new Vector3(0f, 0.95f, 0.48f);
-                clone.transform.localRotation = Quaternion.identity;
+                // anchor to the CHEST BONE so the box rides the carry pose; then correct
+                // against the model's rendered bounds - the prefab's pivot is offset from
+                // its visible box, which is how a "waist-height" offset drew at the knees
+                Transform anchor = null;
+                try { anchor = av.Anim != null ? av.Anim.GetBoneTransform(HumanBodyBones.Chest) : null; } catch { }
+                var body = av.Go.transform;
+                clone.transform.SetParent(anchor != null ? anchor : body, worldPositionStays: false);
+                clone.transform.rotation = body.rotation;
                 clone.name = "CoopBoxProp";
                 clone.SetActive(true);
                 Object.Destroy(holder);
+                Vector3 armsCenter = (anchor != null
+                        ? anchor.position - body.up * 0.05f
+                        : body.position + body.up * 1.16f)
+                    + body.forward * 0.42f;
+                var rends = clone.GetComponentsInChildren<Renderer>();
+                if (rends.Length > 0)
+                {
+                    var b = rends[0].bounds;
+                    for (int i = 1; i < rends.Length; i++) b.Encapsulate(rends[i].bounds);
+                    clone.transform.position += armsCenter - b.center;
+                }
+                else
+                {
+                    clone.transform.position = armsCenter;
+                }
                 av.BoxProp = clone;
 
                 if (itemType > 0)
@@ -262,11 +282,11 @@ namespace CardShopCoop.Sync
                     var meshData = InventoryBase.GetItemMeshData((EItemType)itemType);
                     if (meshData != null)
                     {
-                        var item = ItemSpawnManager.GetItem(av.Go.transform);
+                        var item = ItemSpawnManager.GetItem(clone.transform); // rides the box
                         item.SetMesh(meshData.mesh, meshData.material, (EItemType)itemType,
                             meshData.meshSecondary, meshData.materialSecondary, meshData.materialList);
-                        item.transform.localPosition = new Vector3(0f, 0.95f + (isBig ? 0.34f : 0.24f), 0.48f);
-                        item.transform.localRotation = Quaternion.identity;
+                        item.transform.position = armsCenter + body.up * (isBig ? 0.30f : 0.22f);
+                        item.transform.rotation = body.rotation;
                         item.gameObject.SetActive(true);
                         if (item.m_Rigidbody != null) item.m_Rigidbody.isKinematic = true;
                         if (item.m_Collider != null) item.m_Collider.enabled = false;
