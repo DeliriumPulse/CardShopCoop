@@ -139,7 +139,7 @@ namespace CardShopCoop.Sync
         private static readonly Dictionary<Type, System.Reflection.FieldInfo> _tagGrpFields
             = new Dictionary<Type, System.Reflection.FieldInfo>();
 
-        private static void SyncTagGroup(Transform objTransform)
+        public static void SyncTagGroup(Transform objTransform)
         {
             var comp = objTransform.GetComponent<InteractableObject>();
             if (comp == null) return;

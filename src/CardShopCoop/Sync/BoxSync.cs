@@ -37,6 +37,8 @@ namespace CardShopCoop.Sync
 
         private readonly List<Entry> _lastApplied = new List<Entry>(); // client: host truth
         private readonly HashSet<int> _carriedLastTick = new HashSet<int>();
+        private readonly HashSet<int> _remoteCarried = new HashSet<int>();   // host: client-held boxes
+        private readonly Dictionary<int, double> _recentlyReleased = new Dictionary<int, double>(); // client: ignore stale carried echoes
         private float _timer;
         private RestockManager _rm;
 
@@ -46,6 +48,9 @@ namespace CardShopCoop.Sync
         public void Reset()
         {
             _lastApplied.Clear();
+            _carriedLastTick.Clear();
+            _remoteCarried.Clear();
+            _recentlyReleased.Clear();
             _timer = 0f;
             _rm = null;
         }
@@ -69,8 +74,7 @@ namespace CardShopCoop.Sync
                 Count = box.m_ItemCompartment.GetItemCount(),
                 IsBig = box.m_IsBigBox,
                 IsOpen = box.IsBoxOpened(),
-                // carried locally, or hidden because a remote player carries it
-                Carried = IsLocallyCarried(box) || !box.gameObject.activeSelf,
+                Carried = IsLocallyCarried(box),
                 Pos = box.transform.position,
                 Yaw = box.transform.eulerAngles.y,
             };
@@ -95,7 +99,12 @@ namespace CardShopCoop.Sync
                 var boxes = LiveBoxes();
                 var list = new List<Entry>(Mathf.Min(boxes.Count, 250));
                 for (int i = 0; i < boxes.Count && list.Count < 250; i++)
-                    if (boxes[i] != null) list.Add(Snapshot(boxes[i]));
+                {
+                    if (boxes[i] == null) continue;
+                    var e = Snapshot(boxes[i]);
+                    if (_remoteCarried.Contains(i)) e.Carried = true; // a client holds it
+                    list.Add(e);
+                }
                 OnHostSnapshot?.Invoke(list);
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync host: " + e.Message); }
@@ -112,6 +121,8 @@ namespace CardShopCoop.Sync
                 // type must match: index may have shifted between snapshot and request
                 if ((int)box.m_ItemCompartment.GetItemType() != entries[i].Type) continue;
                 if (IsLocallyCarried(box)) continue; // never stomp a box in the host's hands
+                if (entries[i].Carried) _remoteCarried.Add(i);
+                else _remoteCarried.Remove(i);
                 ApplyToBox(box, entries[i]);
             }
         }
@@ -156,6 +167,10 @@ namespace CardShopCoop.Sync
                 // a box in MY hands is mine until I put it down; a box in the HOST's
                 // hands has a transient position we don't copy
                 if (IsLocallyCarried(box)) continue;
+                // a stale "carried" echo about a box I JUST released must not hide it
+                if (want.Carried && _recentlyReleased.TryGetValue(i, out double t)
+                    && Time.realtimeSinceStartupAsDouble - t < 6.0)
+                    continue;
                 ApplyToBox(box, want, applyPosition: !want.Carried);
             }
             // remember the applied truth for local-change detection
@@ -189,7 +204,11 @@ namespace CardShopCoop.Sync
                             list.Add(held);
                             continue;
                         }
-                        if (_carriedLastTick.Remove(i)) changed = true; // set-down transition
+                        if (_carriedLastTick.Remove(i))
+                        {
+                            changed = true; // set-down transition
+                            _recentlyReleased[i] = Time.realtimeSinceStartupAsDouble;
+                        }
                         var now = Snapshot(boxes[i]);
                         if (Differs(now, _lastApplied[i])) changed = true;
                         list.Add(now);
@@ -215,13 +234,22 @@ namespace CardShopCoop.Sync
             try
             {
                 // someone (remote) is carrying it: their avatar shows the box in hand,
-                // so the world copy disappears until it's set down
+                // so the world copy disappears until it's set down - tags included
+                // (box price tags live in a separate canvas group)
                 if (want.Carried)
                 {
-                    if (box.gameObject.activeSelf) box.gameObject.SetActive(false);
+                    if (box.gameObject.activeSelf)
+                    {
+                        try { box.m_ItemCompartment.SetPriceTagVisibility(false); } catch { }
+                        box.gameObject.SetActive(false);
+                    }
                     return;
                 }
-                if (!box.gameObject.activeSelf) box.gameObject.SetActive(true);
+                if (!box.gameObject.activeSelf)
+                {
+                    box.gameObject.SetActive(true);
+                    try { box.m_ItemCompartment.SetPriceTagVisibility(true); } catch { }
+                }
 
                 var comp = box.m_ItemCompartment;
                 int cur = comp.GetItemCount();
@@ -257,6 +285,7 @@ namespace CardShopCoop.Sync
                         || Mathf.Abs(Mathf.DeltaAngle(t.eulerAngles.y, want.Yaw)) > 3f)
                     {
                         t.SetPositionAndRotation(want.Pos, Quaternion.Euler(0f, want.Yaw, 0f));
+                        ObjMoveSync.SyncTagGroup(t); // box price tags ride in their own group
                     }
                 }
             }

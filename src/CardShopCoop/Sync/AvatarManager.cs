@@ -39,6 +39,9 @@ namespace CardShopCoop.Sync
             public GameObject BinderProp;
             public Item PackProp;
             public float PackTimer;
+            public GameObject BoxProp;     // real cardboard box clone
+            public Item BoxProdItem;       // the product shown on top of it
+            public string BoxSig = "";
             public float EmoteTimer;
             public bool EverPositioned;
             public bool HasState;
@@ -145,6 +148,67 @@ namespace CardShopCoop.Sync
                 av.PackProp = null;
             }
             if (av.BinderProp != null) { Object.Destroy(av.BinderProp); av.BinderProp = null; }
+            ReleaseBoxProp(av);
+        }
+
+        private static void ReleaseBoxProp(RemoteAvatar av)
+        {
+            if (av.BoxProdItem != null)
+            {
+                try { ItemSpawnManager.DisableItem(av.BoxProdItem); } catch { }
+                av.BoxProdItem = null;
+            }
+            if (av.BoxProp != null) { Object.Destroy(av.BoxProp); av.BoxProp = null; }
+            av.BoxSig = "";
+        }
+
+        /// <summary>Clone the game's real packaging-box prefab as a pure visual: stripped
+        /// BEFORE activation so its scripts never wake (no manager registration, no physics).</summary>
+        private static void TrySpawnBoxProp(RemoteAvatar av, bool isBig, int itemType)
+        {
+            try
+            {
+                var rm = Object.FindObjectOfType<RestockManager>();
+                var prefab = isBig ? rm?.m_PackageBoxPrefab : rm?.m_PackageBoxSmallPrefab;
+                if (prefab == null) return;
+                var holder = new GameObject("CoopBoxHolder_tmp");
+                holder.SetActive(false);
+                var clone = Object.Instantiate(prefab.gameObject, holder.transform);
+                foreach (var mb in clone.GetComponentsInChildren<MonoBehaviour>(true))
+                    if (mb != null) Object.DestroyImmediate(mb);
+                foreach (var rb in clone.GetComponentsInChildren<Rigidbody>(true))
+                    Object.DestroyImmediate(rb);
+                foreach (var col in clone.GetComponentsInChildren<Collider>(true))
+                    Object.DestroyImmediate(col);
+                clone.transform.SetParent(av.Go.transform, worldPositionStays: false);
+                clone.transform.localPosition = new Vector3(0f, 0.95f, 0.48f);
+                clone.transform.localRotation = Quaternion.identity;
+                clone.name = "CoopBoxProp";
+                clone.SetActive(true);
+                Object.Destroy(holder);
+                av.BoxProp = clone;
+
+                if (itemType > 0)
+                {
+                    var meshData = InventoryBase.GetItemMeshData((EItemType)itemType);
+                    if (meshData != null)
+                    {
+                        var item = ItemSpawnManager.GetItem(av.Go.transform);
+                        item.SetMesh(meshData.mesh, meshData.material, (EItemType)itemType,
+                            meshData.meshSecondary, meshData.materialSecondary, meshData.materialList);
+                        item.transform.localPosition = new Vector3(0f, 0.95f + (isBig ? 0.34f : 0.24f), 0.48f);
+                        item.transform.localRotation = Quaternion.identity;
+                        item.gameObject.SetActive(true);
+                        if (item.m_Rigidbody != null) item.m_Rigidbody.isKinematic = true;
+                        if (item.m_Collider != null) item.m_Collider.enabled = false;
+                        av.BoxProdItem = item;
+                    }
+                }
+            }
+            catch (System.Exception e)
+            {
+                CoopPlugin.Log.LogInfo("box prop unavailable (using cube): " + e.Message);
+            }
         }
 
         private static void ReleaseCards(RemoteAvatar av)
@@ -227,11 +291,28 @@ namespace CardShopCoop.Sync
                     if (av.HasHoldingBox)
                         av.Anim.SetBool("IsHoldingBox", av.HoldState != 0);
                 }
-                // carried visuals: real item meshes for items, the cardboard prop for boxes
+                // carried visuals: the REAL box (with its product on top) when carrying one
                 bool showBox = av.HoldState == 1;
-                if (av.HoldProp != null && av.HoldProp.activeSelf != showBox)
+                string boxSig = showBox
+                    ? (av.HoldTypes != null && av.HoldTypes.Count >= 2
+                        ? av.HoldTypes[0] + ":" + av.HoldTypes[1] : "0:0")
+                    : "";
+                if (boxSig != av.BoxSig)
                 {
-                    av.HoldProp.SetActive(showBox);
+                    ReleaseBoxProp(av);
+                    av.BoxSig = boxSig;
+                    if (showBox)
+                    {
+                        bool isBig = av.HoldTypes != null && av.HoldTypes.Count >= 1 && av.HoldTypes[0] == 1;
+                        int prodType = av.HoldTypes != null && av.HoldTypes.Count >= 2 ? av.HoldTypes[1] : 0;
+                        TrySpawnBoxProp(av, isBig, prodType);
+                    }
+                }
+                // generic cube only as fallback when the real prefab wasn't available
+                bool showCube = showBox && av.BoxProp == null;
+                if (av.HoldProp != null && av.HoldProp.activeSelf != showCube)
+                {
+                    av.HoldProp.SetActive(showCube);
                     av.HoldProp.transform.localScale = new Vector3(0.34f, 0.27f, 0.34f);
                 }
                 // loose cards fanned in hand (real card faces, modded expansions included)

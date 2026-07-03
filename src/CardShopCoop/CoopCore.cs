@@ -438,7 +438,16 @@ namespace CardShopCoop
             try
             {
                 if (IsAlive(FiHoldBox) || IsAlive(FiHoldItemBox) || IsAlive(FiHoldBoxShelf) || IsAlive(FiHoldBoxCard))
+                {
+                    // describe the box (size + contents) so the avatar shows the real thing
+                    if (FiHoldItemBox?.GetValue(_playerIpc) is InteractablePackagingBox_Item ib && ib != null)
+                    {
+                        _holdTypesBuf.Add(ib.m_IsBigBox ? 1 : 0);
+                        try { _holdTypesBuf.Add((int)ib.m_ItemCompartment.GetItemType()); }
+                        catch { _holdTypesBuf.Add(0); }
+                    }
                     return 1; // carrying a box
+                }
                 if (FiHoldItemList?.GetValue(_playerIpc) is List<Item> items && items.Count > 0)
                 {
                     for (int i = 0; i < items.Count && _holdTypesBuf.Count < 6; i++)
