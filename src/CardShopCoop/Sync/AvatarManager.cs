@@ -291,8 +291,10 @@ namespace CardShopCoop.Sync
                                 var item = ItemSpawnManager.GetItem(av.Go.transform);
                                 item.SetMesh(meshData.mesh, meshData.material, (EItemType)av.HoldTypes[i],
                                     meshData.meshSecondary, meshData.materialSecondary, meshData.materialList);
-                                item.transform.localPosition = new Vector3(0f, 1.02f + 0.14f * i, 0.42f);
-                                item.transform.localRotation = Quaternion.identity;
+                                // a carried pile: outward from the chest, each tucked behind
+                                // the previous with a slight rise and lean - not a totem pole
+                                item.transform.localPosition = new Vector3(0f, 1.04f + 0.018f * i, 0.36f + 0.055f * i);
+                                item.transform.localRotation = Quaternion.Euler(14f, 0f, 0f);
                                 item.gameObject.SetActive(true);
                                 if (item.m_Rigidbody != null) item.m_Rigidbody.isKinematic = true;
                                 if (item.m_Collider != null) item.m_Collider.enabled = false;
