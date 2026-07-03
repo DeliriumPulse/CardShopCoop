@@ -389,7 +389,10 @@ namespace CardShopCoop.Sync
             foreach (var kv in _puppets)
             {
                 var p = kv.Value;
-                if (_now - p.LastSeen > 1.5f)
+                // generous: NPC state rides the UNRELIABLE lane, and flaky NATs starve
+                // it in bursts - a 1.5s timeout made whole crowds blink out and back
+                // for players on rough connections (first field report)
+                if (_now - p.LastSeen > 6f)
                 {
                     if (p.Go != null) Object.Destroy(p.Go);
                     (dead = dead ?? new List<int>()).Add(kv.Key);

@@ -212,10 +212,27 @@ namespace CardShopCoop.Sync
             _lastHostHash = 0;
         }
 
+        private double _removalWindowStart;
+        private int _removalWindowCount;
+
         /// <summary>Host: a client trashed a box - destroy the real one so the next
-        /// broadcast doesn't resurrect it at its old spot.</summary>
+        /// broadcast doesn't resurrect it at its old spot. Flood-guarded: a client
+        /// whose world is reloading can echo its ENTIRE box population as "trashed"
+        /// (old clients did exactly that) - no human trashes 5 boxes in 2 seconds.</summary>
         public void HostApplyRemoval(int index, int type)
         {
+            double nowT = Time.realtimeSinceStartupAsDouble;
+            if (nowT - _removalWindowStart > 2.0)
+            {
+                _removalWindowStart = nowT;
+                _removalWindowCount = 0;
+            }
+            if (++_removalWindowCount > 4)
+            {
+                if (_removalWindowCount == 5)
+                    CoopPlugin.Log.LogWarning("ignoring box-removal flood from a client (reload echo, not gameplay)");
+                return;
+            }
             var boxes = LiveBoxes();
             if (index < 0 || index >= boxes.Count || boxes[index] == null) return;
             if ((int)boxes[index].m_ItemCompartment.GetItemType() != type) return;

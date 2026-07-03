@@ -79,8 +79,8 @@ namespace CardShopCoop.Sync
 
             if (FiMannedByPlayer?.GetValue(counter) is bool byPlayer && byPlayer)
                 return "the host is already at this register";
-            if (FiMannedByNpc?.GetValue(counter) is bool byNpc && byNpc)
-                return "a worker is already on this register";
+            // a WORKER on the register is no obstacle: the host can serve alongside
+            // theirs, so guests can too (field-requested; the vanilla calls arbitrate)
 
             var customer = counter.m_CurrentCustomer;
             if (customer == null || !customer.m_IsActive)

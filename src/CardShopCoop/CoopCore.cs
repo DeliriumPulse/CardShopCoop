@@ -144,6 +144,12 @@ namespace CardShopCoop
         private bool _renamerHandled;
         private int _heldBoxFrame = -1;
         private object _heldBoxA, _heldBoxB, _heldBoxC;
+
+        /// <summary>True while a received world is loading (plus a settle grace):
+        /// the game's own load-cleanup destroys objects and NOTHING destroyed in
+        /// that window is a player action to forward.</summary>
+        public static bool ClientReloading;
+        private float _reloadGrace;
         private readonly System.Collections.Generic.List<InMsg> _dispatchBuf
             = new System.Collections.Generic.List<InMsg>(64);
         private readonly System.Collections.Generic.HashSet<long> _dispatchSeen
@@ -218,7 +224,7 @@ namespace CardShopCoop
             };
             BoxSync.LocalBoxDestroyed = box =>
             {
-                if (!InGameLevel()) return;
+                if (!InGameLevel() || ClientReloading) return;
                 if (Role == CoopRole.Client) _boxes.NotifyLocalDestroyed(box);
                 else if (Role == CoopRole.Host) _boxes.HostNotifyLocalDestroyed();
             };
@@ -520,6 +526,7 @@ namespace CardShopCoop
             _cmSweep = null;
             _renamerHandled = false;
             _catalogSent = false;
+            if (ClientReloading) _reloadGrace = 10f; // countdown starts once in-game
             _playerTf = null;
             _playerCamTf = null;
             _playerIpc = null;
@@ -1048,6 +1055,7 @@ namespace CardShopCoop
         private bool _catalogSent;
         private float _catalogTimer;
         private int _lastCatalogSentHash;
+        private readonly HashSet<int> _catalogWarnedConns = new HashSet<int>();
         private readonly Dictionary<int, string> _rosterNames = new Dictionary<int, string>();
         private HashSet<int> _clientPriced = new HashSet<int>();   // itemTypes the host has priced
         private HashSet<int> _incomingPriced = new HashSet<int>(); // scratch, swapped per apply
@@ -1058,7 +1066,9 @@ namespace CardShopCoop
             {
                 var list = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
                 var entries = new List<RestockData>(list.Count);
-                foreach (var rd in list) if (rd != null) entries.Add(rd);
+                // blank-name entries are mod UI placeholders (Collection Tracker's
+                // restock-shop replacement adds two) - not orderable, not comparable
+                foreach (var rd in list) if (rd != null && !string.IsNullOrEmpty(rd.name)) entries.Add(rd);
                 Send(1, MsgType.CatalogDigest, bw =>
                 {
                     int cnt = Mathf.Min(entries.Count, ushort.MaxValue);
@@ -1090,8 +1100,8 @@ namespace CardShopCoop
             var examples = new List<string>();
             foreach (var rd in list)
             {
-                if (rd == null) continue;
-                if (joiner.Contains(CatalogKey((int)rd.itemType, rd.isBigBox, Fnv(rd.name ?? ""))))
+                if (rd == null || string.IsNullOrEmpty(rd.name)) continue; // placeholder rows, see SendCatalogDigest
+                if (joiner.Contains(CatalogKey((int)rd.itemType, rd.isBigBox, Fnv(rd.name))))
                 {
                     shared++;
                     continue;
@@ -1103,12 +1113,22 @@ namespace CardShopCoop
             if (hostOnly == 0 && joinerOnly == 0)
             {
                 CoopPlugin.Log.LogInfo($"catalog check: identical ({shared} products)");
+                // content mods register products seconds-to-minutes after load, so an
+                // early check can cry wolf; the recheck should also retract the cry
+                if (_catalogWarnedConns.Remove(connId))
+                {
+                    const string clear = "catalogs match now - the earlier warning was mod startup timing, all good";
+                    RegisterLine = clear;
+                    RegisterLineTimer = 8f;
+                    Send(connId, MsgType.Toast, bw => bw.Write(clear));
+                }
                 return;
             }
             string who = PeerNames.TryGetValue(connId, out var nm) ? nm : "joiner";
             string summary = $"heads-up: product catalogs differ ({hostOnly} only on host, {joinerOnly} only on {who}) - mismatched items can't be ordered; match your content packs";
             CoopPlugin.Log.LogWarning("catalog check: " + summary
                 + (examples.Count > 0 ? " | host-only e.g.: " + string.Join(" / ", examples.ToArray()) : ""));
+            _catalogWarnedConns.Add(connId);
             RegisterLine = summary;
             RegisterLineTimer = 10f;
             Send(connId, MsgType.Toast, bw => bw.Write(summary));
@@ -1401,6 +1421,11 @@ namespace CardShopCoop
             FlushPendingCardWork();
 
             _dt = dt;
+            if (ClientReloading && _reloadGrace > 0f && InGameLevel())
+            {
+                _reloadGrace -= dt;
+                if (_reloadGrace <= 0f) ClientReloading = false;
+            }
             Guarded("avatars", _actAvatars);
             _syncActive = Role != CoopRole.None && _net.ConnectionCount > 0 && InGameLevel();
             Guarded("world", _actWorld);
@@ -1886,6 +1911,11 @@ namespace CardShopCoop
                     {
                         CoopPlugin.Log.LogWarning("Sidecar apply failed (continuing): " + e.Message);
                     }
+                    // the game's world-(re)load DESTROYS every existing box via their
+                    // OnDestroyed - on a REJOIN those fire while still "in game" and a
+                    // 1.0.7 client forwarded all ~250 as player trash actions, wiping
+                    // the HOST's boxes (first field report). Suppress until settled.
+                    ClientReloading = true;
                     SaveTransfer.ApplyAndLoad(_pendingSave);
                     _pendingSave = null;
                     break;

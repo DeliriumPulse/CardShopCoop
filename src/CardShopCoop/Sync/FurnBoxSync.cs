@@ -218,7 +218,8 @@ namespace CardShopCoop.Sync
 
         public static bool DestroyedPrefix(InteractablePackagingBox_Shelf __instance)
         {
-            if (!ApplyingRemote) Instance?.OnLocalDestroyed(__instance);
+            // world-(re)load cleanup destroys are not player actions
+            if (!ApplyingRemote && !CoopCore.ClientReloading) Instance?.OnLocalDestroyed(__instance);
             return true;
         }
 
