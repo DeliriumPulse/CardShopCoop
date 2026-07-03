@@ -2273,6 +2273,8 @@ namespace CardShopCoop
                     {
                         RegisterLine = br.ReadString();
                         RegisterLineTimer = 8f;
+                        // support gold: the on-screen line vanishes in 8s, the log keeps it
+                        CoopPlugin.Log.LogInfo("host says: " + RegisterLine);
                     }
                     break;
                 }

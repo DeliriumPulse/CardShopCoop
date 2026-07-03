@@ -192,8 +192,10 @@ namespace CardShopCoop.Sync
                 ApplyToBox(box, entries[i]);
             }
             // fan the change out to everyone NOW - with 3+ players the other
-            // clients otherwise wait out the periodic tick and the hash gate
-            _timer = 99f;
+            // clients otherwise wait out the periodic tick and the hash gate.
+            // Exactly one period: a larger sentinel made the keep-the-phase
+            // decrement fire EVERY frame for seconds (the post-throw jitter)
+            _timer = 1.5f;
             _lastHostHash = 0;
         }
 
@@ -287,9 +289,23 @@ namespace CardShopCoop.Sync
                 if (want.Carried && _recentlyReleased.TryGetValue(i, out double t) && now - t < 6.0)
                     continue;
                 // my own recent edits (took an item, kicked it) win over stale echoes;
-                // my report reaches the host and the next echo agrees
+                // my report reaches the host and the next echo agrees. VISIBILITY is
+                // exempt: someone else's pickup/set-down must show here immediately,
+                // or their set-down box stays invisible to me for the whole window
                 if (_locallyTouched.TryGetValue(i, out double touched) && now - touched < 6.0)
+                {
+                    if (!want.Carried && !box.gameObject.activeSelf)
+                    {
+                        box.gameObject.SetActive(true);
+                        try { box.m_ItemCompartment.SetPriceTagVisibility(true); } catch { }
+                    }
+                    else if (want.Carried && box.gameObject.activeSelf)
+                    {
+                        try { box.m_ItemCompartment.SetPriceTagVisibility(false); } catch { }
+                        box.gameObject.SetActive(false);
+                    }
                     continue;
+                }
                 ApplyToBox(box, want, applyPosition: !want.Carried);
             }
             // remember the applied truth for local-change detection
