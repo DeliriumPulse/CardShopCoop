@@ -70,6 +70,8 @@ namespace CardShopCoop.Net
         EnumSync = 63,         // host -> client: the host's enum_values.json (card-ID registry)
         Toast = 64,            // host -> client: one-line on-screen notice
         CatalogDigest = 65,    // client -> host: restock catalog identities (mismatch diagnosis)
+        FurnBoxOp = 66,        // client -> host: furniture-box carry/place/destroy ops
+        FurnBoxState = 67,     // host -> client: furniture delivery box population
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>

@@ -91,6 +91,7 @@ namespace CardShopCoop.Patches
             TryModule("trades", Sync.TradeServe.ApplyPatches, h);
             TryModule("playtables", Sync.PlayTableSync.ApplyPatches, h);
             TryModule("cardboxes", Sync.CardBoxSync.ApplyPatches, h);
+            TryModule("furnboxes", Sync.FurnBoxSync.ApplyPatches, h);
         }
 
         private static void TryModule(string name, Action<Harmony> apply, Harmony h)

@@ -52,6 +52,7 @@ namespace CardShopCoop
         private readonly ContainerSync _containers = new ContainerSync();
         private readonly TournamentSync _tournament = new TournamentSync();
         private readonly CardBoxSync _cardBoxes = new CardBoxSync();
+        private readonly FurnBoxSync _furnBoxes = new FurnBoxSync();
         private string _lastShopNameSent;
         private float _shopNameTimer = -1.0f; // staggered phase (see _lightSyncTimer note)
         private readonly Sync.RegisterMirror _registerMirror = new Sync.RegisterMirror();
@@ -274,6 +275,26 @@ namespace CardShopCoop
             _tournament.BroadcastState = w => Broadcast(MsgType.TournamentState, w);
             _cardBoxes.SendOp = w => Send(1, MsgType.CardBoxOp, w);
             _cardBoxes.BroadcastState = w => Broadcast(MsgType.CardBoxState, w);
+            _furnBoxes.SendOp = w => Send(1, MsgType.FurnBoxOp, w);
+            _furnBoxes.BroadcastState = w => Broadcast(MsgType.FurnBoxState, w);
+            FurnBoxSync.IsLocallyCarried = box =>
+            {
+                if (_playerIpc == null || box == null) return false;
+                try
+                {
+                    // ONLY the generic hold field: the game never nulls
+                    // m_CurrentHoldingBoxShelf on set-down, so it lies forever
+                    if (_heldBoxFrame != Time.frameCount)
+                    {
+                        _heldBoxFrame = Time.frameCount;
+                        _heldBoxA = FiHoldItemBox?.GetValue(_playerIpc);
+                        _heldBoxB = FiHoldBox?.GetValue(_playerIpc);
+                        _heldBoxC = FiHoldBoxCard?.GetValue(_playerIpc);
+                    }
+                    return ReferenceEquals(_heldBoxB, box);
+                }
+                catch { return false; }
+            };
             _actModules = ModulesTick;
             SceneManager.sceneLoaded += OnSceneLoaded;
 
@@ -531,11 +552,13 @@ namespace CardShopCoop
                 _containers.HostTick(_dt, inGame);
                 _tournament.HostTick(_dt, inGame);
                 _cardBoxes.HostTick(_dt, inGame);
+                _furnBoxes.HostTick(_dt, inGame);
             }
             else if (Role == CoopRole.Client)
             {
                 _trades.ClientTick(_dt, inGame); // offer countdown + accept/decline keys
                 _cardBoxes.ClientTick(_dt, inGame); // carried transitions + box moves
+                _furnBoxes.ClientTick(_dt, inGame);
                 // content mods register their products SECONDS after the scene loads
                 // (and per-save: a host mid-tutorial has none yet) - keep re-digesting
                 // as our catalog changes so the comparison never goes stale
@@ -580,6 +603,7 @@ namespace CardShopCoop
             _containers.Reset();
             _tournament.Reset();
             _cardBoxes.Reset();
+            _furnBoxes.Reset();
         }
 
         private void ModulesForceResend()
@@ -595,6 +619,7 @@ namespace CardShopCoop
             _containers.ForceResend();
             _tournament.ForceResend();
             _cardBoxes.ForceResend();
+            _furnBoxes.ForceResend();
         }
 
         private void RegisterMirrorTick()
@@ -2464,6 +2489,18 @@ namespace CardShopCoop
                 {
                     if (Role != CoopRole.Client || !InGameLevel()) break;
                     using (var br = Msg.Reader(msg.Payload)) _cardBoxes.ClientApplyState(br);
+                    break;
+                }
+                case MsgType.FurnBoxOp:
+                {
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _furnBoxes.HostApplyOp(br);
+                    break;
+                }
+                case MsgType.FurnBoxState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _furnBoxes.ClientApplyState(br);
                     break;
                 }
                 case MsgType.EnumSync:
