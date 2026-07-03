@@ -535,12 +535,35 @@ namespace CardShopCoop
             {
                 _trades.ClientTick(_dt, inGame); // offer countdown + accept/decline keys
                 _cardBoxes.ClientTick(_dt, inGame); // carried transitions + box moves
-                if (!_catalogSent && inGame)
+                // content mods register their products SECONDS after the scene loads
+                // (and per-save: a host mid-tutorial has none yet) - keep re-digesting
+                // as our catalog changes so the comparison never goes stale
+                _catalogTimer += _dt;
+                if (inGame && (_catalogTimer >= 45f || !_catalogSent))
                 {
+                    _catalogTimer = 0f;
                     _catalogSent = true;
-                    SendCatalogDigest();
+                    int h = LocalCatalogHash();
+                    if (h != _lastCatalogSentHash)
+                    {
+                        _lastCatalogSentHash = h;
+                        SendCatalogDigest();
+                    }
                 }
             }
+        }
+
+        private static int LocalCatalogHash()
+        {
+            try
+            {
+                var list = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
+                int h = 17;
+                foreach (var rd in list)
+                    if (rd != null) h = h * 31 + (((int)rd.itemType << 1) | (rd.isBigBox ? 1 : 0));
+                return h;
+            }
+            catch { return 0; }
         }
 
         private void ModulesReset()
@@ -997,6 +1020,8 @@ namespace CardShopCoop
         // The joiner sends its catalog once; the host reports any difference loudly. ----
 
         private bool _catalogSent;
+        private float _catalogTimer;
+        private int _lastCatalogSentHash;
         private HashSet<int> _clientPriced = new HashSet<int>();   // itemTypes the host has priced
         private HashSet<int> _incomingPriced = new HashSet<int>(); // scratch, swapped per apply
 
@@ -2196,12 +2221,20 @@ namespace CardShopCoop
                         {
                             // the money is already in the shared wallet (the charge fired
                             // before the spawn call we intercept) - give it back loudly
-                            CoopPlugin.Log.LogWarning($"{who} ordered unknown product type {itemType} '{rdName}' - refunding {cost:F0}");
+                            int hostCatalog = 0;
+                            try { hostCatalog = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList.Count; } catch { }
+                            CoopPlugin.Log.LogWarning($"{who} ordered unknown product type {itemType} '{rdName}' - refunding {cost:F0} (host catalog: {hostCatalog} products)");
                             LogCatalogCandidates(rdName);
                             if (cost > 0f && cost < 100000f)
                                 CEventManager.QueueEvent(new CEventPlayer_AddCoin(cost));
+                            // vanilla ships ~133 products: a bare catalog means the host's
+                            // content mods haven't registered for this save yet (fresh
+                            // save still in the tutorial), not a missing-pack problem
+                            string reason = hostCatalog <= 140
+                                ? "the host's modded products haven't loaded yet (new save still in the tutorial?) - play past the host's tutorial and rejoin"
+                                : "match your content packs to order it";
                             Send(msg.ConnId, MsgType.Toast, bw => bw.Write(
-                                $"'{rdName}' isn't in the host's catalog - refunded ${cost:F0}. Match your content packs to order it."));
+                                $"'{rdName}' isn't in the host's catalog - refunded ${cost:F0}. Note: {reason}"));
                         }
                     }
                     break;
