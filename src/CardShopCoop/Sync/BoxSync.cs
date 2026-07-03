@@ -44,6 +44,8 @@ namespace CardShopCoop.Sync
         private readonly HashSet<int> _remoteCarried = new HashSet<int>();   // host: client-held boxes
         private readonly Dictionary<int, double> _recentlyReleased = new Dictionary<int, double>(); // client: ignore stale carried echoes
         private readonly Dictionary<int, double> _locallyTouched = new Dictionary<int, double>();   // client: my recent edits beat stale echoes
+        private readonly HashSet<int> _hostCarriedLastTick = new HashSet<int>();                    // host: own-carry transitions
+        private readonly Dictionary<int, double> _hostRecentlyReleased = new Dictionary<int, double>(); // host: just set it down; stale client reports must not stomp it
         private float _timer;
         private int _lastHostHash;
         private float _hostHeal;
@@ -69,6 +71,8 @@ namespace CardShopCoop.Sync
             _remoteCarried.Clear();
             _recentlyReleased.Clear();
             _locallyTouched.Clear();
+            _hostCarriedLastTick.Clear();
+            _hostRecentlyReleased.Clear();
             _timer = -0.6f; // staggered phase vs the other snapshot engines
             _lastHostHash = 0;
             _hostHeal = 0f;
@@ -122,6 +126,14 @@ namespace CardShopCoop.Sync
                 {
                     if (boxes[i] == null) continue;
                     var e = Snapshot(boxes[i]);
+                    if (e.Carried)
+                    {
+                        _hostCarriedLastTick.Add(i);
+                    }
+                    else if (_hostCarriedLastTick.Remove(i))
+                    {
+                        _hostRecentlyReleased[i] = Time.realtimeSinceStartupAsDouble;
+                    }
                     if (_remoteCarried.Contains(i)) e.Carried = true; // a client holds it
                     list.Add(e);
                 }
@@ -157,6 +169,10 @@ namespace CardShopCoop.Sync
                 // type must match: index may have shifted between snapshot and request
                 if ((int)box.m_ItemCompartment.GetItemType() != entries[i].Type) continue;
                 if (IsLocallyCarried(box)) continue; // never stomp a box in the host's hands
+                // just set down: a report the client built while we still carried it is
+                // stale by definition - the race that teleported boxes mid-restock
+                if (_hostRecentlyReleased.TryGetValue(i, out double rel)
+                    && Time.realtimeSinceStartupAsDouble - rel < 6.0) continue;
                 if (entries[i].Carried) _remoteCarried.Add(i);
                 else _remoteCarried.Remove(i);
                 ApplyToBox(box, entries[i]);
@@ -294,6 +310,16 @@ namespace CardShopCoop.Sync
                         {
                             changed = true; // set-down transition
                             _recentlyReleased[i] = Time.realtimeSinceStartupAsDouble;
+                        }
+                        // a box hidden because a REMOTE player carries it has no local
+                        // truth to report: its transform is parked at the hide spot and
+                        // its contents are stale. Diffing it "changed" every tick echoed
+                        // that stale state at the host - teleporting the HOST's box back
+                        // to the pickup spot the moment they set it down mid-restock
+                        if (_lastApplied[i].Carried)
+                        {
+                            list.Add(_lastApplied[i]);
+                            continue;
                         }
                         var now = Snapshot(boxes[i]);
                         if (Differs(now, _lastApplied[i]))
