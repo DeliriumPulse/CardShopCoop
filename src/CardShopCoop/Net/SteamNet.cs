@@ -9,10 +9,12 @@ namespace CardShopCoop.Net
     /// <summary>
     /// Steam P2P transport: friends-list invites, no IPs, no port forwarding. Rides the
     /// game's own Steamworks.NET (initialized and pumped by its Heathen integration).
-    /// Uses classic ISteamNetworking P2P with relay fallback; every frame is one reliable
-    /// P2P message (Msg.Build's 4-byte length prefix is kept for wire compatibility and
-    /// stripped on receive). All Steam calls happen in PumpMainThread; Send() from worker
-    /// threads only enqueues.
+    /// Uses classic ISteamNetworking P2P with relay fallback (Msg.Build's 4-byte length
+    /// prefix is kept for wire compatibility and stripped on receive). Two outgoing lanes:
+    /// transients (UnreliableNoDelay, newest-wins, dropped on refusal) drain before the
+    /// stall-retried reliable lane, so a clogged bulk transfer can never delay position
+    /// updates. All Steam calls happen in PumpMainThread; Send()/SendTransient() from
+    /// worker threads only enqueue.
     /// </summary>
     public class SteamTransport : ICoopTransport
     {
@@ -29,10 +31,18 @@ namespace CardShopCoop.Net
         private readonly Dictionary<int, CSteamID> _peers = new Dictionary<int, CSteamID>();
         private readonly Dictionary<CSteamID, int> _ids = new Dictionary<CSteamID, int>();
         private readonly Dictionary<int, double> _lastRecv = new Dictionary<int, double>();
-        private struct Outgoing { public int ConnId; public byte[] Frame; public bool Transient; }
+        private struct Outgoing { public int ConnId; public byte[] Frame; }
 
-        private readonly ConcurrentQueue<Outgoing> _outbox = new ConcurrentQueue<Outgoing>();
+        private readonly ConcurrentQueue<Outgoing> _transientOutbox = new ConcurrentQueue<Outgoing>();
+        private readonly ConcurrentQueue<Outgoing> _reliableOutbox = new ConcurrentQueue<Outgoing>();
         private Outgoing? _stalled; // reliable frame Steam refused; retried first
+
+        // transient coalescing scratch, reused every pump (main thread only)
+        private readonly List<Outgoing> _transientScratch = new List<Outgoing>(32);
+        private readonly Dictionary<int, int> _newestTransient = new Dictionary<int, int>(32);
+        private double _lastTransientRefusedLog = -10.0;
+
+        private List<int> _connIdsCache; // snapshot handed out by ConnIds(); rebuilt on membership change
         private int _nextConnId = 1;
         private byte[] _readBuf = new byte[600 * 1024];
         private float _keepaliveTimer;
@@ -96,6 +106,7 @@ namespace CardShopCoop.Net
             int cid = _nextConnId++;
             _peers[cid] = sid;
             _ids[sid] = cid;
+            _connIdsCache = null;
             _lastRecv[cid] = Time.realtimeSinceStartupAsDouble;
             Connects.Enqueue(cid);
             CoopPlugin.Log.LogInfo($"steam: peer {sid} connected as {cid}");
@@ -110,45 +121,78 @@ namespace CardShopCoop.Net
 
         public void Send(int connId, byte[] frame)
         {
-            _outbox.Enqueue(new Outgoing { ConnId = connId, Frame = frame });
+            _reliableOutbox.Enqueue(new Outgoing { ConnId = connId, Frame = frame });
         }
 
+        /// <summary>Main thread only: iterates _peers directly to avoid a per-call snapshot.</summary>
         public void Broadcast(byte[] frame)
         {
-            foreach (int cid in ConnIds())
-                _outbox.Enqueue(new Outgoing { ConnId = cid, Frame = frame });
+            foreach (var kv in _peers)
+                _reliableOutbox.Enqueue(new Outgoing { ConnId = kv.Key, Frame = frame });
         }
 
         public void SendTransient(int connId, byte[] frame)
         {
-            _outbox.Enqueue(new Outgoing { ConnId = connId, Frame = frame, Transient = true });
+            _transientOutbox.Enqueue(new Outgoing { ConnId = connId, Frame = frame });
         }
 
+        /// <summary>Main thread only: iterates _peers directly to avoid a per-call snapshot.</summary>
         public void BroadcastTransient(byte[] frame)
         {
-            foreach (int cid in ConnIds())
-                _outbox.Enqueue(new Outgoing { ConnId = cid, Frame = frame, Transient = true });
+            foreach (var kv in _peers)
+                _transientOutbox.Enqueue(new Outgoing { ConnId = kv.Key, Frame = frame });
         }
 
         public void PumpMainThread()
         {
             if (_stopped) return;
 
-            // ---- sends (byte-budgeted per frame; a refused reliable frame stalls until
-            // Steam accepts it). Transient frames go UnreliableNoDelay - never buffered,
-            // never queued behind bulk transfers; a drop just means the next update wins.
-            // Reliable frames use plain Reliable (NOT WithBuffering, which adds ~200ms).
+            // ---- transient lane: drained fully every frame, ahead of the reliable lane,
+            // so a clogged bulk transfer can never delay position updates. States replace
+            // themselves (PlayerState/NpcState), so when several frames for the same
+            // (conn, MsgType) are queued only the newest is worth sending. A refused send
+            // is dropped - the next state tick supersedes it - but logged (throttled) so
+            // oversized packets are visible instead of a silent crowd freeze.
+            _transientScratch.Clear();
+            _newestTransient.Clear();
+            while (_transientOutbox.TryDequeue(out var tr))
+            {
+                int key = (tr.ConnId << 8) | tr.Frame[4]; // MsgType byte follows the 4-byte length prefix
+                if (_newestTransient.TryGetValue(key, out int prev))
+                    _transientScratch[prev] = new Outgoing(); // superseded; null Frame skips it below
+                _newestTransient[key] = _transientScratch.Count;
+                _transientScratch.Add(tr);
+            }
+            for (int i = 0; i < _transientScratch.Count; i++)
+            {
+                var t = _transientScratch[i];
+                if (t.Frame == null) continue;
+                if (!_peers.TryGetValue(t.ConnId, out var tsid)) continue; // peer gone
+                if (!SteamNetworking.SendP2PPacket(tsid, t.Frame, (uint)t.Frame.Length,
+                        EP2PSend.k_EP2PSendUnreliableNoDelay, Channel))
+                {
+                    double now = Time.realtimeSinceStartupAsDouble;
+                    if (now - _lastTransientRefusedLog >= 10.0)
+                    {
+                        _lastTransientRefusedLog = now;
+                        CoopPlugin.Log.LogWarning($"steam: transient packet refused (size {t.Frame.Length})");
+                    }
+                }
+            }
+            _transientScratch.Clear();
+
+            // ---- reliable lane (byte-budgeted per frame; a refused frame stalls until
+            // Steam accepts it). Plain Reliable (NOT WithBuffering, which adds ~200ms).
             int budget = 1024 * 1024;
             while (budget > 0)
             {
                 Outgoing entry;
                 if (_stalled.HasValue) { entry = _stalled.Value; _stalled = null; }
-                else if (!_outbox.TryDequeue(out entry)) break;
+                else if (!_reliableOutbox.TryDequeue(out entry)) break;
 
                 if (!_peers.TryGetValue(entry.ConnId, out var sid)) continue; // peer gone
-                var mode = entry.Transient ? EP2PSend.k_EP2PSendUnreliableNoDelay : EP2PSend.k_EP2PSendReliable;
-                if (!SteamNetworking.SendP2PPacket(sid, entry.Frame, (uint)entry.Frame.Length, mode, Channel)
-                    && !entry.Transient)
+                if (!SteamNetworking.SendP2PPacket(sid, entry.Frame, (uint)entry.Frame.Length,
+                        EP2PSend.k_EP2PSendReliable, Channel))
                 {
                     _stalled = entry; // Steam's reliable queue is full; retry next frame
                     break;
@@ -199,7 +243,12 @@ namespace CardShopCoop.Net
                 : double.MaxValue;
         }
 
-        public List<int> ConnIds() { return new List<int>(_peers.Keys); }
+        /// <summary>Returns a snapshot that is never mutated (callers Kick mid-iteration);
+        /// membership changes swap in a fresh list instead of touching the old one.</summary>
+        public List<int> ConnIds()
+        {
+            return _connIdsCache ?? (_connIdsCache = new List<int>(_peers.Keys));
+        }
 
         public void Kick(int connId)
         {
@@ -207,6 +256,7 @@ namespace CardShopCoop.Net
             SteamNetworking.CloseP2PSessionWithUser(sid);
             _peers.Remove(connId);
             _ids.Remove(sid);
+            _connIdsCache = null;
             _lastRecv.Remove(connId);
             Disconnects.Enqueue(connId);
         }
@@ -219,6 +269,7 @@ namespace CardShopCoop.Net
                 SteamNetworking.CloseP2PSessionWithUser(kv.Value);
             _peers.Clear();
             _ids.Clear();
+            _connIdsCache = null;
             if (LobbyId != CSteamID.Nil)
             {
                 try { SteamMatchmaking.LeaveLobby(LobbyId); } catch { }

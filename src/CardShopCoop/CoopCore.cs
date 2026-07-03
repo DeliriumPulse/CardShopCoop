@@ -39,10 +39,10 @@ namespace CardShopCoop
         private readonly BoxSync _boxes = new BoxSync();
         private readonly PopulationSync _population = new PopulationSync();
         private string _lastShopNameSent;
-        private float _shopNameTimer;
+        private float _shopNameTimer = -1.0f; // staggered phase (see _lightSyncTimer note)
         private readonly Sync.RegisterMirror _registerMirror = new Sync.RegisterMirror();
-        private float _npcSweepTimer;
-        private float _regStateTimer;
+        private float _npcSweepTimer = -1.3f;
+        private float _regStateTimer = -0.17f;
         public string PromptLine = "";
         private readonly ConcurrentQueue<Action> _mainThread = new ConcurrentQueue<Action>();
         private UI.CoopUI _ui;
@@ -57,14 +57,14 @@ namespace CardShopCoop
         private bool _worldRequested;
 
         // host price sync
-        private float _priceTimer;
+        private float _priceTimer = -0.45f;
         private int _lastPriceHash;
 
         // timers
         private float _stateTimer;
         private float _pingTimer;
-        private float _econTimer;
-        private float _dayTimer;
+        private float _econTimer = -0.11f;
+        private float _dayTimer = -0.9f;
 
         // local movement measurement
         private Vector3 _lastPos;
@@ -82,7 +82,7 @@ namespace CardShopCoop
         // pipeline diagnostics: prove where sync stalls instead of guessing
         private long _diagSent;
         private long _diagRecvStates;
-        private float _diagTimer;
+        private float _diagTimer = -7.3f;
         private float _errLogCooldown;
 
         private void Guarded(string stage, Action action)
@@ -108,11 +108,30 @@ namespace CardShopCoop
         private static readonly FieldInfo FiFinishLoading = typeof(LightManager).GetField("m_FinishLoading", BindingFlags.NonPublic | BindingFlags.Instance);
         private static readonly System.Reflection.MethodInfo MiLightInit = typeof(LightManager).GetMethod("Init", BindingFlags.NonPublic | BindingFlags.Instance);
         private static readonly System.Reflection.MethodInfo MiUpdateLightData = typeof(LightManager).GetMethod("UpdateLightTimeData", BindingFlags.NonPublic | BindingFlags.Instance);
-        private float _lightSyncTimer;
-        private LightManager _lightManager;
-        private float _cardResyncTimer;
-        private float _licenseSyncTimer;
+        private float _lightSyncTimer = -2.3f;   // timers carry staggered phases so the
+        private LightManager _lightManager;      // periodic broadcasts never bunch into
+        private float _cardResyncTimer = -5.2f;  // one frame (the rhythmic-hitch bug)
+        private float _licenseSyncTimer = -3.7f;
         private double _lastLicenseBuyTime = -999.0;
+        private string _lastLightJson;
+        private int _lastLicenseHash;
+        private float _licenseHeal;
+
+        // per-frame stages run through cached delegates: a fresh closure per stage per
+        // frame was ~600 allocations/second of GC pressure that only existed in-session
+        private float _dt;
+        private bool _syncActive;
+        private Action _actNetPump, _actAvatars, _actWorld, _actCardShelves, _actObjMoves,
+            _actBoxes, _actPopulation, _actNpcPuppets, _actRegisterMirror, _actNpcSweep,
+            _actStateSend, _actNpcCollect, _actRegisterCollect;
+        private CustomerManager _cmSweep;
+        private bool _renamerHandled;
+        private int _heldBoxFrame = -1;
+        private object _heldBoxA, _heldBoxB;
+        private readonly System.Collections.Generic.List<InMsg> _dispatchBuf
+            = new System.Collections.Generic.List<InMsg>(64);
+        private readonly System.Collections.Generic.HashSet<long> _dispatchSeen
+            = new System.Collections.Generic.HashSet<long>();
 
         // headless auto-test / shortcut args: -coopautohost=SLOT  -coopautojoin=IP
         private int _autoHostSlot = -1;
@@ -150,8 +169,15 @@ namespace CardShopCoop
                 if (_playerIpc == null || box == null) return false;
                 try
                 {
-                    return ReferenceEquals(FiHoldItemBox?.GetValue(_playerIpc), box)
-                        || ReferenceEquals(FiHoldBox?.GetValue(_playerIpc), box);
+                    // resolve the held refs once per frame, not per box: this delegate
+                    // runs for every box in every apply/tick pass
+                    if (_heldBoxFrame != Time.frameCount)
+                    {
+                        _heldBoxFrame = Time.frameCount;
+                        _heldBoxA = FiHoldItemBox?.GetValue(_playerIpc);
+                        _heldBoxB = FiHoldBox?.GetValue(_playerIpc);
+                    }
+                    return ReferenceEquals(_heldBoxA, box) || ReferenceEquals(_heldBoxB, box);
                 }
                 catch { return false; }
             };
@@ -170,6 +196,27 @@ namespace CardShopCoop
                 if (Role == CoopRole.Client && (kind == 2 || kind == 3))
                     _cardShelves.InvalidateBaseline();
             };
+            _actNetPump = () => _net.PumpMainThread();
+            _actAvatars = () => _avatars.Tick(_dt);
+            _actWorld = () => _world.Tick(_dt, _syncActive);
+            _actCardShelves = () =>
+            {
+                _cardShelves.IsClientRole = Role == CoopRole.Client;
+                _cardShelves.Tick(_dt, _syncActive);
+            };
+            _actObjMoves = () => _objMoves.Tick(_dt, _syncActive);
+            _actBoxes = () =>
+            {
+                if (Role == CoopRole.Host) _boxes.HostTick(_dt, _syncActive);
+                else if (Role == CoopRole.Client) _boxes.ClientTick(_dt, _syncActive);
+            };
+            _actPopulation = () => { if (Role == CoopRole.Host) _population.HostTick(_dt, _syncActive); };
+            _actNpcPuppets = () => _npcs.TickPuppets(_dt, InGameLevel());
+            _actRegisterMirror = RegisterMirrorTick;
+            _actNpcSweep = NpcSweepTick;
+            _actStateSend = StateSendTick;
+            _actNpcCollect = NpcCollectTick;
+            _actRegisterCollect = RegisterCollectTick;
             SceneManager.sceneLoaded += OnSceneLoaded;
 
             var args = Environment.GetCommandLineArgs();
@@ -390,6 +437,8 @@ namespace CardShopCoop
             _registerMirror.Reset();
             PromptLine = "";
             _lightManager = null;
+            _cmSweep = null;
+            _renamerHandled = false;
             _playerTf = null;
             _playerCamTf = null;
             _playerIpc = null;
@@ -404,6 +453,108 @@ namespace CardShopCoop
         {
             var gm = CSingleton<CGameManager>.Instance;
             return gm != null && gm.m_IsGameLevel;
+        }
+
+        private void RegisterMirrorTick()
+        {
+            _registerMirror.Tick(_dt);
+            _regStateTimer += _dt;
+            if (_regStateTimer >= 0.5f && InGameLevel())
+            {
+                _regStateTimer -= 0.5f;
+                var tf = ResolvePlayer();
+                int near = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, 3.5f, quiet: true) : -1;
+                PromptLine = _registerMirror.PromptFor(near) ?? "";
+            }
+        }
+
+        private void NpcSweepTick()
+        {
+            // the shop-naming world trigger (and its "!" marker) is host-only; find it
+            // ONCE - once disabled, FindObjectOfType can never see it again and each
+            // retry was a full-scene scan for nothing
+            if (!_renamerHandled)
+            {
+                _renamerHandled = true;
+                var renamer = FindObjectOfType<ShopRenamer>();
+                if (renamer != null && renamer.gameObject.activeSelf)
+                {
+                    renamer.gameObject.SetActive(false);
+                    CoopPlugin.Log.LogInfo("disabled shop-renamer trigger (host names the shop)");
+                }
+            }
+            if (_cmSweep == null) _cmSweep = FindObjectOfType<CustomerManager>();
+            if (_cmSweep != null)
+            {
+                var list = _cmSweep.GetCustomerList();
+                for (int i = 0; i < list.Count; i++)
+                    if (list[i] != null && list[i].gameObject.activeSelf)
+                        list[i].gameObject.SetActive(false);
+            }
+            var workers = WorkerManager.GetWorkerList();
+            if (workers != null)
+                for (int i = 0; i < workers.Count; i++)
+                    if (workers[i] != null && workers[i].gameObject.activeSelf)
+                        workers[i].gameObject.SetActive(false);
+        }
+
+        private void StateSendTick()
+        {
+            float interval = 1f / Mathf.Clamp(CoopPlugin.SendRateHz.Value, 4f, 30f);
+            Transform playerTf = InGameLevel() ? ResolvePlayer() : null;
+            if (_stateTimer < interval || playerTf == null) return;
+            Vector3 pos = playerTf.position;
+            float speed = 0f;
+            if (_hasLastPos)
+            {
+                Vector3 delta = pos - _lastPos;
+                delta.y = 0f;
+                speed = Mathf.Clamp(delta.magnitude / _stateTimer, 0f, 6f);
+            }
+            _lastPos = pos; _hasLastPos = true;
+            float yaw = _playerCamTf != null ? _playerCamTf.eulerAngles.y
+                : (Camera.main != null ? Camera.main.transform.eulerAngles.y : playerTf.eulerAngles.y);
+            byte hold = ComputeHoldState();
+            BroadcastTransient(MsgType.PlayerState, bw =>
+            {
+                bw.Write(pos.x); bw.Write(pos.y); bw.Write(pos.z);
+                bw.Write(yaw); bw.Write(speed); bw.Write(hold);
+                if (hold == 3)
+                {
+                    bw.Write((byte)_holdCardsBuf.Count);
+                    foreach (var c in _holdCardsBuf) Msg.WriteCard(bw, c);
+                }
+                else
+                {
+                    bw.Write((byte)_holdTypesBuf.Count);
+                    foreach (int t in _holdTypesBuf) bw.Write(t);
+                }
+            });
+            _diagSent++;
+            _stateTimer = 0f; // full reset: the speed estimate divides by this elapsed time
+        }
+
+        private void NpcCollectTick()
+        {
+            var chunks = _npcs.HostCollect(_dt);
+            if (chunks == null) return;
+            for (int i = 0; i < chunks.Count; i++)
+            {
+                var c = chunks[i];
+                BroadcastTransient(MsgType.NpcState, bw => bw.Write(c));
+            }
+        }
+
+        private void RegisterCollectTick()
+        {
+            _regStateTimer += _dt;
+            if (_regStateTimer >= 0.5f)
+            {
+                _regStateTimer -= 0.5f;
+                var batch = Sync.RegisterServe.CollectStates();
+                if (batch != null)
+                    BroadcastTransient(MsgType.RegisterState, bw => bw.Write(batch));
+            }
         }
 
         /// <summary>The game assigns neither CGameManager.Player nor
@@ -834,7 +985,7 @@ namespace CardShopCoop
 
             if (_net == null) return;
 
-            Guarded("net-pump", () => _net.PumpMainThread());
+            Guarded("net-pump", _actNetPump);
 
             // The game forces Application.runInBackground=false (changeFramerate coroutine),
             // which freezes the whole simulation when the window loses focus - fatal for
@@ -870,12 +1021,34 @@ namespace CardShopCoop
                 }
             }
 
+            // Drain with coalescing: after any hitch the backlog holds dozens of stale
+            // full-state packets; applying each in one frame turns one slow frame into
+            // a cascade. For snapshot types only the NEWEST per (type, sender) matters.
+            // (NpcState is chunked - every chunk carries different NPCs - and RelayState
+            // multiplexes senders inside the payload, so neither may be coalesced.)
+            _dispatchBuf.Clear();
             while (_net != null && _net.Incoming.TryDequeue(out var msg))
+                _dispatchBuf.Add(msg);
+            if (_dispatchBuf.Count > 8)
             {
-                try { Dispatch(msg); }
-                catch (Exception e) { CoopPlugin.Log.LogError($"Dispatch {msg.Type}: {e}"); }
+                _dispatchSeen.Clear();
+                for (int i = _dispatchBuf.Count - 1; i >= 0; i--)
+                {
+                    var t = _dispatchBuf[i].Type;
+                    if (t != MsgType.PlayerState && t != MsgType.RegisterState
+                        && t != MsgType.BoxState && t != MsgType.PopState) continue;
+                    long key = ((long)t << 32) | (uint)_dispatchBuf[i].ConnId;
+                    if (!_dispatchSeen.Add(key)) _dispatchBuf[i] = default; // superseded
+                }
             }
-            if (_net == null) return; // a Bye may have shut us down mid-drain
+            for (int i = 0; i < _dispatchBuf.Count; i++)
+            {
+                if (_dispatchBuf[i].Type == 0) continue;
+                try { Dispatch(_dispatchBuf[i]); }
+                catch (Exception e) { CoopPlugin.Log.LogError($"Dispatch {_dispatchBuf[i].Type}: {e}"); }
+                if (_net == null) break; // a Bye may have shut us down mid-drain
+            }
+            if (_net == null) return;
 
             float dt = Time.deltaTime;
             if (_errLogCooldown > 0f) _errLogCooldown -= dt;
@@ -884,40 +1057,19 @@ namespace CardShopCoop
             // that feature only, never kill position sync for the whole session.
             FlushPendingCardWork();
 
-            Guarded("avatars", () => _avatars.Tick(dt));
-            bool syncActive = Role != CoopRole.None && _net.ConnectionCount > 0 && InGameLevel();
-            Guarded("world", () => _world.Tick(dt, syncActive));
-            Guarded("cardshelves", () =>
-            {
-                _cardShelves.IsClientRole = Role == CoopRole.Client;
-                _cardShelves.Tick(dt, syncActive);
-            });
-            Guarded("objmoves", () => _objMoves.Tick(dt, syncActive));
-            Guarded("boxes", () =>
-            {
-                if (Role == CoopRole.Host) _boxes.HostTick(dt, syncActive);
-                else if (Role == CoopRole.Client) _boxes.ClientTick(dt, syncActive);
-            });
-            Guarded("population", () =>
-            {
-                if (Role == CoopRole.Host) _population.HostTick(dt, syncActive);
-            });
+            _dt = dt;
+            Guarded("avatars", _actAvatars);
+            _syncActive = Role != CoopRole.None && _net.ConnectionCount > 0 && InGameLevel();
+            Guarded("world", _actWorld);
+            Guarded("cardshelves", _actCardShelves);
+            Guarded("objmoves", _actObjMoves);
+            Guarded("boxes", _actBoxes);
+            Guarded("population", _actPopulation);
 
             if (Role == CoopRole.Client)
             {
-                Guarded("npc-puppets", () => _npcs.TickPuppets(dt, InGameLevel()));
-                Guarded("register-mirror", () =>
-                {
-                    _registerMirror.Tick(dt);
-                    _regStateTimer += dt;
-                    if (_regStateTimer >= 0.5f && InGameLevel())
-                    {
-                        _regStateTimer = 0f;
-                        var tf = ResolvePlayer();
-                        int near = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, 3.5f, quiet: true) : -1;
-                        PromptLine = _registerMirror.PromptFor(near) ?? "";
-                    }
-                });
+                Guarded("npc-puppets", _actNpcPuppets);
+                Guarded("register-mirror", _actRegisterMirror);
 
                 // The save-load path can leave inert vanilla customers standing around on
                 // the client even though their AI is suppressed; sweep them off so only
@@ -925,77 +1077,19 @@ namespace CardShopCoop
                 _npcSweepTimer += dt;
                 if (_npcSweepTimer >= 2f && InGameLevel())
                 {
-                    _npcSweepTimer = 0f;
-                    Guarded("npc-sweep", () =>
-                    {
-                        // the shop-naming world trigger (and its "!" marker) is host-only
-                        var renamer = FindObjectOfType<ShopRenamer>();
-                        if (renamer != null && renamer.gameObject.activeSelf)
-                        {
-                            renamer.gameObject.SetActive(false);
-                            CoopPlugin.Log.LogInfo("disabled shop-renamer trigger (host names the shop)");
-                        }
-                        var cm = FindObjectOfType<CustomerManager>();
-                        if (cm != null)
-                        {
-                            var list = cm.GetCustomerList();
-                            for (int i = 0; i < list.Count; i++)
-                                if (list[i] != null && list[i].gameObject.activeSelf)
-                                    list[i].gameObject.SetActive(false);
-                        }
-                        var workers = WorkerManager.GetWorkerList();
-                        if (workers != null)
-                            for (int i = 0; i < workers.Count; i++)
-                                if (workers[i] != null && workers[i].gameObject.activeSelf)
-                                    workers[i].gameObject.SetActive(false);
-                    });
+                    _npcSweepTimer -= 2f;
+                    Guarded("npc-sweep", _actNpcSweep);
                 }
             }
 
             // position updates
             _stateTimer += dt;
-            float interval = 1f / Mathf.Clamp(CoopPlugin.SendRateHz.Value, 4f, 30f);
-            Guarded("state-send", () =>
-            {
-                Transform playerTf = InGameLevel() ? ResolvePlayer() : null;
-                if (_stateTimer >= interval && playerTf != null)
-                {
-                    Vector3 pos = playerTf.position;
-                    float speed = 0f;
-                    if (_hasLastPos)
-                    {
-                        Vector3 delta = pos - _lastPos;
-                        delta.y = 0f;
-                        speed = Mathf.Clamp(delta.magnitude / _stateTimer, 0f, 6f);
-                    }
-                    _lastPos = pos; _hasLastPos = true;
-                    float yaw = _playerCamTf != null ? _playerCamTf.eulerAngles.y
-                        : (Camera.main != null ? Camera.main.transform.eulerAngles.y : playerTf.eulerAngles.y);
-                    byte hold = ComputeHoldState();
-                    BroadcastTransient(MsgType.PlayerState, bw =>
-                    {
-                        bw.Write(pos.x); bw.Write(pos.y); bw.Write(pos.z);
-                        bw.Write(yaw); bw.Write(speed); bw.Write(hold);
-                        if (hold == 3)
-                        {
-                            bw.Write((byte)_holdCardsBuf.Count);
-                            foreach (var c in _holdCardsBuf) Msg.WriteCard(bw, c);
-                        }
-                        else
-                        {
-                            bw.Write((byte)_holdTypesBuf.Count);
-                            foreach (int t in _holdTypesBuf) bw.Write(t);
-                        }
-                    });
-                    _diagSent++;
-                    _stateTimer = 0f;
-                }
-            });
+            Guarded("state-send", _actStateSend);
 
             _diagTimer += dt;
             if (_diagTimer >= 15f)
             {
-                _diagTimer = 0f;
+                _diagTimer -= 15f;
                 var diagTf = InGameLevel() ? ResolvePlayer() : null;
                 string posStr = diagTf != null ? $"({diagTf.position.x:F1},{diagTf.position.y:F1},{diagTf.position.z:F1})" : "n/a";
                 string npcStr = "";
@@ -1111,29 +1205,14 @@ namespace CardShopCoop
 
             if (InGameLevel())
             {
-                Guarded("npc-collect", () =>
-                {
-                    var batch = _npcs.HostCollect(dt);
-                    if (batch != null)
-                        BroadcastTransient(MsgType.NpcState, bw => bw.Write(batch));
-                });
-                Guarded("register-collect", () =>
-                {
-                    _regStateTimer += dt;
-                    if (_regStateTimer >= 0.5f)
-                    {
-                        _regStateTimer = 0f;
-                        var batch = Sync.RegisterServe.CollectStates();
-                        if (batch != null)
-                            BroadcastTransient(MsgType.RegisterState, bw => bw.Write(batch));
-                    }
-                });
+                Guarded("npc-collect", _actNpcCollect);
+                Guarded("register-collect", _actRegisterCollect);
             }
 
             _priceTimer += dt;
             if (_priceTimer >= 3f)
             {
-                _priceTimer = 0f;
+                _priceTimer -= 3f;
                 try
                 {
                     var prices = CPlayerData.m_SetItemPriceList;
@@ -1156,7 +1235,7 @@ namespace CardShopCoop
             _shopNameTimer += dt;
             if (_shopNameTimer >= 3f)
             {
-                _shopNameTimer = 0f;
+                _shopNameTimer -= 3f;
                 string name = CPlayerData.GetPlayerName();
                 if (name != _lastShopNameSent)
                 {
@@ -1168,7 +1247,7 @@ namespace CardShopCoop
             _econTimer += dt;
             if (_econTimer >= 0.5f)
             {
-                _econTimer = 0f;
+                _econTimer -= 0.5f;
                 double coin = CPlayerData.m_CoinAmountDouble;
                 if (Math.Abs(coin - _lastCoinSent) > 0.0001)
                 {
@@ -1193,7 +1272,7 @@ namespace CardShopCoop
             _lightSyncTimer += dt;
             if (_lightSyncTimer >= 5f)
             {
-                _lightSyncTimer = 0f;
+                _lightSyncTimer -= 5f;
                 try
                 {
                     if (_lightManager == null) _lightManager = FindObjectOfType<LightManager>();
@@ -1201,7 +1280,11 @@ namespace CardShopCoop
                     {
                         MiUpdateLightData.Invoke(_lightManager, null); // refresh bundle from live state
                         string lightJson = JsonUtility.ToJson(CPlayerData.m_LightTimeData);
-                        Broadcast(MsgType.LightState, bw => bw.Write(lightJson));
+                        if (lightJson != _lastLightJson) // skip the broadcast+client parse when static
+                        {
+                            _lastLightJson = lightJson;
+                            Broadcast(MsgType.LightState, bw => bw.Write(lightJson));
+                        }
                     }
                 }
                 catch (Exception e) { CoopPlugin.Log.LogWarning("light sync: " + e.Message); }
@@ -1213,7 +1296,7 @@ namespace CardShopCoop
             _cardResyncTimer += dt;
             if (_cardResyncTimer >= 12f && InGameLevel())
             {
-                _cardResyncTimer = 0f;
+                _cardResyncTimer -= 12f;
                 try
                 {
                     var full = _cardShelves.BuildFullState();
@@ -1228,7 +1311,7 @@ namespace CardShopCoop
             _licenseSyncTimer += dt;
             if (_licenseSyncTimer >= 10f && InGameLevel())
             {
-                _licenseSyncTimer = 0f;
+                _licenseSyncTimer -= 10f;
                 try
                 {
                     var rl = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
@@ -1237,16 +1320,28 @@ namespace CardShopCoop
                     for (int i = 0; i < rl.Count && i < flags.Count; i++)
                         if (flags[i] && rl[i] != null) unlocked.Add(rl[i]);
                     bool scanner = CPlayerData.m_IsScannerRestockUnlocked;
-                    Broadcast(MsgType.LicenseState, bw =>
+                    // licenses change a few times per session: broadcast on change, plus
+                    // a slow heal so a client that missed one still converges
+                    int lh = 17;
+                    foreach (var rd in unlocked)
+                        lh = lh * 31 + (((int)rd.itemType << 1) | (rd.isBigBox ? 1 : 0));
+                    lh = lh * 31 + (scanner ? 1 : 0);
+                    _licenseHeal += 10f;
+                    if (lh != _lastLicenseHash || _licenseHeal >= 60f)
                     {
-                        bw.Write(scanner);
-                        bw.Write((ushort)unlocked.Count);
-                        foreach (var rd in unlocked)
+                        _lastLicenseHash = lh;
+                        _licenseHeal = 0f;
+                        Broadcast(MsgType.LicenseState, bw =>
                         {
-                            bw.Write((int)rd.itemType);
-                            bw.Write(rd.isBigBox);
-                        }
-                    });
+                            bw.Write(scanner);
+                            bw.Write((ushort)unlocked.Count);
+                            foreach (var rd in unlocked)
+                            {
+                                bw.Write((int)rd.itemType);
+                                bw.Write(rd.isBigBox);
+                            }
+                        });
+                    }
                 }
                 catch (Exception e) { CoopPlugin.Log.LogWarning("license sync: " + e.Message); }
             }
@@ -1254,7 +1349,7 @@ namespace CardShopCoop
             _dayTimer += dt;
             if (_dayTimer >= 2f)
             {
-                _dayTimer = 0f;
+                _dayTimer -= 2f;
                 int hour = 8, min = 0;
                 try
                 {
@@ -2028,23 +2123,21 @@ namespace CardShopCoop
 
         private void SendWorldTo(int connId)
         {
-            byte[] payload;
-            byte[] bundle;
+            byte[] rawSave;
+            byte[] rawBundle;
             int hostSlot;
             try
             {
+                // game-state reads must stay on the main thread; the gzip below moves to
+                // the worker (compressing a multi-MB save used to freeze the host's frame
+                // at every join)
                 hostSlot = CSingleton<CGameManager>.Instance.m_CurrentSaveLoadSlotSelectedIndex;
-                payload = Msg.Gzip(SaveTransfer.BuildHostPayload());
-                try
-                {
-                    var raw = SidecarTransfer.BuildBundle(hostSlot);
-                    bundle = raw.Length > 0 ? Msg.Gzip(raw) : raw;
-                    CoopPlugin.Log.LogInfo($"transfer: save {payload.Length / 1024} KB, mod data {bundle.Length / 1024} KB (compressed)");
-                }
+                rawSave = SaveTransfer.BuildHostPayload();
+                try { rawBundle = SidecarTransfer.BuildBundle(hostSlot); }
                 catch (Exception e)
                 {
                     CoopPlugin.Log.LogWarning("Sidecar bundle failed (sending base save only): " + e.Message);
-                    bundle = new byte[0];
+                    rawBundle = new byte[0];
                 }
             }
             catch (Exception e)
@@ -2054,22 +2147,26 @@ namespace CardShopCoop
                 return;
             }
 
-            Send(connId, MsgType.Welcome, bw =>
-            {
-                bw.Write(CoopPlugin.Version);
-                bw.Write(CoopPlugin.PlayerName.Value);
-                bw.Write(payload.Length);
-                bw.Write(hostSlot);
-                bw.Write(bundle.Length);
-                bw.Write((byte)connId); // tells the client its own id (to skip in rosters)
-            });
-
             var net = _net;
             new Thread(() =>
             {
                 const int chunk = 128 * 1024;
                 try
                 {
+                    byte[] payload = Msg.Gzip(rawSave);
+                    byte[] bundle = rawBundle.Length > 0 ? Msg.Gzip(rawBundle) : rawBundle;
+                    CoopPlugin.Log.LogInfo($"transfer: save {payload.Length / 1024} KB, mod data {bundle.Length / 1024} KB (compressed)");
+
+                    net.Send(connId, Msg.Build(MsgType.Welcome, bw =>
+                    {
+                        bw.Write(CoopPlugin.Version);
+                        bw.Write(CoopPlugin.PlayerName.Value);
+                        bw.Write(payload.Length);
+                        bw.Write(hostSlot);
+                        bw.Write(bundle.Length);
+                        bw.Write((byte)connId); // tells the client its own id (to skip in rosters)
+                    }));
+
                     for (int off = 0; off < payload.Length; off += chunk)
                     {
                         int len = Math.Min(chunk, payload.Length - off);

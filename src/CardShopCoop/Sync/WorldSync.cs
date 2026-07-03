@@ -27,6 +27,8 @@ namespace CardShopCoop.Sync
         private struct CompState { public int Type; public int Count; }
 
         private readonly Dictionary<int, CompState> _last = new Dictionary<int, CompState>();
+        private readonly Dictionary<WarehouseShelf, List<ShelfCompartment>> _whComps
+            = new Dictionary<WarehouseShelf, List<ShelfCompartment>>();
         private float _timer;
 
         /// <summary>Fired with locally-originated changes (host: broadcast; client: request).</summary>
@@ -55,7 +57,8 @@ namespace CardShopCoop.Sync
         public void Reset()
         {
             _last.Clear();
-            _timer = 0f;
+            _whComps.Clear();
+            _timer = 0.35f; // staggered phase: engines must not all walk on the same frame
             _sm = null;
         }
 
@@ -64,7 +67,7 @@ namespace CardShopCoop.Sync
             if (!inGame) return;
             _timer += dt;
             if (_timer < 0.75f) return;
-            _timer = 0f;
+            _timer -= 0.75f; // keep the phase; reset-to-zero drifts back into alignment
 
             List<Entry> changes = null;
             try
@@ -84,7 +87,10 @@ namespace CardShopCoop.Sync
                 {
                     var wh = sm.m_WarehouseShelfList[i];
                     if (wh == null) continue;
-                    var comps = FiWarehouseComps?.GetValue(wh) as List<ShelfCompartment>;
+                    // the list object never changes identity - cache it per shelf instead
+                    // of a reflection GetValue inside the hottest recurring walk
+                    if (!_whComps.TryGetValue(wh, out var comps) || comps == null)
+                        _whComps[wh] = comps = FiWarehouseComps?.GetValue(wh) as List<ShelfCompartment>;
                     if (comps == null) continue;
                     for (int j = 0; j < comps.Count; j++)
                         Visit(Key(1, i, j), comps[j], ref changes);
@@ -167,6 +173,22 @@ namespace CardShopCoop.Sync
             int curType = (int)comp.GetItemType();
             int cur = comp.GetItemCount();
             if (cur == count && (curType == type || count == 0)) return;
+
+            // same product, fewer items (a customer bought some): remove exactly the
+            // difference - the full teardown/respawn for a 1-item sale was constant
+            // visible churn on the client every 0.75s during open hours
+            if (curType == type && count < cur && count > 0)
+            {
+                for (int k = cur - count; k > 0; k--)
+                {
+                    var item = comp.GetLastItem();
+                    if (item == null) break;
+                    comp.RemoveItem(item);
+                    ItemSpawnManager.DisableItem(item);
+                }
+                if (comp.GetItemCount() == count) return;
+                // count disagrees (corrupted m_ItemAmount): fall through and self-heal
+            }
 
             Clear(comp);
             if (count > 0)

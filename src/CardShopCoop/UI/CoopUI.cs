@@ -33,6 +33,17 @@ namespace CardShopCoop.UI
         private CSteamID _pwPromptLobby = CSteamID.Nil;
         private const int PageSize = 6;
 
+        // OnGUI runs 2+ times per frame; GUIStyle construction and string interpolation
+        // there is steady per-frame garbage, so styles are built once (lazily — GUI.skin
+        // is only valid inside OnGUI) and display strings only when their source changes
+        private GUIStyle _warnStyle, _centerStyle, _bigStyle, _redStyle, _wrapStyle;
+        private KeyCode _hintKeySeen;
+        private string _hintText;
+        private string _errorSeen, _errorText;
+        private string _hostTimeSeen, _hostTimeText;
+        private string _promptSeen, _promptText;
+        private string _registerSeen, _registerText;
+
         /// <summary>Lower = more likely the real home-LAN address.</summary>
         private static int IpRank(string ip)
         {
@@ -50,33 +61,62 @@ namespace CardShopCoop.UI
             // little always-on hint + client link status
             if (!Visible)
             {
-                GUI.Label(new Rect(8f, Screen.height - 22f, 400f, 20f),
-                    $"<size=11><color=#9fd3ff>CardShopCoop: {CoopPlugin.UiToggleKey.Value} for co-op</color></size>");
+                if (_hintText == null || _hintKeySeen != CoopPlugin.UiToggleKey.Value)
+                {
+                    _hintKeySeen = CoopPlugin.UiToggleKey.Value;
+                    _hintText = $"<size=11><color=#9fd3ff>CardShopCoop: {_hintKeySeen} for co-op</color></size>";
+                }
+                GUI.Label(new Rect(8f, Screen.height - 22f, 400f, 20f), _hintText);
                 if (core.ErrorLine.Length > 0)
                 {
-                    var warn = new GUIStyle(GUI.skin.label) { richText = true, fontStyle = FontStyle.Bold };
-                    GUI.Label(new Rect(8f, Screen.height - 46f, 900f, 22f),
-                        $"<size=13><color=#ff5a4a>CO-OP: {core.ErrorLine}</color></size>", warn);
+                    if (_warnStyle == null)
+                        _warnStyle = new GUIStyle(GUI.skin.label) { richText = true, fontStyle = FontStyle.Bold };
+                    if (core.ErrorLine != _errorSeen)
+                    {
+                        _errorSeen = core.ErrorLine;
+                        _errorText = $"<size=13><color=#ff5a4a>CO-OP: {core.ErrorLine}</color></size>";
+                    }
+                    GUI.Label(new Rect(8f, Screen.height - 46f, 900f, 22f), _errorText, _warnStyle);
                 }
             }
             if (CoopCore.Role == CoopRole.Client && core.HostTimeLine.Length > 0)
             {
-                var style = new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, richText = true };
-                GUI.Label(new Rect(Screen.width / 2f - 150f, 4f, 300f, 20f),
-                    $"<color=#ffd54a>{core.HostTimeLine} - co-op</color>", style);
+                if (_centerStyle == null)
+                    _centerStyle = new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, richText = true };
+                if (core.HostTimeLine != _hostTimeSeen)
+                {
+                    _hostTimeSeen = core.HostTimeLine;
+                    _hostTimeText = $"<color=#ffd54a>{core.HostTimeLine} - co-op</color>";
+                }
+                GUI.Label(new Rect(Screen.width / 2f - 150f, 4f, 300f, 20f), _hostTimeText, _centerStyle);
             }
             if (core.RegisterLine.Length > 0 || core.PromptLine.Length > 0)
             {
-                var big = new GUIStyle(GUI.skin.label)
-                {
-                    alignment = TextAnchor.MiddleCenter, richText = true, fontStyle = FontStyle.Bold
-                };
+                if (_bigStyle == null)
+                    _bigStyle = new GUIStyle(GUI.skin.label)
+                    {
+                        alignment = TextAnchor.MiddleCenter, richText = true, fontStyle = FontStyle.Bold
+                    };
                 if (core.PromptLine.Length > 0)
+                {
+                    if (core.PromptLine != _promptSeen)
+                    {
+                        _promptSeen = core.PromptLine;
+                        _promptText = $"<size=17><color=#7ecbff>{core.PromptLine}</color></size>";
+                    }
                     GUI.Label(new Rect(Screen.width / 2f - 300f, Screen.height * 0.58f, 600f, 30f),
-                        $"<size=17><color=#7ecbff>{core.PromptLine}</color></size>", big);
+                        _promptText, _bigStyle);
+                }
                 if (core.RegisterLine.Length > 0)
+                {
+                    if (core.RegisterLine != _registerSeen)
+                    {
+                        _registerSeen = core.RegisterLine;
+                        _registerText = $"<size=18><color=#8ef58a>{core.RegisterLine}</color></size>";
+                    }
                     GUI.Label(new Rect(Screen.width / 2f - 300f, Screen.height * 0.63f, 600f, 30f),
-                        $"<size=18><color=#8ef58a>{core.RegisterLine}</color></size>", big);
+                        _registerText, _bigStyle);
+                }
             }
             if (!Visible) return;
 
@@ -88,9 +128,12 @@ namespace CardShopCoop.UI
             GUILayout.Label(core.StatusLine);
             if (core.ErrorLine.Length > 0)
             {
-                var red = new GUIStyle(GUI.skin.label) { wordWrap = true };
-                red.normal.textColor = new Color(1f, 0.45f, 0.4f);
-                GUILayout.Label(core.ErrorLine, red);
+                if (_redStyle == null)
+                {
+                    _redStyle = new GUIStyle(GUI.skin.label) { wordWrap = true };
+                    _redStyle.normal.textColor = new Color(1f, 0.45f, 0.4f);
+                }
+                GUILayout.Label(core.ErrorLine, _redStyle);
             }
 
             switch (CoopCore.Role)
@@ -208,8 +251,10 @@ namespace CardShopCoop.UI
                 case CoopRole.Client:
                 {
                     GUILayout.Label(PlayersLine(core));
+                    if (_wrapStyle == null)
+                        _wrapStyle = new GUIStyle(GUI.skin.label) { wordWrap = true, richText = true };
                     GUILayout.Label($"<size=11>You're playing in the host's shop. At the register, click the customer's items to scan them, then click to take payment and give change ({CoopPlugin.ServeKey.Value} also works). Your own saves are protected.</size>",
-                        new GUIStyle(GUI.skin.label) { wordWrap = true, richText = true });
+                        _wrapStyle);
                     if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")")) core.SendEmote();
                     if (GUILayout.Button("Leave session")) core.Disconnect();
                     break;

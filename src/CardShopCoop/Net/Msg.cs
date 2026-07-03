@@ -63,21 +63,32 @@ namespace CardShopCoop.Net
     /// [int32 payloadLen+1][byte MsgType][payload]. All little-endian via BinaryWriter.</summary>
     public static class Msg
     {
+        // One builder per thread, reused forever: Build runs ~30x/second in a session
+        // (15Hz states + engine deltas) and a fresh MemoryStream+writer per message was
+        // a steady GC drip that only existed while connected.
+        [ThreadStatic] private static MemoryStream _buildMs;
+        [ThreadStatic] private static BinaryWriter _buildBw;
+
         public static byte[] Build(MsgType type, Action<BinaryWriter> write = null)
         {
-            using (var ms = new MemoryStream())
-            using (var bw = new BinaryWriter(ms))
+            if (_buildMs == null)
             {
-                bw.Write(0);              // frame length placeholder
-                bw.Write((byte)type);
-                write?.Invoke(bw);
-                bw.Flush();
-                long end = ms.Position;
-                ms.Position = 0;
-                bw.Write((int)(end - 4)); // bytes after the length field
-                bw.Flush();
-                return ms.ToArray();
+                _buildMs = new MemoryStream(4096);
+                _buildBw = new BinaryWriter(_buildMs);
             }
+            var ms = _buildMs;
+            var bw = _buildBw;
+            ms.SetLength(0);
+            ms.Position = 0;
+            bw.Write(0);              // frame length placeholder
+            bw.Write((byte)type);
+            write?.Invoke(bw);
+            bw.Flush();
+            long end = ms.Position;
+            ms.Position = 0;
+            bw.Write((int)(end - 4)); // bytes after the length field
+            bw.Flush();
+            return ms.ToArray();      // the one remaining copy: transports own the array
         }
 
         public static BinaryReader Reader(byte[] payload)

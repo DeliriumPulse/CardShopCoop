@@ -53,6 +53,8 @@ namespace CardShopCoop.Sync
 
         private ShelfManager _sm;
         private float _timer;
+        private int _lastHash;
+        private float _heal;
 
         public Action<List<List<Entry>>> OnHostSnapshot;
 
@@ -63,7 +65,9 @@ namespace CardShopCoop.Sync
         public void Reset()
         {
             _sm = null;
-            _timer = 0f;
+            _timer = -1.1f; // staggered phase vs the other snapshot engines
+            _lastHash = 0;
+            _heal = 0f;
         }
 
         private ShelfManager Sm()
@@ -77,11 +81,29 @@ namespace CardShopCoop.Sync
             if (!active) return;
             _timer += dt;
             if (_timer < 3f) return;
-            _timer = 0f;
+            _timer -= 3f;
             try
             {
                 var sm = Sm();
                 if (sm == null) return;
+                // population changes a handful of times per session; hash the cheap
+                // identity (counts + types) and skip the heavy build when unchanged,
+                // with a slow heal so a client that missed one still converges
+                int hash = 17;
+                for (int kind = 0; kind < KindCount; kind++)
+                {
+                    var list = GetList(sm, kind);
+                    int n = list?.Count ?? 0;
+                    hash = hash * 31 + n;
+                    if (list != null)
+                        for (int i = 0; i < n && i < 250; i++)
+                            if (list[i] is InteractableObject obj)
+                                hash = hash * 31 + (int)obj.m_ObjectType;
+                }
+                _heal += 3f;
+                if (hash == _lastHash && _heal < 30f) return;
+                _lastHash = hash;
+                _heal = 0f;
                 var all = new List<List<Entry>>(KindCount);
                 for (int kind = 0; kind < KindCount; kind++)
                 {

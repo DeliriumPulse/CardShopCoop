@@ -14,6 +14,15 @@ namespace CardShopCoop.Sync
     /// </summary>
     public class AvatarManager
     {
+        /// <summary>One received transform state, timestamped with local arrival time so
+        /// Tick can replay motion slightly in the past instead of predicting ahead.</summary>
+        private struct Snapshot
+        {
+            public Vector3 Pos;
+            public float Yaw;
+            public float RecvTime;
+        }
+
         private class RemoteAvatar
         {
             public GameObject Go;
@@ -23,17 +32,24 @@ namespace CardShopCoop.Sync
             public TextMesh NameTag;
             public TextMesh EmoteTag;
             public GameObject HoldProp;
+            public Material HoldPropMat;  // instanced by the tint at spawn; Destroy(Go) alone leaks it
             public string Name = "Player";
             public Vector3 TargetPos;
-            public Vector3 Velocity;      // measured between packets, for dead reckoning
+            public Vector3 Velocity;      // measured between packets, only used when the buffer runs dry
             public float LastStateTime;   // Time.time when TargetPos arrived
             public float TargetYaw;
             public float NetSpeed;
             public byte HoldState;
             public List<int> HoldTypes;         // actual EItemTypes being carried
             public List<CardData> HoldCards;    // actual cards fanned in hand
+            public readonly Snapshot[] Snaps = new Snapshot[SnapBufferSize];
+            public int SnapHead = -1;           // index of newest snapshot
+            public int SnapCount;
             public string HeldSig = "";          // what the spawned item props currently show
             public string CardSig = "";          // what the spawned card visuals currently show
+            public string PendingBoxSig = "";    // built at packet rate in UpdateState; Tick only compares
+            public string PendingCardSig = "";
+            public string PendingItemSig = "";
             public readonly List<Item> HeldItems = new List<Item>();
             public readonly List<InteractableCard3d> HeldCards3d = new List<InteractableCard3d>();
             public GameObject BinderProp;
@@ -45,7 +61,18 @@ namespace CardShopCoop.Sync
             public float EmoteTimer;
             public bool EverPositioned;
             public bool HasState;
+            public bool HoldingBoxPose;    // last value pushed to the animator, to skip redundant SetBool
+            public bool HoldingBoxPoseSet;
         }
+
+        private const int SnapBufferSize = 4;
+        private const float InterpDelay = 2f / 15f;    // two send intervals at the 15 Hz default
+        private const float MaxExtrapolation = 0.25f;  // never dead-reckon further than this past the newest snapshot
+        private static readonly int MoveSpeedHash = Animator.StringToHash("MoveSpeed");
+        private static readonly int IsHoldingBoxHash = Animator.StringToHash("IsHoldingBox");
+        /// <summary>Scene-wide lookup is milliseconds in a full shop; cache it and let the
+        /// Unity fake-null re-resolve after scene loads.</summary>
+        private static RestockManager _restock;
 
         private readonly Dictionary<int, RemoteAvatar> _avatars = new Dictionary<int, RemoteAvatar>();
         private bool _loggedAnimParams;
@@ -91,6 +118,31 @@ namespace CardShopCoop.Sync
             av.HoldTypes = holdTypes;
             av.HoldCards = holdCards;
             av.HasState = true;
+
+            av.SnapHead = (av.SnapHead + 1) % SnapBufferSize;
+            av.Snaps[av.SnapHead] = new Snapshot { Pos = pos, Yaw = yaw, RecvTime = now };
+            if (av.SnapCount < SnapBufferSize) av.SnapCount++;
+
+            // Hold signatures are built here, at packet rate (<=15 Hz): strings are fine at
+            // this cadence, and Tick then only compares cached strings so rendering never
+            // allocates while something is carried (steady per-frame garbage was a GC-stutter
+            // source on the joiner).
+            av.PendingBoxSig = holdState == 1
+                ? (holdTypes != null && holdTypes.Count >= 2
+                    ? holdTypes[0] + ":" + holdTypes[1] : "0:0")
+                : "";
+            if (holdState == 3 && holdCards != null && holdCards.Count > 0)
+            {
+                var sb = new StringBuilder();
+                foreach (var c in holdCards)
+                    sb.Append((int)c.monsterType).Append('/').Append((int)c.expansionType)
+                      .Append('/').Append(c.isFoil ? 1 : 0).Append(';');
+                av.PendingCardSig = sb.ToString();
+            }
+            else av.PendingCardSig = "";
+            av.PendingItemSig = holdState == 2 && holdTypes != null && holdTypes.Count > 0
+                ? string.Join(",", holdTypes) : "";
+
             if (!av.EverPositioned && av.Go != null)
             {
                 av.Go.transform.position = pos;
@@ -117,7 +169,7 @@ namespace CardShopCoop.Sync
             if (_avatars.TryGetValue(connId, out var av))
             {
                 ReleaseHeld(av); // pooled items must go back before their parent dies
-                if (av.Go != null) Object.Destroy(av.Go);
+                DestroyBody(av);
                 _avatars.Remove(connId);
             }
         }
@@ -127,12 +179,23 @@ namespace CardShopCoop.Sync
             foreach (var av in _avatars.Values)
             {
                 ReleaseHeld(av);
-                if (av.Go != null) Object.Destroy(av.Go);
+                DestroyBody(av);
             }
             _avatars.Clear();
         }
 
-        private static void ReleaseHeld(RemoteAvatar av)
+        /// <summary>Materials are assets, not scene objects: the instanced cube tint from
+        /// TrySpawn must be destroyed explicitly or it leaks past Destroy(Go).</summary>
+        private static void DestroyBody(RemoteAvatar av)
+        {
+            if (av.HoldPropMat != null) { Object.Destroy(av.HoldPropMat); av.HoldPropMat = null; }
+            if (av.Go != null) Object.Destroy(av.Go);
+        }
+
+        /// <summary>Releases ONLY the loose-item pile. The items signature changes every time
+        /// the remote player adds one to the stack - tearing down pack/binder/box visuals on
+        /// that path forced needless re-instantiation mid-carry.</summary>
+        private static void ReleaseItems(RemoteAvatar av)
         {
             foreach (var item in av.HeldItems)
                 if (item != null)
@@ -141,6 +204,11 @@ namespace CardShopCoop.Sync
                 }
             av.HeldItems.Clear();
             av.HeldSig = "";
+        }
+
+        private static void ReleaseHeld(RemoteAvatar av)
+        {
+            ReleaseItems(av);
             ReleaseCards(av);
             if (av.PackProp != null)
             {
@@ -168,7 +236,8 @@ namespace CardShopCoop.Sync
         {
             try
             {
-                var rm = Object.FindObjectOfType<RestockManager>();
+                if (_restock == null) _restock = Object.FindObjectOfType<RestockManager>();
+                var rm = _restock;
                 var prefab = isBig ? rm?.m_PackageBoxPrefab : rm?.m_PackageBoxSmallPrefab;
                 if (prefab == null) return;
                 var holder = new GameObject("CoopBoxHolder_tmp");
@@ -263,44 +332,74 @@ namespace CardShopCoop.Sync
                           && CSingleton<CGameManager>.Instance.m_IsGameLevel;
             if (!inGame) return;
 
+            var cam = Camera.main; // one lookup per Tick, not per avatar
+
             foreach (var av in _avatars.Values)
             {
                 if (av.Go == null)
                 {
+                    if (av.HoldPropMat != null)
+                    {
+                        // the body died with a scene load: pooled children went down with it,
+                        // so drop the dead references, free the instanced tint material, and
+                        // blank the sigs so every prop rebuilds on the fresh body
+                        Object.Destroy(av.HoldPropMat);
+                        av.HoldPropMat = null;
+                        av.HoldProp = null;
+                        av.PackProp = null;
+                        av.BinderProp = null;
+                        av.BoxProp = null;
+                        av.BoxProdItem = null;
+                        av.HeldItems.Clear();
+                        av.HeldCards3d.Clear();
+                        av.HeldSig = "";
+                        av.CardSig = "";
+                        av.BoxSig = "";
+                    }
                     if (av.HasState) TrySpawn(av);
                     continue;
                 }
 
                 var t = av.Go.transform;
-                // dead reckoning: chase where the player IS NOW (last packet + predicted
-                // travel), capped at 250ms of extrapolation so overshoots stay tiny
-                float age = Mathf.Min(Time.time - av.LastStateTime, 0.25f);
-                var predicted = av.TargetPos + av.Velocity * age;
-                bool snap = (t.position - predicted).sqrMagnitude > 25f;
-                t.position = snap ? predicted : Vector3.Lerp(t.position, predicted, dt * 14f);
-                var targetRot = Quaternion.Euler(0f, av.TargetYaw, 0f);
-                t.rotation = Quaternion.Slerp(t.rotation, targetRot, dt * 14f);
+                // snapshot interpolation: render two send intervals in the past so there is
+                // almost always a newer snapshot to blend toward - motion glides at any frame
+                // rate instead of stepping at packet cadence or overshooting on stops/turns
+                Vector3 renderPos;
+                float renderYaw;
+                if (av.SnapCount > 0)
+                    SampleSnapshots(av, Time.time - InterpDelay, dt, out renderPos, out renderYaw);
+                else { renderPos = av.TargetPos; renderYaw = av.TargetYaw; }
+                bool snap = (t.position - renderPos).sqrMagnitude > 25f; // 5m = teleport, don't glide
+                float blend = 1f - Mathf.Exp(-14f * dt); // frame-rate independent residual smoothing
+                t.position = snap ? renderPos : Vector3.Lerp(t.position, renderPos, blend);
+                var targetRot = Quaternion.Euler(0f, renderYaw, 0f);
+                t.rotation = snap ? targetRot : Quaternion.Slerp(t.rotation, targetRot, blend);
 
                 if (av.Anim != null)
                 {
                     if (av.HasMoveSpeed)
                     {
-                        float current = av.Anim.GetFloat("MoveSpeed");
-                        av.Anim.SetFloat("MoveSpeed", Mathf.Lerp(current, av.NetSpeed, dt * 8f));
+                        float current = av.Anim.GetFloat(MoveSpeedHash);
+                        av.Anim.SetFloat(MoveSpeedHash,
+                            Mathf.Lerp(current, av.NetSpeed, 1f - Mathf.Exp(-8f * dt)));
                     }
                     if (av.HasHoldingBox)
-                        av.Anim.SetBool("IsHoldingBox", av.HoldState != 0);
+                    {
+                        bool holding = av.HoldState != 0;
+                        if (!av.HoldingBoxPoseSet || av.HoldingBoxPose != holding)
+                        {
+                            av.Anim.SetBool(IsHoldingBoxHash, holding);
+                            av.HoldingBoxPose = holding;
+                            av.HoldingBoxPoseSet = true;
+                        }
+                    }
                 }
                 // carried visuals: the REAL box (with its product on top) when carrying one
                 bool showBox = av.HoldState == 1;
-                string boxSig = showBox
-                    ? (av.HoldTypes != null && av.HoldTypes.Count >= 2
-                        ? av.HoldTypes[0] + ":" + av.HoldTypes[1] : "0:0")
-                    : "";
-                if (boxSig != av.BoxSig)
+                if (av.PendingBoxSig != av.BoxSig)
                 {
                     ReleaseBoxProp(av);
-                    av.BoxSig = boxSig;
+                    av.BoxSig = av.PendingBoxSig;
                     if (showBox)
                     {
                         bool isBig = av.HoldTypes != null && av.HoldTypes.Count >= 1 && av.HoldTypes[0] == 1;
@@ -316,20 +415,11 @@ namespace CardShopCoop.Sync
                     av.HoldProp.transform.localScale = new Vector3(0.34f, 0.27f, 0.34f);
                 }
                 // loose cards fanned in hand (real card faces, modded expansions included)
-                string wantCards = "";
-                if (av.HoldState == 3 && av.HoldCards != null && av.HoldCards.Count > 0)
-                {
-                    var sb = new StringBuilder();
-                    foreach (var c in av.HoldCards)
-                        sb.Append((int)c.monsterType).Append('/').Append((int)c.expansionType)
-                          .Append('/').Append(c.isFoil ? 1 : 0).Append(';');
-                    wantCards = sb.ToString();
-                }
-                if (wantCards != av.CardSig)
+                if (av.PendingCardSig != av.CardSig)
                 {
                     ReleaseCards(av);
-                    av.CardSig = wantCards;
-                    if (wantCards.Length > 0)
+                    av.CardSig = av.PendingCardSig;
+                    if (av.CardSig.Length > 0 && av.HoldCards != null)
                     {
                         for (int i = 0; i < av.HoldCards.Count; i++)
                         {
@@ -372,13 +462,11 @@ namespace CardShopCoop.Sync
                 if (av.BinderProp != null && av.BinderProp.activeSelf != wantBinder)
                     av.BinderProp.SetActive(wantBinder);
 
-                string wantSig = av.HoldState == 2 && av.HoldTypes != null && av.HoldTypes.Count > 0
-                    ? string.Join(",", av.HoldTypes) : "";
-                if (wantSig != av.HeldSig)
+                if (av.PendingItemSig != av.HeldSig)
                 {
-                    ReleaseHeld(av);
-                    av.HeldSig = wantSig;
-                    if (wantSig.Length > 0)
+                    ReleaseItems(av); // items only: growing the pile must not kill pack/binder/box visuals
+                    av.HeldSig = av.PendingItemSig;
+                    if (av.HeldSig.Length > 0 && av.HoldTypes != null)
                     {
                         for (int i = 0; i < av.HoldTypes.Count; i++)
                         {
@@ -403,7 +491,6 @@ namespace CardShopCoop.Sync
                     }
                 }
 
-                var cam = Camera.main;
                 if (cam != null)
                 {
                     if (av.NameTag != null)
@@ -420,6 +507,41 @@ namespace CardShopCoop.Sync
                     if (av.EmoteTimer <= 0f && av.EmoteTag != null) av.EmoteTag.text = "";
                 }
             }
+        }
+
+        /// <summary>Sample the snapshot buffer at renderTime (playback delayed by InterpDelay).
+        /// Extrapolates only when the buffer runs dry, capped at MaxExtrapolation with the
+        /// velocity easing to zero (exp(-3*dt)) so a stopped or turning player never overshoots
+        /// and rubber-bands back when the next packet lands.</summary>
+        private static void SampleSnapshots(RemoteAvatar av, float renderTime, float dt,
+            out Vector3 pos, out float yaw)
+        {
+            var newest = av.Snaps[av.SnapHead];
+            if (renderTime >= newest.RecvTime)
+            {
+                av.Velocity *= Mathf.Exp(-3f * dt);
+                float age = Mathf.Min(renderTime - newest.RecvTime, MaxExtrapolation);
+                pos = newest.Pos + av.Velocity * age;
+                yaw = newest.Yaw;
+                return;
+            }
+            int oldest = (av.SnapHead - av.SnapCount + 1 + SnapBufferSize) % SnapBufferSize;
+            var prev = av.Snaps[oldest];
+            for (int i = 1; i < av.SnapCount; i++)
+            {
+                var next = av.Snaps[(oldest + i) % SnapBufferSize];
+                if (renderTime <= next.RecvTime)
+                {
+                    float span = next.RecvTime - prev.RecvTime;
+                    float u = span > 0.0001f ? (renderTime - prev.RecvTime) / span : 1f;
+                    pos = Vector3.Lerp(prev.Pos, next.Pos, u);         // clamps u below 0 (renderTime older than buffer)
+                    yaw = Mathf.LerpAngle(prev.Yaw, next.Yaw, u);      // wraps correctly through 360
+                    return;
+                }
+                prev = next;
+            }
+            pos = prev.Pos; // single-snapshot buffer, not yet time to show it: hold the pose
+            yaw = prev.Yaw;
         }
 
         private void TrySpawn(RemoteAvatar av)
@@ -505,6 +627,7 @@ namespace CardShopCoop.Sync
             av.Go = clone;
             av.Anim = clone.GetComponentInChildren<Animator>(true);
             av.EverPositioned = true;
+            av.HoldingBoxPoseSet = false; // fresh Animator: the pose must be pushed once
 
             if (av.Anim != null)
             {
@@ -530,7 +653,12 @@ namespace CardShopCoop.Sync
             prop.transform.localPosition = new Vector3(0f, 1.05f, 0.45f);
             prop.transform.localRotation = Quaternion.identity;
             var mr = prop.GetComponent<MeshRenderer>();
-            if (mr != null) mr.material.color = new Color(0.72f, 0.55f, 0.35f); // cardboard
+            if (mr != null)
+            {
+                // .material instances a clone; keep the handle so DestroyBody can free it
+                av.HoldPropMat = mr.material;
+                av.HoldPropMat.color = new Color(0.72f, 0.55f, 0.35f); // cardboard
+            }
             prop.SetActive(false);
             av.HoldProp = prop;
 

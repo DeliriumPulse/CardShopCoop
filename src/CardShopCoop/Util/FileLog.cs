@@ -13,6 +13,7 @@ namespace CardShopCoop.Util
     {
         private static StreamWriter _writer;
         private static readonly object Lock = new object();
+        private static int _lastFlushTick;
 
         public static string Path { get; private set; }
 
@@ -22,8 +23,12 @@ namespace CardShopCoop.Util
             {
                 int pid = Process.GetCurrentProcess().Id;
                 Path = System.IO.Path.Combine(gameRoot, "BepInEx", $"CardShopCoop_{pid}.log");
-                _writer = new StreamWriter(Path, append: false) { AutoFlush = true };
+                // no AutoFlush: an OS flush per line stalls the main thread under disk or
+                // antivirus pressure, so lines are batched and flushed at most once/second
+                _writer = new StreamWriter(Path, append: false);
+                AppDomain.CurrentDomain.ProcessExit += (_, __) => Flush();
                 Write("log started " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                Flush();
             }
             catch
             {
@@ -36,7 +41,26 @@ namespace CardShopCoop.Util
             if (_writer == null) return;
             lock (Lock)
             {
-                try { _writer.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] {line}"); } catch { }
+                try
+                {
+                    _writer.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] {line}");
+                    // unchecked int math survives TickCount wraparound (~25 days)
+                    int now = Environment.TickCount;
+                    if (now - _lastFlushTick > 1000)
+                    {
+                        _writer.Flush();
+                        _lastFlushTick = now;
+                    }
+                }
+                catch { }
+            }
+        }
+
+        private static void Flush()
+        {
+            lock (Lock)
+            {
+                try { _writer?.Flush(); } catch { }
             }
         }
     }

@@ -27,10 +27,21 @@ namespace CardShopCoop.Sync
         private static readonly FieldInfo FiIsChangeReady = AccessTools.Field(typeof(InteractableCashierCounter), "m_IsChangeReady");
         private static readonly FieldInfo FiScannedCount = AccessTools.Field(typeof(Customer), "m_ItemScannedCount");
 
+        // FindObjectOfType walks every loaded object; callers here fire up to 2-4x/s,
+        // so the manager is cached. Unity's destroyed-object == null overload makes the
+        // lazy re-resolve self-healing across scene loads.
+        private static ShelfManager _sm;
+
+        private static ShelfManager Shelf()
+        {
+            if (_sm == null) _sm = Object.FindObjectOfType<ShelfManager>();
+            return _sm;
+        }
+
         /// <summary>Client: nearest cashier counter index within reach, or -1.</summary>
         public static int FindNearestCounter(Vector3 playerPos, float maxDist = 3.5f, bool quiet = false)
         {
-            var sm = Object.FindObjectOfType<ShelfManager>();
+            var sm = Shelf();
             if (sm == null) { if (!quiet) CoopPlugin.Log.LogInfo("serve: no ShelfManager"); return -1; }
             int best = -1;
             float bestSq = maxDist * maxDist;
@@ -53,18 +64,18 @@ namespace CardShopCoop.Sync
         {
             scanEcho = null;
             string result = ServeInner(counterIndex, serverName, ref scanEcho);
-            CoopPlugin.Log.LogInfo($"serve: {serverName} @ counter {counterIndex} -> {result}");
+            CoopPlugin.Log.LogDebug($"serve: {serverName} @ counter {counterIndex} -> {result}");
             return result;
         }
 
         private static string ServeInner(int counterIndex, string serverName, ref byte[] scanEcho)
         {
-            var sm = Object.FindObjectOfType<ShelfManager>();
+            var sm = Shelf();
             if (sm == null || counterIndex < 0 || counterIndex >= sm.m_CashierCounterList.Count)
                 return "no register here";
             var counter = sm.m_CashierCounterList[counterIndex];
             if (counter == null) return "no register here";
-            CoopPlugin.Log.LogInfo($"serve: counter {counterIndex} state={counter.m_CashierCounterState} customer={(counter.m_CurrentCustomer != null ? counter.m_CurrentCustomer.name : "none")} byPlayer={FiMannedByPlayer?.GetValue(counter)} byNPC={FiMannedByNpc?.GetValue(counter)}");
+            CoopPlugin.Log.LogDebug($"serve: counter {counterIndex} state={counter.m_CashierCounterState} customer={(counter.m_CurrentCustomer != null ? counter.m_CurrentCustomer.name : "none")} byPlayer={FiMannedByPlayer?.GetValue(counter)} byNPC={FiMannedByNpc?.GetValue(counter)}");
 
             if (FiMannedByPlayer?.GetValue(counter) is bool byPlayer && byPlayer)
                 return "the host is already at this register";
@@ -148,7 +159,7 @@ namespace CardShopCoop.Sync
                         // card: EvaluateCreditCard completes the transaction in one step
                         double totalCost = FiTotalScanned?.GetValue(counter) is double d ? d : 0.0;
                         MiCreditCard?.Invoke(counter, new object[] { totalCost });
-                        CoopPlugin.Log.LogInfo($"{serverName} completed a card sale at register {counterIndex}");
+                        CoopPlugin.Log.LogDebug($"{serverName} completed a card sale at register {counterIndex}");
                         return "sale complete!";
                     }
                     // cash is two-phase, exactly like the worker automation:
@@ -161,7 +172,7 @@ namespace CardShopCoop.Sync
                         return "change counted - click again to hand it over";
                     }
                     MiSpaceBar?.Invoke(counter, null);
-                    CoopPlugin.Log.LogInfo($"{serverName} completed a cash sale at register {counterIndex}");
+                    CoopPlugin.Log.LogDebug($"{serverName} completed a cash sale at register {counterIndex}");
                     return "sale complete!";
                 }
                 default:
@@ -183,7 +194,7 @@ namespace CardShopCoop.Sync
         /// <summary>Client: zero every counter's running total (sale completed).</summary>
         public static void ClientResetTotals()
         {
-            var sm = Object.FindObjectOfType<ShelfManager>();
+            var sm = Shelf();
             if (sm == null) return;
             for (int i = 0; i < sm.m_CashierCounterList.Count; i++)
                 if (sm.m_CashierCounterList[i] != null)
@@ -205,7 +216,7 @@ namespace CardShopCoop.Sync
         /// <summary>Host: 2 Hz snapshot of every counter that has a current customer.</summary>
         public static byte[] CollectStates()
         {
-            var sm = Object.FindObjectOfType<ShelfManager>();
+            var sm = Shelf();
             if (sm == null) return null;
             using (var ms = new MemoryStream())
             using (var bw = new BinaryWriter(ms))
@@ -294,8 +305,11 @@ namespace CardShopCoop.Sync
     public class RegisterMirror
     {
         private readonly Dictionary<int, RegisterServe.CounterInfo> _states = new Dictionary<int, RegisterServe.CounterInfo>();
+        // _props[idx] is index-aligned with the last-applied type list (null = mesh missing),
+        // so a per-index diff can keep unchanged items in place. _propTypes buffers are
+        // reused across applies to avoid a per-refresh allocation at 2 Hz.
         private readonly Dictionary<int, List<Item>> _props = new Dictionary<int, List<Item>>();
-        private readonly Dictionary<int, string> _propSig = new Dictionary<int, string>();
+        private readonly Dictionary<int, List<int>> _propTypes = new Dictionary<int, List<int>>();
         private readonly Dictionary<Collider, int> _propColliders = new Dictionary<Collider, int>();
         private ShelfManager _sm;
         private float _staleTimer;
@@ -320,7 +334,7 @@ namespace CardShopCoop.Sync
                 foreach (var item in list)
                     if (item != null) ItemSpawnManager.DisableItem(item);
             _props.Clear();
-            _propSig.Clear();
+            _propTypes.Clear();
             _propColliders.Clear();
             _states.Clear();
             _sm = null;
@@ -363,14 +377,49 @@ namespace CardShopCoop.Sync
             }
         }
 
+        private void ReleaseProp(Item item)
+        {
+            if (item == null) return;
+            if (item.m_Collider != null) _propColliders.Remove(item.m_Collider);
+            ItemSpawnManager.DisableItem(item);
+        }
+
         private void ReleaseProps(int idx)
         {
             foreach (var item in _props[idx])
+                ReleaseProp(item);
+        }
+
+        private static bool SameTypes(List<int> a, List<int> b)
+        {
+            if (a.Count != b.Count) return false;
+            for (int i = 0; i < a.Count; i++)
+                if (a[i] != b[i]) return false;
+            return true;
+        }
+
+        /// <summary>Acquire and place one pooled prop, or null when its mesh is missing.</summary>
+        private Item SpawnProp(Transform t, int idx, int type, Vector3 local)
+        {
+            try
             {
-                if (item == null) continue;
-                if (item.m_Collider != null) _propColliders.Remove(item.m_Collider);
-                ItemSpawnManager.DisableItem(item);
+                var meshData = InventoryBase.GetItemMeshData((EItemType)type);
+                if (meshData == null) return null;
+                var item = ItemSpawnManager.GetItem(t);
+                item.SetMesh(meshData.mesh, meshData.material, (EItemType)type,
+                    meshData.meshSecondary, meshData.materialSecondary, meshData.materialList);
+                item.transform.position = t.TransformPoint(local);
+                item.transform.rotation = t.rotation;
+                item.gameObject.SetActive(true);
+                if (item.m_Rigidbody != null) item.m_Rigidbody.isKinematic = true;
+                if (item.m_Collider != null)
+                {
+                    item.m_Collider.enabled = true; // clickable: click a cart item to scan it
+                    _propColliders[item.m_Collider] = idx;
+                }
+                return item;
             }
+            catch { return null; }
         }
 
         private void RefreshProps()
@@ -387,7 +436,7 @@ namespace CardShopCoop.Sync
                 {
                     ReleaseProps(idx);
                     _props.Remove(idx);
-                    _propSig.Remove(idx);
+                    _propTypes.Remove(idx);
                 }
 
             foreach (var kv in _states)
@@ -398,41 +447,50 @@ namespace CardShopCoop.Sync
                 var counter = _sm.m_CashierCounterList[idx];
                 if (counter == null) continue;
 
-                string sig = string.Join(",", ci.ItemTypes);
-                if (_propSig.TryGetValue(idx, out var oldSig) && oldSig == sig) continue;
-                _propSig[idx] = sig;
+                bool hadPrev = _propTypes.TryGetValue(idx, out var prev);
+                if (hadPrev && SameTypes(prev, ci.ItemTypes)) continue;
 
-                if (_props.ContainsKey(idx)) ReleaseProps(idx);
-                var list = new List<Item>();
-                _props[idx] = list;
+                if (!_props.TryGetValue(idx, out var list))
+                    _props[idx] = list = new List<Item>();
 
+                // per-index diff: a scan typically removes one entry, so most items keep
+                // their pooled prop and only get their real counter position refreshed
                 var t = counter.transform;
                 for (int k = 0; k < ci.ItemTypes.Count; k++)
                 {
-                    try
+                    // exactly where the item really sits on the host's counter
+                    var local = k < ci.ItemLocal.Count
+                        ? ci.ItemLocal[k]
+                        : new Vector3(-0.45f + (k % 4) * 0.3f, 1.02f, 0.05f + (k / 4) * 0.3f);
+                    bool keep = hadPrev && k < prev.Count && k < list.Count
+                        && prev[k] == ci.ItemTypes[k] && list[k] != null;
+                    if (keep)
                     {
-                        var meshData = InventoryBase.GetItemMeshData((EItemType)ci.ItemTypes[k]);
-                        if (meshData == null) continue;
-                        var item = ItemSpawnManager.GetItem(t);
-                        item.SetMesh(meshData.mesh, meshData.material, (EItemType)ci.ItemTypes[k],
-                            meshData.meshSecondary, meshData.materialSecondary, meshData.materialList);
-                        // exactly where the item really sits on the host's counter
-                        var local = k < ci.ItemLocal.Count
-                            ? ci.ItemLocal[k]
-                            : new Vector3(-0.45f + (k % 4) * 0.3f, 1.02f, 0.05f + (k / 4) * 0.3f);
-                        item.transform.position = t.TransformPoint(local);
-                        item.transform.rotation = t.rotation;
-                        item.gameObject.SetActive(true);
-                        if (item.m_Rigidbody != null) item.m_Rigidbody.isKinematic = true;
-                        if (item.m_Collider != null)
+                        try
                         {
-                            item.m_Collider.enabled = true; // clickable: click a cart item to scan it
-                            _propColliders[item.m_Collider] = idx;
+                            list[k].transform.position = t.TransformPoint(local);
+                            list[k].transform.rotation = t.rotation;
                         }
-                        list.Add(item);
+                        catch { }
+                        continue;
                     }
-                    catch { }
+                    if (k < list.Count)
+                    {
+                        ReleaseProp(list[k]);
+                        list[k] = SpawnProp(t, idx, ci.ItemTypes[k], local);
+                    }
+                    else
+                        list.Add(SpawnProp(t, idx, ci.ItemTypes[k], local));
                 }
+                for (int k = list.Count - 1; k >= ci.ItemTypes.Count; k--)
+                {
+                    ReleaseProp(list[k]);
+                    list.RemoveAt(k);
+                }
+
+                if (!hadPrev) _propTypes[idx] = prev = new List<int>(ci.ItemTypes.Count);
+                prev.Clear();
+                prev.AddRange(ci.ItemTypes);
             }
         }
     }

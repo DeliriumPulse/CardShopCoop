@@ -45,6 +45,9 @@ namespace CardShopCoop.Sync
         private readonly Dictionary<int, double> _recentlyReleased = new Dictionary<int, double>(); // client: ignore stale carried echoes
         private readonly Dictionary<int, double> _locallyTouched = new Dictionary<int, double>();   // client: my recent edits beat stale echoes
         private float _timer;
+        private int _lastHostHash;
+        private float _hostHeal;
+        private readonly List<Entry> _reportBuf = new List<Entry>();
         private RestockManager _rm;
 
         public Action<List<Entry>> OnHostSnapshot;   // host: broadcast
@@ -66,7 +69,9 @@ namespace CardShopCoop.Sync
             _remoteCarried.Clear();
             _recentlyReleased.Clear();
             _locallyTouched.Clear();
-            _timer = 0f;
+            _timer = -0.6f; // staggered phase vs the other snapshot engines
+            _lastHostHash = 0;
+            _hostHeal = 0f;
             _rm = null;
         }
 
@@ -108,7 +113,7 @@ namespace CardShopCoop.Sync
             if (!active || Rm() == null) return;
             _timer += dt;
             if (_timer < 1.5f) return;
-            _timer = 0f;
+            _timer -= 1.5f;
             try
             {
                 var boxes = LiveBoxes();
@@ -120,6 +125,22 @@ namespace CardShopCoop.Sync
                     if (_remoteCarried.Contains(i)) e.Carried = true; // a client holds it
                     list.Add(e);
                 }
+                // skip identical snapshots (boxes sit still most of the time); a slow
+                // heal broadcast still repairs any client that missed one
+                int hash = 17;
+                for (int i = 0; i < list.Count; i++)
+                {
+                    var e = list[i];
+                    hash = hash * 31 + e.Type;
+                    hash = hash * 31 + e.Count;
+                    hash = hash * 31 + ((e.IsBig ? 1 : 0) | (e.IsOpen ? 2 : 0) | (e.Carried ? 4 : 0));
+                    hash = hash * 31 + (int)(e.Pos.x * 8f);
+                    hash = hash * 31 + (int)(e.Pos.z * 8f);
+                }
+                _hostHeal += 1.5f;
+                if (hash == _lastHostHash && _hostHeal < 10f) return;
+                _lastHostHash = hash;
+                _hostHeal = 0f;
                 OnHostSnapshot?.Invoke(list);
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync host: " + e.Message); }
@@ -248,12 +269,13 @@ namespace CardShopCoop.Sync
             if (!active || Rm() == null || _lastApplied.Count == 0) return;
             _timer += dt;
             if (_timer < 1.5f) return;
-            _timer = 0f;
+            _timer -= 1.5f;
             try
             {
                 var boxes = LiveBoxes();
                 bool changed = false;
-                var list = new List<Entry>(_lastApplied.Count);
+                _reportBuf.Clear(); // serialized synchronously by the callback; safe to reuse
+                var list = _reportBuf;
                 for (int i = 0; i < _lastApplied.Count; i++)
                 {
                     if (i < boxes.Count && boxes[i] != null)

@@ -70,7 +70,7 @@ namespace CardShopCoop.Sync
         {
             _last.Clear();
             _locallyChanged.Clear();
-            _timer = 0f;
+            _timer = 0.1f; // staggered phase vs the other snapshot engines
             _sm = null;
         }
 
@@ -93,7 +93,7 @@ namespace CardShopCoop.Sync
             if (!active) return;
             _timer += dt;
             if (_timer < 0.9f) return;
-            _timer = 0f;
+            _timer -= 0.9f;
 
             List<Entry> changes = null;
             try
@@ -177,6 +177,14 @@ namespace CardShopCoop.Sync
                         continue;
                     var comp = Resolve(sm, e.Key);
                     if (comp == null) continue;
+                    // a culled slot (card present, pooled UI detached) matching what we
+                    // last knew is almost certainly correct - rebuilding it every heal
+                    // broadcast was a mass destroy/respawn spike whenever the player
+                    // stood far from a card wall
+                    if (e.Occupied && comp.m_StoredCardList.Count > 0
+                        && _last.TryGetValue(e.Key, out var known) && known.Matches(e.Card)
+                        && !TryReadSlot(comp, out _))
+                        continue;
                     ApplySlot(comp, e);
                     _last[e.Key] = SlotState.From(e.Occupied ? e.Card : null);
                 }

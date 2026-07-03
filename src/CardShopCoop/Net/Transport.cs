@@ -10,8 +10,11 @@ namespace CardShopCoop.Net
 {
     /// <summary>
     /// Minimal TCP transport. Host accepts any number of clients (dad + son = 2 players,
-    /// but nothing hardcodes that). All socket work happens on background threads;
-    /// received messages land in a ConcurrentQueue that the Unity main thread drains.
+    /// but nothing hardcodes that). All socket work happens on background threads:
+    /// received messages land in a ConcurrentQueue that the Unity main thread drains,
+    /// and Send() only enqueues - a dedicated writer thread per connection does the
+    /// actual Stream.Write, so a stalled peer can never block the caller (Unity's
+    /// main thread sends 25-30 frames/s while connected).
     /// </summary>
     public class Transport : ICoopTransport
     {
@@ -49,7 +52,11 @@ namespace CardShopCoop.Net
             public TcpClient Tcp;
             public NetworkStream Stream;
             public Thread ReadThread;
-            public readonly object WriteLock = new object();
+            public Thread WriteThread;
+            // Single writer thread drains this, so frames stay atomic on the wire
+            // without a write lock; keepalives are just another queued frame.
+            public readonly ConcurrentQueue<byte[]> SendQueue = new ConcurrentQueue<byte[]>();
+            public readonly AutoResetEvent SendSignal = new AutoResetEvent(false);
             public volatile bool Alive = true;
             public long LastRecvTicksUtc = DateTime.UtcNow.Ticks;
         }
@@ -74,7 +81,7 @@ namespace CardShopCoop.Net
                 TcpClient tcp;
                 try { tcp = _listener.AcceptTcpClient(); }
                 catch { break; } // listener stopped
-                tcp.NoDelay = true;
+                ConfigureSocket(tcp);
                 var conn = new Conn { Tcp = tcp, Stream = tcp.GetStream() };
                 lock (_connsLock)
                 {
@@ -83,6 +90,8 @@ namespace CardShopCoop.Net
                 }
                 conn.ReadThread = new Thread(() => ReadLoop(conn)) { IsBackground = true, Name = "CoopRead" + conn.Id };
                 conn.ReadThread.Start();
+                conn.WriteThread = new Thread(() => WriteLoop(conn)) { IsBackground = true, Name = "CoopWrite" + conn.Id };
+                conn.WriteThread.Start();
                 StartKeepalive(conn);
                 Connects.Enqueue(conn.Id);
             }
@@ -103,16 +112,28 @@ namespace CardShopCoop.Net
                 throw new TimeoutException($"No answer from {ip}:{port} after {timeoutMs / 1000}s");
             }
             tcp.EndConnect(ar);
-            tcp.NoDelay = true;
+            ConfigureSocket(tcp);
             var conn = new Conn { Id = 1, Tcp = tcp, Stream = tcp.GetStream() };
             lock (_connsLock) { _conns[1] = conn; }
             conn.ReadThread = new Thread(() => ReadLoop(conn)) { IsBackground = true, Name = "CoopRead1" };
             conn.ReadThread.Start();
+            conn.WriteThread = new Thread(() => WriteLoop(conn)) { IsBackground = true, Name = "CoopWrite1" };
+            conn.WriteThread.Start();
             StartKeepalive(conn);
             return conn.Id;
         }
 
         // ---------------- shared ----------------
+
+        /// <summary>Belt-and-suspenders against a wedged peer: the writer thread absorbs
+        /// short stalls, the 5s send timeout turns a long one into a disconnect instead
+        /// of an ever-growing queue, and the large send buffer rides out scene loads.</summary>
+        private static void ConfigureSocket(TcpClient tcp)
+        {
+            tcp.NoDelay = true;
+            tcp.SendTimeout = 5000;
+            tcp.SendBufferSize = 256 * 1024;
+        }
 
         private void StartKeepalive(Conn conn)
         {
@@ -123,18 +144,39 @@ namespace CardShopCoop.Net
                     Thread.Sleep(2000);
                     var frame = KeepaliveFrame;
                     if (frame == null || !conn.Alive) continue;
-                    try
-                    {
-                        lock (conn.WriteLock) { conn.Stream.Write(frame, 0, frame.Length); }
-                    }
-                    catch { DropConn(conn.Id); break; }
+                    conn.SendQueue.Enqueue(frame);
+                    conn.SendSignal.Set();
                 }
             }) { IsBackground = true, Name = "CoopKeepalive" + conn.Id }.Start();
+        }
+
+        /// <summary>Drains the connection's send queue; the only thread that writes to
+        /// the stream. Wakes on SendSignal, with a timeout so it notices dead connections.</summary>
+        private void WriteLoop(Conn conn)
+        {
+            try
+            {
+                while (_running && conn.Alive)
+                {
+                    if (!conn.SendQueue.TryDequeue(out var frame))
+                    {
+                        conn.SendSignal.WaitOne(500);
+                        continue;
+                    }
+                    conn.Stream.Write(frame, 0, frame.Length);
+                }
+            }
+            catch
+            {
+                // fallthrough to disconnect
+            }
+            DropConn(conn.Id);
         }
 
         private void ReadLoop(Conn conn)
         {
             var lenBuf = new byte[4];
+            var typeBuf = new byte[1];
             try
             {
                 while (_running && conn.Alive)
@@ -143,12 +185,12 @@ namespace CardShopCoop.Net
                     int frameLen = BitConverter.ToInt32(lenBuf, 0);
                     if (frameLen < 1 || frameLen > MaxFrame)
                         throw new IOException("Bad frame length " + frameLen);
-                    var frame = new byte[frameLen];
-                    ReadExact(conn.Stream, frame, frameLen);
-                    conn.LastRecvTicksUtc = DateTime.UtcNow.Ticks;
+                    // MsgType byte and payload read separately: one allocation, no copy
+                    ReadExact(conn.Stream, typeBuf, 1);
                     var payload = new byte[frameLen - 1];
-                    Buffer.BlockCopy(frame, 1, payload, 0, frameLen - 1);
-                    Incoming.Enqueue(new InMsg { ConnId = conn.Id, Type = (MsgType)frame[0], Payload = payload });
+                    ReadExact(conn.Stream, payload, frameLen - 1);
+                    conn.LastRecvTicksUtc = DateTime.UtcNow.Ticks;
+                    Incoming.Enqueue(new InMsg { ConnId = conn.Id, Type = (MsgType)typeBuf[0], Payload = payload });
                 }
             }
             catch
@@ -169,19 +211,15 @@ namespace CardShopCoop.Net
             }
         }
 
+        /// <summary>Never blocks the caller: enqueues for the connection's writer thread.
+        /// A write failure surfaces there as a disconnect, not here.</summary>
         public void Send(int connId, byte[] frame)
         {
             Conn conn;
             lock (_connsLock) { if (!_conns.TryGetValue(connId, out conn)) return; }
             if (!conn.Alive) return;
-            try
-            {
-                lock (conn.WriteLock) { conn.Stream.Write(frame, 0, frame.Length); }
-            }
-            catch
-            {
-                DropConn(connId);
-            }
+            conn.SendQueue.Enqueue(frame);
+            conn.SendSignal.Set();
         }
 
         public void Broadcast(byte[] frame)
@@ -224,6 +262,7 @@ namespace CardShopCoop.Net
             }
             if (!conn.Alive) return;
             conn.Alive = false;
+            try { conn.SendSignal.Set(); } catch { } // wake the writer so it can exit
             try { conn.Stream?.Close(); } catch { }
             try { conn.Tcp?.Close(); } catch { }
             Disconnects.Enqueue(connId);

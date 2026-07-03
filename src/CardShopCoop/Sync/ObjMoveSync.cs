@@ -30,7 +30,10 @@ namespace CardShopCoop.Sync
 
             public bool Same(Vector3 p, Quaternion r)
             {
-                return Valid && (P - p).sqrMagnitude < 0.0004f && Quaternion.Angle(R, r) < 0.5f;
+                // dot-product threshold ~= angle < 0.5deg, without Quaternion.Angle's
+                // acos - this runs for every placed object every tick
+                return Valid && (P - p).sqrMagnitude < 0.0004f
+                    && Mathf.Abs(Quaternion.Dot(R, r)) > 0.99999f;
             }
         }
 
@@ -46,7 +49,7 @@ namespace CardShopCoop.Sync
             _sent.Clear();
             _candidate.Clear();
             _sm = null;
-            _timer = 0f;
+            _timer = -0.25f; // staggered phase vs the other snapshot engines
         }
 
         private ShelfManager Sm()
@@ -60,7 +63,7 @@ namespace CardShopCoop.Sync
             if (!active) return;
             _timer += dt;
             if (_timer < 1.0f) return;
-            _timer = 0f;
+            _timer -= 1.0f;
 
             List<Entry> changes = null;
             try
