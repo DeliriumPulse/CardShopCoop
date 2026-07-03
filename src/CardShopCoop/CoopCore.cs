@@ -1858,17 +1858,25 @@ namespace CardShopCoop
                         try
                         {
                             _incomingPriced.Clear();
+                            int grown = 0;
                             for (int k = 0; k < n; k++)
                             {
                                 int i = br.ReadInt32();
                                 float v = br.ReadSingle();
                                 _incomingPriced.Add(i);
-                                if (i >= 0 && i < prices.Count && Math.Abs(prices[i] - v) > 0.0001f)
+                                if (i < 0 || i > 500000) continue;
+                                // the table only grows on the machine that PRICES a modded
+                                // item - grow ours the same way the game pads it (Add(0f))
+                                // or the bounds check silently eats every modded price
+                                while (prices.Count <= i) { prices.Add(0f); grown++; }
+                                if (Math.Abs(prices[i] - v) > 0.0001f)
                                 {
                                     prices[i] = v;
                                     CEventManager.QueueEvent(new CEventPlayer_ItemPriceChanged((EItemType)i, v));
                                 }
                             }
+                            if (grown > 0)
+                                CoopPlugin.Log.LogInfo($"price apply: grew the price table by {grown} entries for modded items");
                             // a price the host CLEARED is absent from the sparse set
                             foreach (int i in _clientPriced)
                                 if (!_incomingPriced.Contains(i) && i >= 0 && i < prices.Count && prices[i] != 0f)
@@ -2489,8 +2497,11 @@ namespace CardShopCoop
                         int itemType = br.ReadInt32();
                         float price = br.ReadSingle();
                         var prices = CPlayerData.m_SetItemPriceList;
-                        if (itemType >= 0 && itemType < prices.Count)
+                        if (itemType >= 0 && itemType <= 500000)
                         {
+                            // grow-on-demand: a joiner pricing a modded item the host
+                            // hasn't priced yet must not be silently dropped
+                            while (prices.Count <= itemType) prices.Add(0f);
                             prices[itemType] = price;
                             Patches.GamePatches.ApplyingRemotePrice = true;
                             try { CEventManager.QueueEvent(new CEventPlayer_ItemPriceChanged((EItemType)itemType, price)); }

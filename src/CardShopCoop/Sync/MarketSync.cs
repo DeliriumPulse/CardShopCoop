@@ -134,6 +134,12 @@ namespace CardShopCoop.Sync
                 hash = HashFloats(hash, CPlayerData.m_SetGameEventPriceList);
                 hash = HashFloats(hash, CPlayerData.m_GeneratedGameEventPriceList);
                 hash = HashFloats(hash, CPlayerData.m_GameEventPricePercentChangeList);
+                // generated BASE prices: per-save tables filled the first time a machine
+                // "meets" an item. Content packs installed mid-save get bases only on the
+                // host - without this the joiner sees $0 market prices for them forever
+                hash = HashFloats(hash, CPlayerData.m_GeneratedMarketPriceList);
+                hash = HashFloats(hash, CPlayerData.m_GeneratedCostPriceList);
+                hash = HashFloats(hash, CPlayerData.m_AverageItemCostList);
 
                 _heal += Interval;
                 if (hash == _lastHash && _heal < HealEvery) return;
@@ -159,6 +165,9 @@ namespace CardShopCoop.Sync
             WriteFloats(bw, CPlayerData.m_SetGameEventPriceList);
             WriteFloats(bw, CPlayerData.m_GeneratedGameEventPriceList);
             WriteFloats(bw, CPlayerData.m_GameEventPricePercentChangeList);
+            WriteSparseFloats(bw, CPlayerData.m_GeneratedMarketPriceList);
+            WriteSparseFloats(bw, CPlayerData.m_GeneratedCostPriceList);
+            WriteSparseFloats(bw, CPlayerData.m_AverageItemCostList);
         }
 
         // ---------------- client ----------------
@@ -185,6 +194,9 @@ namespace CardShopCoop.Sync
             ReadFloatsInto(br, CPlayerData.m_SetGameEventPriceList);
             ReadFloatsInto(br, CPlayerData.m_GeneratedGameEventPriceList);
             ReadFloatsInto(br, CPlayerData.m_GameEventPricePercentChangeList);
+            ReadSparseFloatsInto(br, CPlayerData.m_GeneratedMarketPriceList);
+            ReadSparseFloatsInto(br, CPlayerData.m_GeneratedCostPriceList);
+            ReadSparseFloatsInto(br, CPlayerData.m_AverageItemCostList);
 
             // Replay the vanilla once-per-day history append AFTER the day's values are
             // in, so the graph gains the same last point the host's did. The first
@@ -228,6 +240,37 @@ namespace CardShopCoop.Sync
                     }
         }
 
+        // Generated base prices are FULL floats keyed by raw itemType (the ~200k modded
+        // index space), non-zero entries only. Unlike percents, absent entries keep
+        // their local value - the host may legitimately have gaps we filled at join.
+        private static void WriteSparseFloats(BinaryWriter bw, List<float> list)
+        {
+            int nonZero = 0;
+            if (list != null)
+                for (int i = 0; i < list.Count; i++) if (list[i] != 0f) nonZero++;
+            bw.Write(nonZero);
+            if (list != null)
+                for (int i = 0; i < list.Count; i++)
+                    if (list[i] != 0f)
+                    {
+                        bw.Write(i);
+                        bw.Write(list[i]);
+                    }
+        }
+
+        private static void ReadSparseFloatsInto(BinaryReader br, List<float> list)
+        {
+            int n = br.ReadInt32();
+            for (int k = 0; k < n; k++)
+            {
+                int i = br.ReadInt32();
+                float v = br.ReadSingle(); // always consume the wire bytes
+                if (list == null || i < 0 || i > 500000) continue;
+                while (list.Count <= i) list.Add(0f); // grow-on-demand for modded indexes
+                list[i] = v;
+            }
+        }
+
         private static void ReadPercentsInto(BinaryReader br, List<float> list)
         {
             if (list != null)
@@ -237,7 +280,9 @@ namespace CardShopCoop.Sync
             {
                 int i = br.ReadInt32();
                 float v = br.ReadInt16() / 100f; // always consume the wire bytes
-                if (list != null && i >= 0 && i < list.Count) list[i] = v;
+                if (list == null || i < 0 || i > 500000) continue;
+                while (list.Count <= i) list.Add(0f); // grow-on-demand for modded indexes
+                list[i] = v;
             }
         }
 
