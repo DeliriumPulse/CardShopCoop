@@ -83,18 +83,12 @@ namespace CardShopCoop.Sync
                     for (int j = 0; j < comps.Count; j++)
                         Visit(Key(0, i, j), comps[j], ref changes);
                 }
-                for (int i = 0; i < sm.m_WarehouseShelfList.Count; i++)
-                {
-                    var wh = sm.m_WarehouseShelfList[i];
-                    if (wh == null) continue;
-                    // the list object never changes identity - cache it per shelf instead
-                    // of a reflection GetValue inside the hottest recurring walk
-                    if (!_whComps.TryGetValue(wh, out var comps) || comps == null)
-                        _whComps[wh] = comps = FiWarehouseComps?.GetValue(wh) as List<ShelfCompartment>;
-                    if (comps == null) continue;
-                    for (int j = 0; j < comps.Count; j++)
-                        Visit(Key(1, i, j), comps[j], ref changes);
-                }
+                // warehouse racks (kind 1) are deliberately NOT walked: their compartment
+                // "count" is a STORED-BOX tally (AddBox/RemoveBox), not loose items, and
+                // applying it through the item path spawned phantom item meshes into the
+                // rack, stomped the compartment type, and threw the recurring
+                // "apply 1000102: Index was out of range" (CalculatePositionList against
+                // the rack's few physical slots). BoxSync owns racks via Stored entries.
                 // combi card shelves and tournament prize shelves carry ITEM compartments
                 // too (the bottom half) - they live in their own manager lists, so the
                 // walks above never saw them
@@ -182,9 +176,10 @@ namespace CardShopCoop.Sync
                 var comps = sm.m_TournamentPrizeShelfList[shelfIdx]?.GetItemCompartmentList();
                 return comps != null && compIdx < comps.Count ? comps[compIdx] : null;
             }
-            if (shelfIdx >= sm.m_WarehouseShelfList.Count) return null;
-            var whComps = FiWarehouseComps?.GetValue(sm.m_WarehouseShelfList[shelfIdx]) as List<ShelfCompartment>;
-            return whComps != null && compIdx < whComps.Count ? whComps[compIdx] : null;
+            // kind 1 (warehouse racks): never resolved - stored-box tallies are not
+            // item counts (see the walk comment). Old peers may still send them;
+            // returning null makes the apply a harmless no-op.
+            return null;
         }
 
         private static readonly FieldInfo FiStoredItemList =

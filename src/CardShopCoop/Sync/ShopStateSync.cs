@@ -52,6 +52,16 @@ namespace CardShopCoop.Sync
         private RentBillScreen _billScreen;                        // phone screen, often inactive
         private InteractableOpenCloseSign _openSign;               // world object by the door
         private InteractableWarehouseAllowEnterSign _warehouseSign;
+        private UnlockRoomManager _urm;                            // NEVER CSingleton<>.Instance:
+        private ShelfManager _shelfMgr;                            // it fabricates a fake empty
+                                                                   // manager if touched during a
+                                                                   // loading screen (see WorldSync)
+
+        private UnlockRoomManager Urm()
+        {
+            if (_urm == null) _urm = UnityEngine.Object.FindObjectOfType<UnlockRoomManager>();
+            return _urm;
+        }
 
         public ShopStateSync()
         {
@@ -66,6 +76,8 @@ namespace CardShopCoop.Sync
             _billScreen = null;
             _openSign = null;
             _warehouseSign = null;
+            _urm = null;
+            _shelfMgr = null;
         }
 
         public void ForceResend()
@@ -298,7 +310,7 @@ namespace CardShopCoop.Sync
             // screen instance with the right private tab selected, which the host may not
             // have open. Cost/eligibility are recomputed from HOST state so a stale
             // joiner UI can neither underpay nor double-buy.
-            var urm = CSingleton<UnlockRoomManager>.Instance;
+            var urm = Urm();
             if (urm == null) return;
             if (CSingleton<CGameManager>.Instance != null && CSingleton<CGameManager>.Instance.m_IsPrologue) return;
 
@@ -347,7 +359,12 @@ namespace CardShopCoop.Sync
                 SoundManager.PlayAudio("SFX_CustomerBuy", 0.6f);
             }
             // vanilla defers this by a second from the screen; immediate is equivalent
-            try { CSingleton<ShelfManager>.Instance.SaveInteractableObjectData(); } catch { }
+            try
+            {
+                if (_shelfMgr == null) _shelfMgr = UnityEngine.Object.FindObjectOfType<ShelfManager>();
+                if (_shelfMgr != null) _shelfMgr.SaveInteractableObjectData();
+            }
+            catch { }
         }
 
         private void HostToggleSign(byte which)
@@ -410,7 +427,7 @@ namespace CardShopCoop.Sync
 
             // unlocks: the manager methods are pure world changes (blocker off, door
             // anim, count++) - every coin charge lives in the UI handlers we never call
-            var urm = CSingleton<UnlockRoomManager>.Instance;
+            var urm = Urm();
             if (urm != null)
             {
                 bool unlocksChanged = (wantShopB && !CPlayerData.m_IsWarehouseRoomUnlocked)

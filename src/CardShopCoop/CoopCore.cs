@@ -2325,11 +2325,20 @@ namespace CardShopCoop
                             if (cost > 0f && cost < 100000f)
                                 CEventManager.QueueEvent(new CEventPlayer_AddCoin(cost));
                             // vanilla ships ~133 products: a bare catalog means the host's
-                            // content mods haven't registered for this save yet (fresh
-                            // save still in the tutorial), not a missing-pack problem
-                            string reason = hostCatalog <= 140
-                                ? "the host's modded products haven't loaded yet (new save still in the tutorial?) - play past the host's tutorial and rejoin"
-                                : "match your content packs to order it";
+                            // content mods haven't registered products FOR THIS SAVE (they
+                            // register per save, on their own progression triggers), not a
+                            // missing-pack problem. Only blame the tutorial when the save
+                            // is actually young - a Day-17 host got told to "play past the
+                            // tutorial" (field report)
+                            int hostDay = 0;
+                            try { hostDay = CPlayerData.m_CurrentDay; } catch { }
+                            string reason;
+                            if (hostCatalog > 140)
+                                reason = "match your content packs to order it";
+                            else if (hostDay <= 2)
+                                reason = "the host's modded products haven't loaded yet (new save still in the tutorial) - play past the host's tutorial and rejoin";
+                            else
+                                reason = "the mod's products aren't registered in the HOST's save yet - if the host can order it from their own phone shop, have them order it once; guests can order it after that";
                             Send(msg.ConnId, MsgType.Toast, bw => bw.Write(
                                 $"'{rdName}' isn't in the host's catalog - refunded ${cost:F0}. Note: {reason}"));
                         }

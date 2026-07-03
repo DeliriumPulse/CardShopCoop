@@ -181,6 +181,20 @@ namespace CardShopCoop.Sync
             return (a.Pos - b.Pos).sqrMagnitude > 0.01f || Mathf.Abs(Mathf.DeltaAngle(a.Yaw, b.Yaw)) > 3f;
         }
 
+        /// <summary>Data-only count apply via the closed-box path (stored boxes are
+        /// always closed): safe before OR after the box is slotted into a rack.</summary>
+        private static void ApplyClosedCount(InteractablePackagingBox_Item box, int count)
+        {
+            try
+            {
+                var comp = box.m_ItemCompartment;
+                if (comp.GetItemCount() == count) return;
+                comp.PreSpawnItemUpdate(count);
+                FiAmountToSpawn?.SetValue(box, count);
+            }
+            catch { }
+        }
+
         /// <summary>A stored box destroyed without unhooking leaks the compartment's
         /// box count and leaves a dangling slot reference.</summary>
         private static void UnhookIfStored(InteractablePackagingBox_Item box)
@@ -195,11 +209,19 @@ namespace CardShopCoop.Sync
             catch { }
         }
 
+        // NEVER CSingleton<ShelfManager>.Instance here: box snapshots arrive during
+        // the client's LOADING SCREEN, and touching it then creates a fake empty
+        // manager that shadows the real one all session - the 1.0.11 store mirror
+        // silently found zero racks forever (second storage field report)
+        private static ShelfManager _sm;
+        private static double _lastResolveWarn;
+
         private static ShelfCompartment ResolveWarehouseCompartment(int shelfIdx, int compIdx)
         {
             try
             {
-                var sm = CSingleton<ShelfManager>.Instance;
+                if (_sm == null) _sm = UnityEngine.Object.FindObjectOfType<ShelfManager>();
+                var sm = _sm;
                 if (sm == null) return null;
                 var list = sm.m_WarehouseShelfList;
                 for (int i = 0; i < list.Count; i++)
@@ -207,6 +229,14 @@ namespace CardShopCoop.Sync
                     var ws = list[i];
                     if (ws == null || ws.GetIndex() != shelfIdx) continue;
                     return ws.GetWarehouseCompartment(compIdx);
+                }
+                // no silent skips: an unresolvable rack means the store mirror is
+                // stuck retrying - say so (throttled) instead of shrugging
+                double nowT = Time.realtimeSinceStartupAsDouble;
+                if (nowT - _lastResolveWarn > 30.0)
+                {
+                    _lastResolveWarn = nowT;
+                    CoopPlugin.Log.LogWarning($"BoxSync store: no warehouse rack with index {shelfIdx} (have {list.Count}) - retrying on next snapshot");
                 }
             }
             catch { }
@@ -604,6 +634,16 @@ namespace CardShopCoop.Sync
                         list.Add(held);      // flag would keep the host's copy slotted
                         continue;
                     }
+                    // host says STORED: the rack slot is host-authoritative. Report the
+                    // truth VERBATIM - if our local store mirror was rejected (full slot,
+                    // stale type), reporting our not-stored state would command the host
+                    // to yank its legitimately-stored box off the rack (revert war). The
+                    // carried branch above is the one legitimate exit: the player took it
+                    if (truth.Stored)
+                    {
+                        list.Add(truth);
+                        continue;
+                    }
                     // hidden because ANOTHER player carries it: no local truth to
                     // report (its transform is parked at the hide spot, contents
                     // stale) - UNLESS I just set it down myself: that report IS the
@@ -643,27 +683,53 @@ namespace CardShopCoop.Sync
                 try { locallyStored = box.m_IsStored; } catch { }
                 if (want.Stored)
                 {
+                    // contents FIRST: DispenseItem rejects "empty" boxes, and a mirror
+                    // whose count went stale while the box was carried would otherwise
+                    // live-lock the store forever (closed-box path is data-only, safe
+                    // whether stored already or about to be)
+                    ApplyClosedCount(box, want.Count);
                     if (!locallyStored)
                     {
                         if (!box.gameObject.activeSelf) box.gameObject.SetActive(true);
                         var rackComp = ResolveWarehouseCompartment(want.StoreShelf, want.StoreComp);
-                        // vanilla store: closes the box, lerps to the slot, AddBox,
-                        // flags - isPlayer:false silences popups/sounds/tutorial.
-                        // A null/full/wrong-type compartment self-heals: the next
-                        // snapshot retries once WorldSync has aligned the rack
                         if (rackComp != null)
                         {
-                            try { box.DispenseItem(isPlayer: false, rackComp); }
+                            try
+                            {
+                                // the game's OWN restore recipe (ShelfManager.DelayLoad):
+                                // physics off, then DispenseItem. In the player flow
+                                // StartHoldBox already disabled physics; a live loose box
+                                // here still has gravity and would fall off the rack
+                                box.SetPhysicsEnabled(false);
+                                box.DispenseItem(isPlayer: false, rackComp);
+                            }
                             catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync store: " + e.Message); }
+                            // no silent rejections: DispenseItem returns void and eats
+                            // failures - if the store didn't take, say so (throttled)
+                            if (!box.m_IsStored)
+                            {
+                                box.SetPhysicsEnabled(true); // don't leave a loose box frozen
+                                double nowT = Time.realtimeSinceStartupAsDouble;
+                                if (nowT - _lastResolveWarn > 30.0)
+                                {
+                                    _lastResolveWarn = nowT;
+                                    CoopPlugin.Log.LogWarning($"BoxSync store: rack {want.StoreShelf}/{want.StoreComp} rejected box id {want.Id} (slot full or size/type mismatch) - retrying");
+                                }
+                            }
                         }
                     }
-                    return; // slot owns pose and contents while stored
+                    return; // slot owns pose while stored
                 }
                 if (locallyStored)
                 {
-                    // remote took it off the rack: unhook before the normal apply moves it
+                    // remote took it off the rack: replicate the take recipe, not just
+                    // the bookkeeping - a stored box has physics DISABLED, and skipping
+                    // the re-enable left an unclickable kinematic ghost at the drop spot
                     UnhookIfStored(box);
                     try { box.transform.SetParent(null); } catch { }
+                    try { box.SetPhysicsEnabled(true); } catch { }
+                    try { if (box.m_MoveStateValidArea != null) box.m_MoveStateValidArea.gameObject.SetActive(true); } catch { }
+                    try { box.m_ItemCompartment.SetPriceTagVisibility(box.gameObject.activeSelf); } catch { }
                 }
 
                 // someone (remote) is carrying it: their avatar shows the box in hand,
