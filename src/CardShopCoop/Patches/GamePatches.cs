@@ -119,10 +119,13 @@ namespace CardShopCoop.Patches
             }
         }
 
-        public static void SaveGuardPrefix(ref int saveSlotIndex)
+        public static bool SaveGuardPrefix(ref int saveSlotIndex)
         {
-            if (CoopCore.Role == CoopRole.Client)
-                saveSlotIndex = SaveTransfer.CoopSlot;
+            // A joiner is a visitor in the HOST's save: it re-downloads the world at every
+            // join, so client-side saving is pure waste - and each autosave is a full JSON
+            // serialize + GC.Collect stutter. Joiners write nothing; the host's save is
+            // the single source of truth.
+            return CoopCore.Role != CoopRole.Client;
         }
 
         public static bool ClientBlockPrefix()

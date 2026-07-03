@@ -795,6 +795,13 @@ namespace CardShopCoop
                     _npcSweepTimer = 0f;
                     Guarded("npc-sweep", () =>
                     {
+                        // the shop-naming world trigger (and its "!" marker) is host-only
+                        var renamer = FindObjectOfType<ShopRenamer>();
+                        if (renamer != null && renamer.gameObject.activeSelf)
+                        {
+                            renamer.gameObject.SetActive(false);
+                            CoopPlugin.Log.LogInfo("disabled shop-renamer trigger (host names the shop)");
+                        }
                         var cm = FindObjectOfType<CustomerManager>();
                         if (cm != null)
                         {
