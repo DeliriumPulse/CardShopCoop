@@ -37,6 +37,7 @@ namespace CardShopCoop
         private readonly CardShelfSync _cardShelves = new CardShelfSync();
         private readonly ObjMoveSync _objMoves = new ObjMoveSync();
         private readonly BoxSync _boxes = new BoxSync();
+        private readonly PopulationSync _population = new PopulationSync();
         private string _lastShopNameSent;
         private float _shopNameTimer;
         private readonly Sync.RegisterMirror _registerMirror = new Sync.RegisterMirror();
@@ -135,6 +136,8 @@ namespace CardShopCoop
                 else if (Role == CoopRole.Client)
                     Send(1, MsgType.ObjMoveRequest, bw => ObjMoveSync.WriteEntries(bw, changes));
             };
+            _population.OnHostSnapshot = all =>
+                Broadcast(MsgType.PopState, bw => PopulationSync.Write(bw, all));
             _boxes.OnHostSnapshot = list =>
                 Broadcast(MsgType.BoxState, bw => BoxSync.WriteEntries(bw, list));
             _boxes.OnClientChanges = list =>
@@ -365,6 +368,7 @@ namespace CardShopCoop
             _cardShelves.Reset();
             _objMoves.Reset();
             _boxes.Reset();
+            _population.Reset();
             _registerMirror.Reset();
             PromptLine = "";
             _lightManager = null;
@@ -563,6 +567,18 @@ namespace CardShopCoop
             Send(1, MsgType.OrderRequest, bw => { bw.Write(restockIndex); bw.Write(count); });
         }
 
+        /// <summary>Client: the joiner bought furniture - deliver it on the host.</summary>
+        public void ForwardFurniture(int objType, Vector3 pos, Quaternion rot)
+        {
+            if (Role != CoopRole.Client || _net == null) return;
+            Send(1, MsgType.FurnitureOrder, bw =>
+            {
+                bw.Write(objType);
+                bw.Write(pos.x); bw.Write(pos.y); bw.Write(pos.z);
+                bw.Write(rot.x); bw.Write(rot.y); bw.Write(rot.z); bw.Write(rot.w);
+            });
+        }
+
         /// <summary>Client: the joiner set an item price - the host's table is authoritative.</summary>
         public void ForwardItemPrice(EItemType itemType, float price)
         {
@@ -606,6 +622,7 @@ namespace CardShopCoop
             _cardShelves.Reset();
             _objMoves.Reset();
             _boxes.Reset();
+            _population.Reset();
             _registerMirror.Reset();
             PromptLine = "";
             _lastShopNameSent = null;
@@ -778,6 +795,10 @@ namespace CardShopCoop
             {
                 if (Role == CoopRole.Host) _boxes.HostTick(dt, syncActive);
                 else if (Role == CoopRole.Client) _boxes.ClientTick(dt, syncActive);
+            });
+            Guarded("population", () =>
+            {
+                if (Role == CoopRole.Host) _population.HostTick(dt, syncActive);
             });
 
             if (Role == CoopRole.Client)
@@ -1538,6 +1559,27 @@ namespace CardShopCoop
                     if (Role != CoopRole.Client || !InGameLevel()) break;
                     using (var br = Msg.Reader(msg.Payload))
                         _boxes.ClientApply(BoxSync.ReadEntries(br));
+                    break;
+                }
+                case MsgType.PopState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                        _population.ClientApply(PopulationSync.Read(br));
+                    break;
+                }
+                case MsgType.FurnitureOrder:
+                {
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        int objType = br.ReadInt32();
+                        var pos = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
+                        var rot = new Quaternion(br.ReadSingle(), br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
+                        string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : "player";
+                        CoopPlugin.Log.LogInfo($"{who} bought furniture: {(EObjectType)objType}");
+                        ShelfManager.SpawnInteractableObjectInPackageBox((EObjectType)objType, pos, rot);
+                    }
                     break;
                 }
                 case MsgType.BoxRequest:

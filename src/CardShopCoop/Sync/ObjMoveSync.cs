@@ -67,12 +67,8 @@ namespace CardShopCoop.Sync
             {
                 var sm = Sm();
                 if (sm == null) return;
-                Walk(sm.m_ShelfList, 0, ref changes);
-                Walk(sm.m_WarehouseShelfList, 1, ref changes);
-                Walk(sm.m_CardShelfList, 2, ref changes);
-                Walk(sm.m_CardItemCombiShelfList, 3, ref changes);
-                Walk(sm.m_CashierCounterList, 4, ref changes);
-                Walk(sm.m_DecoObjectList, 5, ref changes);
+                for (int kind = 0; kind < PopulationSync.KindCount; kind++)
+                    Walk(PopulationSync.GetList(sm, kind), kind, ref changes);
             }
             catch (Exception e)
             {
@@ -83,11 +79,12 @@ namespace CardShopCoop.Sync
                 OnLocalChanges?.Invoke(changes);
         }
 
-        private void Walk<T>(List<T> list, int kind, ref List<Entry> changes) where T : Component
+        private void Walk(System.Collections.IList list, int kind, ref List<Entry> changes)
         {
+            if (list == null) return;
             for (int i = 0; i < list.Count; i++)
             {
-                var obj = list[i];
+                var obj = list[i] as Component;
                 if (obj == null || !obj.gameObject.activeInHierarchy) continue; // boxed/carried
                 int key = (kind << 24) | (i & 0xFFFF);
                 var p = obj.transform.position;
@@ -139,16 +136,9 @@ namespace CardShopCoop.Sync
         {
             int kind = key >> 24;
             int idx = key & 0xFFFF;
-            switch (kind)
-            {
-                case 0: return idx < sm.m_ShelfList.Count ? sm.m_ShelfList[idx]?.transform : null;
-                case 1: return idx < sm.m_WarehouseShelfList.Count ? sm.m_WarehouseShelfList[idx]?.transform : null;
-                case 2: return idx < sm.m_CardShelfList.Count ? sm.m_CardShelfList[idx]?.transform : null;
-                case 3: return idx < sm.m_CardItemCombiShelfList.Count ? sm.m_CardItemCombiShelfList[idx]?.transform : null;
-                case 4: return idx < sm.m_CashierCounterList.Count ? sm.m_CashierCounterList[idx]?.transform : null;
-                case 5: return idx < sm.m_DecoObjectList.Count ? sm.m_DecoObjectList[idx]?.transform : null;
-                default: return null;
-            }
+            var list = PopulationSync.GetList(sm, kind);
+            if (list == null || idx >= list.Count) return null;
+            return (list[idx] as Component)?.transform;
         }
 
         // ---- wire ----

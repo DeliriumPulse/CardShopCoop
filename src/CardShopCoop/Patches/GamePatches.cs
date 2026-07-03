@@ -56,6 +56,23 @@ namespace CardShopCoop.Patches
             // prompt for one nor let it be changed.
             Try(h, typeof(ShopRenamer), "ShowRenameShopScreen",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(RenamerBlockPrefix)));
+
+            // The joiner's FURNITURE purchases spawn on the host (as the official delivery
+            // box); the placed object mirrors back through the population sync.
+            Try(h, typeof(ShelfManager), "SpawnInteractableObjectInPackageBox",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(FurnitureOrderPrefix)));
+        }
+
+        public static bool FurnitureOrderPrefix(EObjectType objType, UnityEngine.Vector3 spawnPos, UnityEngine.Quaternion spawnRot)
+        {
+            if (CoopCore.Role != CoopRole.Client) return true;
+            CoopCore.Instance?.ForwardFurniture((int)objType, spawnPos, spawnRot);
+            if (CoopCore.Instance != null)
+            {
+                CoopCore.Instance.RegisterLine = "furniture delivered at the host's shop";
+                CoopCore.Instance.RegisterLineTimer = 4f;
+            }
+            return false;
         }
 
         public static bool OrderPrefix(int restockIndex, int count)

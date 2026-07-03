@@ -44,6 +44,8 @@ namespace CardShopCoop.Net
         ShopName = 37,         // host -> client: the shop's name
         ItemPriceContrib = 38, // client -> host: joiner set an item price
         LightState = 39,       // host -> client: full LightTimeData (sky phase, timers)
+        PopState = 40,         // host -> client: placed-object population roster (all kinds)
+        FurnitureOrder = 41,   // client -> host: joiner bought furniture (spawn officially)
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>
