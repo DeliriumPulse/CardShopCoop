@@ -95,6 +95,7 @@ namespace CardShopCoop.Sync
 
         private const byte OpAccept = 1;
         private const byte OpDecline = 2;
+        private const byte OpScreen = 3; // joiner's native screen open-claim (renewed ~2s)
 
         // harmony prefixes are static; CoopCore owns the single instance
         private static TradeServe _live;
@@ -161,6 +162,13 @@ namespace CardShopCoop.Sync
         private int _pendingCounter = -1; // counter our native screen is answering
         private bool _nativeBroken;       // native screen threw once: prompt+keys fallback
         private Transform _playerTf;      // the joiner's MOVING body (ipc.m_WalkerCtrl)
+        private bool _hostBusy;           // host is mid-trade: don't open ours
+        private float _claimTimer;        // renews our open-screen claim to the host
+
+        // host: a joiner's screen is open for this counter (renewed every ~2s;
+        // stale after 5s so a crash/disconnect never wedges the host's trading)
+        private int _guestClaimCounter = -1;
+        private double _guestClaimTime;
 
         public void Reset()
         {
@@ -183,6 +191,10 @@ namespace CardShopCoop.Sync
             _pendingCounter = -1;
             _nativeBroken = false;
             _playerTf = null;
+            _hostBusy = false;
+            _claimTimer = 0f;
+            _guestClaimCounter = -1;
+            _guestClaimTime = 0.0;
         }
 
         public void ForceResend()
@@ -218,8 +230,36 @@ namespace CardShopCoop.Sync
                 prefix: new HarmonyMethod(typeof(TradeServe), nameof(ClientStopInteractPrefix)));
         }
 
-        public static bool ClientTradeBlockPrefix()
+        public static bool ClientTradeBlockPrefix(Customer __instance)
         {
+            // HOST half of the both-players-on-one-customer guard: while a joiner's
+            // native screen is open for this customer's counter (claim renewed ~2s,
+            // stale after 5s), the host's click must not open a second screen
+            if (CoopCore.Role == CoopRole.Host)
+            {
+                var t = _live;
+                if (t != null && t._guestClaimCounter >= 0
+                    && Time.realtimeSinceStartupAsDouble - t._guestClaimTime < 5.0)
+                {
+                    try
+                    {
+                        var sm = t.Sm();
+                        var counter = sm != null && t._guestClaimCounter < sm.m_CashierCounterList.Count
+                            ? sm.m_CashierCounterList[t._guestClaimCounter] : null;
+                        if (counter != null && ReferenceEquals(FiTradeCounter?.GetValue(__instance), counter))
+                        {
+                            if (CoopCore.Instance != null)
+                            {
+                                CoopCore.Instance.RegisterLine = "your partner is answering that customer";
+                                CoopCore.Instance.RegisterLineTimer = 3f;
+                            }
+                            return false;
+                        }
+                    }
+                    catch { }
+                }
+                return true;
+            }
             if (CoopCore.Role != CoopRole.Client) return true;
             if (CoopCore.Instance != null)
             {
@@ -514,6 +554,17 @@ namespace CardShopCoop.Sync
 
         private void WriteState(BinaryWriter bw)
         {
+            // both-players-on-one-customer guard, host half: while the HOST has the
+            // trade screen up (or is mid-trade), joiners must not open theirs
+            bool hostBusy = false;
+            try
+            {
+                var cm = Cm();
+                hostBusy = cm != null && (cm.m_IsPlayerTrading
+                    || (cm.m_CustomerTradeCardScreen != null && cm.m_CustomerTradeCardScreen.IsScreenOpened()));
+            }
+            catch { }
+            bw.Write(hostBusy);
             bw.Write(_resultSeq);
             bw.Write(_result ?? "");
             bw.Write((byte)_hostBuf.Count);
@@ -547,6 +598,14 @@ namespace CardShopCoop.Sync
             byte op = br.ReadByte();
             int idx = br.ReadByte();
             float price = br.ReadSingle();
+            if (op == OpScreen)
+            {
+                // joiner's screen-open claim (renewed ~2s; expiry is time-based so no
+                // close message is ever needed). Not logged - it's a heartbeat.
+                _guestClaimCounter = idx;
+                _guestClaimTime = Time.realtimeSinceStartupAsDouble;
+                return;
+            }
             CoopPlugin.Log.LogInfo($"TradeServe host: received {(op == OpAccept ? "accept" : op == OpDecline ? "decline" : "op " + op)} @ counter {idx}, price {price:F2}");
             try { HostApplyOpInner(op, idx, price); }
             catch (Exception e)
@@ -558,6 +617,7 @@ namespace CardShopCoop.Sync
 
         private void HostApplyOpInner(byte op, int idx, float price)
         {
+            _guestClaimCounter = -1; // an answer means the joiner's screen is closing
             var cm = Cm();
             var sm = Sm();
             if (cm == null || sm == null || idx < 0 || idx >= sm.m_CashierCounterList.Count)
@@ -732,6 +792,7 @@ namespace CardShopCoop.Sync
 
         public void ClientApplyState(BinaryReader br)
         {
+            _hostBusy = br.ReadBoolean();
             byte seq = br.ReadByte();
             string result = br.ReadString();
             int count = br.ReadByte();
@@ -864,6 +925,7 @@ namespace CardShopCoop.Sync
             TutorialManager.SetGameUIVisible(isVisible: false);
             screen.OpenScreen();
             _pendingCounter = idx;
+            _claimTimer = 999f; // claim immediately on the next tick
             CoopPlugin.Log.LogInfo($"TradeServe client: opened native trade screen for counter {idx}");
         }
 
@@ -901,6 +963,17 @@ namespace CardShopCoop.Sync
             // served them, walk-off)
             if (_pendingCounter >= 0)
             {
+                // renew the open-screen claim so the host can't open the SAME
+                // customer's screen ("trades popping up on both screens" report);
+                // renewal-based so any close path (Esc, crash, disconnect) simply
+                // lets it expire host-side
+                _claimTimer += dt;
+                if (_claimTimer >= 2f)
+                {
+                    _claimTimer = 0f;
+                    int pc = _pendingCounter;
+                    SendOp?.Invoke(bw => { bw.Write(OpScreen); bw.Write((byte)pc); bw.Write(0f); });
+                }
                 var cm = Cm();
                 var screen = cm != null ? cm.m_CustomerTradeCardScreen : null;
                 if (screen == null || !screen.IsScreenOpened())
@@ -955,6 +1028,18 @@ namespace CardShopCoop.Sync
             if (decline)
             {
                 SendOpFor(OpDecline, near, 0f, "declining...");
+                return;
+            }
+
+            // both-players-on-one-customer guard, joiner half
+            if (_hostBusy)
+            {
+                _opThrottle = 0.5f;
+                if (CoopCore.Instance != null)
+                {
+                    CoopCore.Instance.RegisterLine = "the host is serving a customer right now";
+                    CoopCore.Instance.RegisterLineTimer = 3f;
+                }
                 return;
             }
 

@@ -48,6 +48,17 @@ namespace CardShopCoop.Sync
             AccessTools.Field(typeof(InteractablePackagingBox_Item), "m_ItemAmountToSpawn");
         private static readonly System.Reflection.FieldInfo FiStoredList =
             AccessTools.Field(typeof(ShelfCompartment), "m_StoredItemList");
+        // protected on InteractableObject; true while ANY holder (player or WORKER)
+        // carries the box - the player-only IsLocallyCarried guard left worker-held
+        // boxes unprotected, so guest reports teleported boxes out of the restocker's
+        // hands and broke its bring-boxes-inside loop (field report)
+        private static readonly System.Reflection.FieldInfo FiBeingHold =
+            AccessTools.Field(typeof(InteractableObject), "m_IsBeingHold");
+
+        private static bool IsBeingHeld(InteractablePackagingBox_Item box)
+        {
+            try { return FiBeingHold?.GetValue(box) is bool b && b; } catch { return false; }
+        }
 
         // client: host truth + id<->box maps (boxes spawned by our apply, or adopted
         // from the save-load population by type/order at first snapshot)
@@ -161,7 +172,10 @@ namespace CardShopCoop.Sync
                 Count = box.m_ItemCompartment.GetItemCount(),
                 IsBig = box.m_IsBigBox,
                 IsOpen = box.IsBoxOpened(),
-                Carried = !stored && IsLocallyCarried(box),
+                // worker-held counts as carried: mirrors hide it while the restocker
+                // walks it (instead of dragging a copy along the floor) and never
+                // position-stomp the original out of its hands
+                Carried = !stored && (IsLocallyCarried(box) || IsBeingHeld(box)),
                 Settled = stored || settled,
                 Stored = stored,
                 StoreShelf = (byte)Mathf.Clamp(sShelf, 0, 255),
@@ -346,7 +360,7 @@ namespace CardShopCoop.Sync
                 if (!_hostById.TryGetValue(e.Id, out var box) || box == null) continue;
                 // type sanity: a mangled or ancient request must not restyle a box
                 if ((int)box.m_ItemCompartment.GetItemType() != e.Type) continue;
-                if (IsLocallyCarried(box)) continue; // never stomp a box in the host's hands
+                if (IsLocallyCarried(box) || IsBeingHeld(box)) continue; // never stomp a box in the host's or a WORKER's hands
                 // just set down: a report the client built while we still carried it is
                 // stale by definition - the race that teleported boxes mid-restock
                 if (_hostRecentlyReleased.TryGetValue(e.Id, out double rel)
@@ -394,7 +408,7 @@ namespace CardShopCoop.Sync
             if (RemovalFlooded(connId, "item-box")) return;
             if (!_hostById.TryGetValue((ushort)id, out var box) || box == null) return;
             if ((int)box.m_ItemCompartment.GetItemType() != type) return;
-            if (IsLocallyCarried(box)) return;
+            if (IsLocallyCarried(box) || IsBeingHeld(box)) return; // player's OR worker's hands
             ApplyingRemote = true;
             try { UnhookIfStored(box); box.OnDestroyed(); } // OnDestroyed alone leaks the rack slot
             catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync removal: " + e.Message); }
