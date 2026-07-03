@@ -67,6 +67,7 @@ namespace CardShopCoop.Net
         TableState = 60,       // host -> client: play-table card layout digest (visuals)
         CardBoxOp = 61,        // client -> host: joiner collects/moves a graded-returns card box
         CardBoxState = 62,     // host -> client: card packaging box population (graded returns)
+        EnumSync = 63,         // host -> client: the host's enum_values.json (card-ID registry)
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>

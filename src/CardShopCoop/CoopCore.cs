@@ -1518,7 +1518,21 @@ namespace CardShopCoop
                         string hostEnum = Util.ModParity.EnumHash();
                         if (enumHash != "none" && hostEnum != "none" && enumHash != hostEnum)
                         {
-                            RejectConn(msg.ConnId, "custom-card registry differs (EPL enum_values.json) - see the mod page's compatibility notes");
+                            // send our registry along with the rejection: the client
+                            // backs theirs up, installs ours, and only has to restart -
+                            // no more hand-copying enum_values.json between PCs
+                            try
+                            {
+                                var enumBytes = System.IO.File.ReadAllBytes(Util.ModParity.EnumFilePath());
+                                var gz = Msg.Gzip(enumBytes);
+                                Send(msg.ConnId, MsgType.EnumSync, bw =>
+                                {
+                                    bw.Write(gz.Length);
+                                    bw.Write(gz);
+                                });
+                            }
+                            catch (Exception e) { CoopPlugin.Log.LogWarning("enum sync send: " + e.Message); }
+                            RejectConn(msg.ConnId, "your custom-card database differed - it has been synced from the host; RESTART your game, then join again");
                             break;
                         }
 
@@ -2117,6 +2131,25 @@ namespace CardShopCoop
                 {
                     if (Role != CoopRole.Client || !InGameLevel()) break;
                     using (var br = Msg.Reader(msg.Payload)) _cardBoxes.ClientApplyState(br);
+                    break;
+                }
+                case MsgType.EnumSync:
+                {
+                    if (Role != CoopRole.Client) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        int len = br.ReadInt32();
+                        var hostBytes = Msg.Gunzip(br.ReadBytes(len));
+                        if (CoopPlugin.AutoSyncCardDatabase.Value)
+                        {
+                            StatusLine = Util.ModParity.InstallEnumFile(hostBytes);
+                            CoopPlugin.Log.LogInfo("enum sync: " + StatusLine);
+                        }
+                        else
+                        {
+                            StatusLine = "card databases differ - auto-sync is disabled; copy the host's enum_values.json (PrefabLoader folder) yourself";
+                        }
+                    }
                     break;
                 }
                 case MsgType.GradingOp:

@@ -11,7 +11,7 @@ namespace CardShopCoop
     {
         public const string Guid = "com.zwhit.cardshopcoop";
         public const string Name = "CardShopCoop";
-        public const string Version = "0.15.1";
+        public const string Version = "0.15.2";
 
         public static ManualLogSource Log;
 
@@ -24,6 +24,7 @@ namespace CardShopCoop
         public static ConfigEntry<KeyCode> EmoteKey;
         public static ConfigEntry<KeyCode> ServeKey;
         public static ConfigEntry<int> ClientWorldSlot;
+        public static ConfigEntry<bool> AutoSyncCardDatabase;
 
         private void Awake()
         {
@@ -53,6 +54,8 @@ namespace CardShopCoop
                 "When JOINING: stand at the register and press this to serve the customer (scan items, take payment, give change).");
             ClientWorldSlot = Config.Bind("Network", "ClientWorldSlot", 7,
                 "Save slot the co-op world uses when JOINING someone (your own slots 0-3 are never touched). On a PC dedicated to co-op you can set 0 for maximum mod-data fidelity.");
+            AutoSyncCardDatabase = Config.Bind("Network", "AutoSyncCardDatabase", true,
+                "When your modded-card ID registry (EPL enum_values.json) differs from the host's, automatically install the host's copy (yours is backed up beside it) so you only need to restart and rejoin. Set false to handle the file yourself.");
 
             var harmony = new Harmony(Guid);
             Patches.GamePatches.ApplyAll(harmony);

@@ -37,11 +37,16 @@ Two ways:
 
 Then, either way:
 
-6. From this kit, copy `enum_values.json` to
-   `C:\Users\<you>\AppData\LocalLow\OPNeonGames\Card Shop Simulator\PrefabLoader\`
-   (replace the one there if it exists — back it up first if you have your own
-   modded solo saves you care about). This aligns the custom-card IDs with the host.
-7. Join the same way. If the mod refuses you, it says exactly what differs.
+6. Just join. If your custom-card database differs from the host's, the mod
+   **syncs it automatically** (your old file is backed up beside it in the
+   `PrefabLoader` folder) and asks you to restart the game — restart, join
+   again, done. If the mod refuses you for any other reason, it says exactly
+   what differs.
+
+> Heads-up if you have your own modded SOLO saves: the sync aligns custom-card
+> IDs with the host's, which can re-shuffle how modded cards display in your own
+> solo world. The backup (`enum_values.json.coopbak-<date>`) restores it —
+> or set `AutoSyncCardDatabase = false` in the mod's config to handle it yourself.
 
 ## Good to know
 
