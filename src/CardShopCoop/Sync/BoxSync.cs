@@ -49,6 +49,15 @@ namespace CardShopCoop.Sync
 
         public Action<List<Entry>> OnHostSnapshot;   // host: broadcast
         public Action<List<Entry>> OnClientChanges;  // client: request
+        public Action<int, int> OnLocalRemoved;      // client: (index, type) I trashed a box
+
+        /// <summary>Wired by CoopCore to the OnDestroyed patch: a box was destroyed by
+        /// LOCAL gameplay (trash bin, storage) - not by sync reconciliation.</summary>
+        public static Action<InteractablePackagingBox_Item> LocalBoxDestroyed;
+
+        /// <summary>True while sync code itself destroys/spawns boxes, so the OnDestroyed
+        /// patch doesn't mistake reconciliation for a player throwing boxes away.</summary>
+        public static bool ApplyingRemote;
 
         public void Reset()
         {
@@ -133,10 +142,55 @@ namespace CardShopCoop.Sync
             }
         }
 
+        /// <summary>Host: a client trashed a box - destroy the real one so the next
+        /// broadcast doesn't resurrect it at its old spot.</summary>
+        public void HostApplyRemoval(int index, int type)
+        {
+            var boxes = LiveBoxes();
+            if (index < 0 || index >= boxes.Count || boxes[index] == null) return;
+            if ((int)boxes[index].m_ItemCompartment.GetItemType() != type) return;
+            if (IsLocallyCarried(boxes[index])) return;
+            ApplyingRemote = true;
+            try { boxes[index].OnDestroyed(); }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync removal: " + e.Message); }
+            finally { ApplyingRemote = false; }
+            _remoteCarried.Clear(); // indices shifted; holds re-assert within a tick
+        }
+
+        /// <summary>Host: the host player destroyed a box locally - the index-keyed
+        /// client-held markers have all shifted.</summary>
+        public void HostNotifyLocalDestroyed()
+        {
+            _remoteCarried.Clear();
+        }
+
+        /// <summary>Client: the local player destroyed a box (trash bin etc.). Tell the
+        /// host to remove the real one and stop tracking it, so no ghost report or stale
+        /// echo brings it back.</summary>
+        public void NotifyLocalDestroyed(InteractablePackagingBox_Item box)
+        {
+            int idx = LiveBoxes().IndexOf(box);
+            if (idx < 0) return;
+            int type = 0;
+            try { type = (int)box.m_ItemCompartment.GetItemType(); } catch { }
+            if (idx < _lastApplied.Count) _lastApplied.RemoveAt(idx);
+            _carriedLastTick.Clear();   // index-keyed trackers all shifted;
+            _locallyTouched.Clear();    // they re-establish within a tick
+            _recentlyReleased.Clear();
+            OnLocalRemoved?.Invoke(idx, type);
+        }
+
         // ---------------- client ----------------
 
         /// <summary>Client: reconcile the live box population to the host's snapshot.</summary>
         public void ClientApply(List<Entry> hostList)
+        {
+            ApplyingRemote = true;
+            try { ClientApplyInner(hostList); }
+            finally { ApplyingRemote = false; }
+        }
+
+        private void ClientApplyInner(List<Entry> hostList)
         {
             var boxes = LiveBoxes();
 
@@ -229,11 +283,9 @@ namespace CardShopCoop.Sync
                     }
                     else
                     {
-                        // vanished locally (trashed/emptied) - report as empty at same spot
-                        var gone = _lastApplied[i];
-                        gone.Count = 0;
-                        list.Add(gone);
-                        changed = true;
+                        // list shrank without OnDestroyed telling us (trash is forwarded
+                        // separately) - stop and let the next host snapshot re-align
+                        break;
                     }
                 }
                 if (changed) OnClientChanges?.Invoke(list);

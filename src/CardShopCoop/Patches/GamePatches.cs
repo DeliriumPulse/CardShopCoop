@@ -61,6 +61,31 @@ namespace CardShopCoop.Patches
             // box); the placed object mirrors back through the population sync.
             Try(h, typeof(ShelfManager), "SpawnInteractableObjectInPackageBox",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(FurnitureOrderPrefix)));
+
+            // A trashed box must die on the host too, or the next broadcast resurrects
+            // it at its old spot on the ground.
+            Try(h, typeof(InteractablePackagingBox_Item), "OnDestroyed",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(BoxDestroyedPrefix)));
+
+            // Product licenses are shared: bought by either player, unlocked for both.
+            // Identity travels as (itemType + box size), never a restock-list index -
+            // modded restock lists can be ordered differently per machine.
+            Try(h, typeof(CPlayerData), "SetUnlockItemLicense",
+                prefix: null, postfix: new HarmonyMethod(typeof(GamePatches), nameof(LicenseUnlockPostfix)));
+        }
+
+        public static bool BoxDestroyedPrefix(InteractablePackagingBox_Item __instance)
+        {
+            if (!BoxSync.ApplyingRemote) BoxSync.LocalBoxDestroyed?.Invoke(__instance);
+            return true;
+        }
+
+        public static bool ApplyingRemoteLicense;
+
+        public static void LicenseUnlockPostfix(int index)
+        {
+            if (!ApplyingRemoteLicense && CoopCore.Role != CoopRole.None)
+                CoopCore.Instance?.ForwardLicense(index);
         }
 
         public static bool FurnitureOrderPrefix(EObjectType objType, UnityEngine.Vector3 spawnPos, UnityEngine.Quaternion spawnRot)

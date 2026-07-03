@@ -56,6 +56,10 @@ namespace CardShopCoop.Sync
 
         public Action<List<List<Entry>>> OnHostSnapshot;
 
+        /// <summary>Fired when reconciliation destroys or spawns an object of a kind -
+        /// other syncs' index baselines for that kind are stale from this moment.</summary>
+        public static Action<int> OnClientStructureChanged;
+
         public void Reset()
         {
             _sm = null;
@@ -129,6 +133,7 @@ namespace CardShopCoop.Sync
                 if (extra == null) { list.RemoveAt(list.Count - 1); continue; }
                 CoopPlugin.Log.LogInfo($"population: removing extra {extra.m_ObjectType} (kind {kind})");
                 extra.OnDestroyed();
+                OnClientStructureChanged?.Invoke(kind);
                 list = GetList(sm, kind);
             }
 
@@ -142,6 +147,7 @@ namespace CardShopCoop.Sync
                 {
                     CoopPlugin.Log.LogInfo($"population: repairing index {i} (kind {kind}): {obj.m_ObjectType} -> {(EObjectType)want[i].ObjType}");
                     obj.OnDestroyed();
+                    OnClientStructureChanged?.Invoke(kind);
                     return; // re-align next tick
                 }
             }
@@ -156,6 +162,7 @@ namespace CardShopCoop.Sync
                 if (spawned == null) break;
                 spawned.transform.SetPositionAndRotation(e.Pos, e.Rot);
                 CoopPlugin.Log.LogInfo($"population: spawned {(EObjectType)e.ObjType} (kind {kind})");
+                OnClientStructureChanged?.Invoke(kind);
                 list = GetList(sm, kind);
             }
         }

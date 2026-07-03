@@ -54,16 +54,32 @@ namespace CardShopCoop.Sync
         }
 
         private readonly Dictionary<int, SlotState> _last = new Dictionary<int, SlotState>();
+        private readonly Dictionary<int, double> _locallyChanged = new Dictionary<int, double>();
         private float _timer;
         private ShelfManager _sm;
 
         public Action<List<Entry>> OnLocalChanges;
 
+        /// <summary>Client role: adopt unknown slots silently instead of reporting them
+        /// (a joiner only reports transitions it witnessed against a known baseline -
+        /// reporting its own stale/empty view is how the host's stands got wiped), and
+        /// protect fresh local edits from stale host echoes.</summary>
+        public bool IsClientRole;
+
         public void Reset()
         {
             _last.Clear();
+            _locallyChanged.Clear();
             _timer = 0f;
             _sm = null;
+        }
+
+        /// <summary>The local display structure changed under us (population repair
+        /// respawned a shelf): the baseline is meaningless now. Client mode silently
+        /// re-adopts; the host's periodic full resync repaints whatever got wiped.</summary>
+        public void InvalidateBaseline()
+        {
+            _last.Clear();
         }
 
         private ShelfManager Sm()
@@ -101,35 +117,49 @@ namespace CardShopCoop.Sync
             for (int i = 0; i < shelves.Count; i++)
             {
                 var shelf = shelves[i];
-                if (shelf == null) continue;
+                if (shelf == null || !shelf.gameObject.activeInHierarchy) continue; // boxed/carried
                 var comps = shelf.GetCardCompartmentList();
                 for (int j = 0; j < comps.Count; j++)
                 {
                     var comp = comps[j];
                     if (comp == null) continue;
                     int key = (kind << 24) | ((i & 0xFFFF) << 8) | (j & 0xFF);
-                    CardData card = ReadSlot(comp);
+                    // unreadable (a card is there but its pooled UI is culled/detached)
+                    // is NOT empty - misreporting it as empty wipes the other side
+                    if (!TryReadSlot(comp, out CardData card)) continue;
                     bool occupied = card != null;
 
-                    if (_last.TryGetValue(key, out var st)
-                        && st.Occupied == occupied && (!occupied || st.Matches(card)))
+                    if (_last.TryGetValue(key, out var st))
+                    {
+                        if (st.Occupied == occupied && (!occupied || st.Matches(card)))
+                            continue;
+                    }
+                    else if (IsClientRole)
+                    {
+                        _last[key] = SlotState.From(card); // adopt silently, never report
                         continue;
+                    }
 
                     if (changes == null) changes = new List<Entry>();
                     if (changes.Count >= 128) return; // rest next tick
                     _last[key] = SlotState.From(card);
+                    if (IsClientRole) _locallyChanged[key] = Time.realtimeSinceStartupAsDouble;
                     changes.Add(new Entry { Key = key, Occupied = occupied, Card = card });
                 }
             }
         }
 
-        private static CardData ReadSlot(InteractableCardCompartment comp)
+        /// <summary>False = state unknown right now (a stored card's pooled UI is
+        /// distance-culled or detached) - callers must NOT treat that as empty.</summary>
+        private static bool TryReadSlot(InteractableCardCompartment comp, out CardData card)
         {
-            if (comp.m_StoredCardList.Count == 0) return null;
+            card = null;
+            if (comp.m_StoredCardList.Count == 0) return true; // genuinely empty
             var card3d = comp.m_StoredCardList[0];
             if (card3d == null || card3d.m_Card3dUI == null || card3d.m_Card3dUI.m_CardUI == null)
-                return null;
-            return card3d.m_Card3dUI.m_CardUI.GetCardData();
+                return false;
+            card = card3d.m_Card3dUI.m_CardUI.GetCardData();
+            return card != null;
         }
 
         public void ApplyRemote(List<Entry> entries)
@@ -140,6 +170,11 @@ namespace CardShopCoop.Sync
             {
                 try
                 {
+                    // my own fresh edit is still round-tripping to the host; a stale
+                    // echo (or the periodic full resync) must not stomp it
+                    if (IsClientRole && _locallyChanged.TryGetValue(e.Key, out double t)
+                        && Time.realtimeSinceStartupAsDouble - t < 6.0)
+                        continue;
                     var comp = Resolve(sm, e.Key);
                     if (comp == null) continue;
                     ApplySlot(comp, e);
@@ -167,16 +202,19 @@ namespace CardShopCoop.Sync
 
         private static void ApplySlot(InteractableCardCompartment comp, Entry e)
         {
-            var current = ReadSlot(comp);
+            bool hasCard = comp.m_StoredCardList.Count > 0;
             if (!e.Occupied)
             {
-                if (current != null) comp.DisableAllCard(); // game's own cleanup path
+                if (hasCard) comp.DisableAllCard(); // game's own cleanup path
                 return;
             }
-            if (current != null)
+            if (hasCard)
             {
-                var st = SlotState.From(current);
-                if (st.Matches(e.Card)) return; // already showing this exact card
+                // matching readable card: done; different or unreadable: replace clean
+                // (spawning on top of an existing card3d would stack duplicates)
+                if (TryReadSlot(comp, out CardData current) && current != null
+                    && SlotState.From(current).Matches(e.Card))
+                    return;
                 comp.DisableAllCard();
             }
 
@@ -194,6 +232,40 @@ namespace CardShopCoop.Sync
             card3d.SetEnableCollision(isEnable: false);
             comp.SetCardOnShelf(card3d);
             cardUI.m_IgnoreCulling = false;
+        }
+
+        /// <summary>Host: full authoritative slot state for the periodic heal broadcast.
+        /// Unreadable slots (host's own culled cards) are OMITTED rather than guessed -
+        /// absence means "no instruction", so clients keep what they have.</summary>
+        public List<Entry> BuildFullState()
+        {
+            var full = new List<Entry>();
+            var sm = Sm();
+            if (sm == null) return full;
+            Collect(sm.m_CardShelfList, 2, full);
+            Collect(sm.m_CardItemCombiShelfList, 3, full);
+            return full;
+        }
+
+        private static void Collect<T>(List<T> shelves, int kind, List<Entry> into) where T : CardShelf
+        {
+            for (int i = 0; i < shelves.Count; i++)
+            {
+                var shelf = shelves[i];
+                if (shelf == null || !shelf.gameObject.activeInHierarchy) continue;
+                var comps = shelf.GetCardCompartmentList();
+                for (int j = 0; j < comps.Count; j++)
+                {
+                    var comp = comps[j];
+                    if (comp == null || !TryReadSlot(comp, out CardData card)) continue;
+                    into.Add(new Entry
+                    {
+                        Key = (kind << 24) | ((i & 0xFFFF) << 8) | (j & 0xFF),
+                        Occupied = card != null,
+                        Card = card,
+                    });
+                }
+            }
         }
 
         // ---- wire format ----

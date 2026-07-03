@@ -46,6 +46,9 @@ namespace CardShopCoop.Net
         LightState = 39,       // host -> client: full LightTimeData (sky phase, timers)
         PopState = 40,         // host -> client: placed-object population roster (all kinds)
         FurnitureOrder = 41,   // client -> host: joiner bought furniture (spawn officially)
+        BoxRemoved = 42,       // client -> host: joiner trashed a loose box (destroy officially)
+        LicenseUnlock = 43,    // both ways: a product license was purchased (itemType+size identity)
+        LicenseState = 44,     // host -> client: full unlocked-license set (identity-keyed)
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>

@@ -110,6 +110,9 @@ namespace CardShopCoop
         private static readonly System.Reflection.MethodInfo MiUpdateLightData = typeof(LightManager).GetMethod("UpdateLightTimeData", BindingFlags.NonPublic | BindingFlags.Instance);
         private float _lightSyncTimer;
         private LightManager _lightManager;
+        private float _cardResyncTimer;
+        private float _licenseSyncTimer;
+        private double _lastLicenseBuyTime = -999.0;
 
         // headless auto-test / shortcut args: -coopautohost=SLOT  -coopautojoin=IP
         private int _autoHostSlot = -1;
@@ -151,6 +154,21 @@ namespace CardShopCoop
                         || ReferenceEquals(FiHoldBox?.GetValue(_playerIpc), box);
                 }
                 catch { return false; }
+            };
+            BoxSync.LocalBoxDestroyed = box =>
+            {
+                if (!InGameLevel()) return;
+                if (Role == CoopRole.Client) _boxes.NotifyLocalDestroyed(box);
+                else if (Role == CoopRole.Host) _boxes.HostNotifyLocalDestroyed();
+            };
+            _boxes.OnLocalRemoved = (idx, type) =>
+                Send(1, MsgType.BoxRemoved, bw => { bw.Write(idx); bw.Write(type); });
+            PopulationSync.OnClientStructureChanged = kind =>
+            {
+                // a repaired/respawned card display starts empty locally; that emptiness
+                // is repair fallout, not a player action - never report it to the host
+                if (Role == CoopRole.Client && (kind == 2 || kind == 3))
+                    _cardShelves.InvalidateBaseline();
             };
             SceneManager.sceneLoaded += OnSceneLoaded;
 
@@ -573,7 +591,78 @@ namespace CardShopCoop
         public void ForwardOrder(int restockIndex, int count)
         {
             if (Role != CoopRole.Client || _net == null) return;
-            Send(1, MsgType.OrderRequest, bw => { bw.Write(restockIndex); bw.Write(count); });
+            // identity, never the raw index: modded restock lists (EPL packs) can be
+            // ordered differently per machine - a raw index once turned a hololive
+            // pack order into a $43 vanilla pack on the host
+            RestockData rd = null;
+            try { rd = InventoryBase.GetRestockData(restockIndex); } catch { }
+            if (rd == null)
+            {
+                CoopPlugin.Log.LogWarning($"order: bad restock index {restockIndex}");
+                return;
+            }
+            Send(1, MsgType.OrderRequest, bw =>
+            {
+                bw.Write((int)rd.itemType);
+                bw.Write(rd.isBigBox);
+                bw.Write(rd.name ?? "");
+                bw.Write(count);
+            });
+        }
+
+        /// <summary>Either side bought a product license: share it by identity.</summary>
+        public void ForwardLicense(int restockIndex)
+        {
+            if (Role == CoopRole.None || _net == null) return;
+            RestockData rd = null;
+            try { rd = InventoryBase.GetRestockData(restockIndex); } catch { }
+            if (rd == null) return;
+            _lastLicenseBuyTime = UnityEngine.Time.realtimeSinceStartupAsDouble;
+            int itemType = (int)rd.itemType;
+            bool isBig = rd.isBigBox;
+            string rdName = rd.name ?? "";
+            if (Role == CoopRole.Host)
+                Broadcast(MsgType.LicenseUnlock, bw => { bw.Write(itemType); bw.Write(isBig); bw.Write(rdName); });
+            else
+                Send(1, MsgType.LicenseUnlock, bw => { bw.Write(itemType); bw.Write(isBig); bw.Write(rdName); });
+        }
+
+        /// <summary>Find OUR restock entry for a partner's (itemType, boxSize) identity;
+        /// falls back to the entry name for mods whose enum ints don't line up.</summary>
+        private static int ResolveRestockIndex(int itemType, bool isBig, string name)
+        {
+            try
+            {
+                var list = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
+                for (int i = 0; i < list.Count; i++)
+                    if (list[i] != null && (int)list[i].itemType == itemType && list[i].isBigBox == isBig)
+                        return i;
+                if (!string.IsNullOrEmpty(name))
+                    for (int i = 0; i < list.Count; i++)
+                        if (list[i] != null && list[i].name == name && list[i].isBigBox == isBig)
+                            return i;
+            }
+            catch { }
+            return -1;
+        }
+
+        private void ApplyLicenseUnlock(int itemType, bool isBig, string name)
+        {
+            int idx = ResolveRestockIndex(itemType, isBig, name);
+            if (idx < 0)
+            {
+                CoopPlugin.Log.LogWarning($"license unlock: no local product for type {itemType} big={isBig} '{name}'");
+                return;
+            }
+            if (CPlayerData.GetIsItemLicenseUnlocked(idx)) return;
+            Patches.GamePatches.ApplyingRemoteLicense = true;
+            try
+            {
+                CPlayerData.SetUnlockItemLicense(idx);
+                try { AchievementManager.OnItemLicenseUnlocked((EItemType)itemType); } catch { }
+            }
+            finally { Patches.GamePatches.ApplyingRemoteLicense = false; }
+            CoopPlugin.Log.LogInfo($"license unlocked by partner: {(EItemType)itemType} big={isBig}");
         }
 
         /// <summary>Client: the joiner bought furniture - deliver it on the host.</summary>
@@ -798,7 +887,11 @@ namespace CardShopCoop
             Guarded("avatars", () => _avatars.Tick(dt));
             bool syncActive = Role != CoopRole.None && _net.ConnectionCount > 0 && InGameLevel();
             Guarded("world", () => _world.Tick(dt, syncActive));
-            Guarded("cardshelves", () => _cardShelves.Tick(dt, syncActive));
+            Guarded("cardshelves", () =>
+            {
+                _cardShelves.IsClientRole = Role == CoopRole.Client;
+                _cardShelves.Tick(dt, syncActive);
+            });
             Guarded("objmoves", () => _objMoves.Tick(dt, syncActive));
             Guarded("boxes", () =>
             {
@@ -1112,6 +1205,50 @@ namespace CardShopCoop
                     }
                 }
                 catch (Exception e) { CoopPlugin.Log.LogWarning("light sync: " + e.Message); }
+            }
+
+            // slow full-truth repaint of card display slots: heals any client whose local
+            // display diverged (population repairs, culled reads, missed deltas) without
+            // waiting for the host to touch a slot again
+            _cardResyncTimer += dt;
+            if (_cardResyncTimer >= 12f && InGameLevel())
+            {
+                _cardResyncTimer = 0f;
+                try
+                {
+                    var full = _cardShelves.BuildFullState();
+                    if (full.Count > 0)
+                        Broadcast(MsgType.CardShelfDelta, bw => CardShelfSync.WriteEntries(bw, full));
+                }
+                catch (Exception e) { CoopPlugin.Log.LogWarning("card resync: " + e.Message); }
+            }
+
+            // shared product licenses, identity-keyed: the save-file bool list is indexed
+            // by restock position, which modded lists can scramble between machines
+            _licenseSyncTimer += dt;
+            if (_licenseSyncTimer >= 10f && InGameLevel())
+            {
+                _licenseSyncTimer = 0f;
+                try
+                {
+                    var rl = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
+                    var flags = CPlayerData.m_IsItemLicenseUnlocked;
+                    var unlocked = new List<RestockData>();
+                    for (int i = 0; i < rl.Count && i < flags.Count; i++)
+                        if (flags[i] && rl[i] != null) unlocked.Add(rl[i]);
+                    bool scanner = CPlayerData.m_IsScannerRestockUnlocked;
+                    Broadcast(MsgType.LicenseState, bw =>
+                    {
+                        bw.Write(scanner);
+                        bw.Write((ushort)unlocked.Count);
+                        foreach (var rd in unlocked)
+                        {
+                            bw.Write((int)rd.itemType);
+                            bw.Write(rd.isBigBox);
+                        }
+                    });
+                }
+                catch (Exception e) { CoopPlugin.Log.LogWarning("license sync: " + e.Message); }
             }
 
             _dayTimer += dt;
@@ -1603,11 +1740,92 @@ namespace CardShopCoop
                     if (Role != CoopRole.Host || !InGameLevel()) break;
                     using (var br = Msg.Reader(msg.Payload))
                     {
-                        int restockIndex = br.ReadInt32();
+                        int itemType = br.ReadInt32();
+                        bool isBig = br.ReadBoolean();
+                        string rdName = br.ReadString();
                         int count = br.ReadInt32();
                         string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : "player";
-                        CoopPlugin.Log.LogInfo($"{who} ordered restock {restockIndex} x{count}");
-                        RestockManager.SpawnPackageBoxItemMultipleFrame(restockIndex, count);
+                        int idx = ResolveRestockIndex(itemType, isBig, rdName);
+                        if (idx >= 0)
+                        {
+                            CoopPlugin.Log.LogInfo($"{who} ordered {(EItemType)itemType} big={isBig} x{count} -> restock {idx}");
+                            RestockManager.SpawnPackageBoxItemMultipleFrame(idx, count);
+                        }
+                        else
+                            CoopPlugin.Log.LogWarning($"{who} ordered unknown product type {itemType} '{rdName}' - skipped");
+                    }
+                    break;
+                }
+                case MsgType.BoxRemoved:
+                {
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        int idx = br.ReadInt32();
+                        int type = br.ReadInt32();
+                        string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : "player";
+                        CoopPlugin.Log.LogInfo($"{who} trashed box {idx} ({(EItemType)type})");
+                        _boxes.HostApplyRemoval(idx, type);
+                    }
+                    break;
+                }
+                case MsgType.LicenseUnlock:
+                {
+                    if (!InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        int itemType = br.ReadInt32();
+                        bool isBig = br.ReadBoolean();
+                        string rdName = br.ReadString();
+                        ApplyLicenseUnlock(itemType, isBig, rdName);
+                        if (Role == CoopRole.Host) // echo to the other clients
+                            Broadcast(MsgType.LicenseUnlock, bw =>
+                            { bw.Write(itemType); bw.Write(isBig); bw.Write(rdName); });
+                    }
+                    break;
+                }
+                case MsgType.LicenseState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        bool scanner = br.ReadBoolean();
+                        int n = br.ReadUInt16();
+                        var wanted = new HashSet<long>();
+                        for (int i = 0; i < n; i++)
+                        {
+                            int t = br.ReadInt32();
+                            bool big = br.ReadBoolean();
+                            wanted.Add(((long)t << 1) | (big ? 1L : 0L));
+                        }
+                        // don't re-lock during the window where our own purchase is
+                        // still round-tripping to the host
+                        bool allowLock = UnityEngine.Time.realtimeSinceStartupAsDouble
+                            - _lastLicenseBuyTime > 12.0;
+                        Guarded("license-apply", () =>
+                        {
+                            CPlayerData.m_IsScannerRestockUnlocked |= scanner;
+                            var rl = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
+                            var flags = CPlayerData.m_IsItemLicenseUnlocked;
+                            for (int i = 0; i < rl.Count && i < flags.Count; i++)
+                            {
+                                if (rl[i] == null) continue;
+                                bool should = wanted.Contains(
+                                    ((long)(int)rl[i].itemType << 1) | (rl[i].isBigBox ? 1L : 0L));
+                                if (should && !flags[i])
+                                {
+                                    Patches.GamePatches.ApplyingRemoteLicense = true;
+                                    try { CPlayerData.SetUnlockItemLicense(i); }
+                                    finally { Patches.GamePatches.ApplyingRemoteLicense = false; }
+                                }
+                                else if (!should && flags[i] && i != 0 && allowLock)
+                                {
+                                    // scrambled save-transfer flag (index order differs
+                                    // between machines): host truth says locked
+                                    flags[i] = false;
+                                }
+                            }
+                        });
                     }
                     break;
                 }
