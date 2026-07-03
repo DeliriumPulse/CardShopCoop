@@ -32,6 +32,9 @@ namespace CardShopCoop.Sync
             public bool IsOpen;
             public bool Carried; // in someone's hands: position is transient, don't apply
             public bool Settled; // physics at rest: only settled poses are applied
+            public bool Stored;  // on a warehouse rack slot: the compartment owns pose+contents
+            public byte StoreShelf; // WarehouseShelf.GetIndex() while stored
+            public byte StoreComp;  // compartment index within that shelf while stored
             public Vector3 Pos;
             public float Yaw;
         }
@@ -135,14 +138,34 @@ namespace CardShopCoop.Sync
                     || rb.velocity.sqrMagnitude < 0.04f;
             }
             catch { }
+            // warehouse-rack storage: the slot transform owns the pose, so a stored
+            // box reports its slot address instead of a physics pose
+            bool stored = false; int sShelf = 0, sComp = 0;
+            try
+            {
+                if (box.m_IsStored)
+                {
+                    var sc = box.GetBoxStoredCompartment();
+                    if (sc != null)
+                    {
+                        stored = true;
+                        sShelf = sc.GetWarehouseIndex();
+                        sComp = sc.GetIndex();
+                    }
+                }
+            }
+            catch { }
             return new Entry
             {
                 Type = (int)box.m_ItemCompartment.GetItemType(),
                 Count = box.m_ItemCompartment.GetItemCount(),
                 IsBig = box.m_IsBigBox,
                 IsOpen = box.IsBoxOpened(),
-                Carried = IsLocallyCarried(box),
-                Settled = settled,
+                Carried = !stored && IsLocallyCarried(box),
+                Settled = stored || settled,
+                Stored = stored,
+                StoreShelf = (byte)Mathf.Clamp(sShelf, 0, 255),
+                StoreComp = (byte)Mathf.Clamp(sComp, 0, 255),
                 Pos = box.transform.position,
                 Yaw = box.transform.eulerAngles.y,
             };
@@ -150,8 +173,44 @@ namespace CardShopCoop.Sync
 
         private static bool Differs(Entry a, Entry b)
         {
-            return a.Type != b.Type || a.Count != b.Count || a.IsBig != b.IsBig || a.IsOpen != b.IsOpen
-                || (a.Pos - b.Pos).sqrMagnitude > 0.01f || Mathf.Abs(Mathf.DeltaAngle(a.Yaw, b.Yaw)) > 3f;
+            if (a.Type != b.Type || a.Count != b.Count || a.IsBig != b.IsBig || a.IsOpen != b.IsOpen) return true;
+            if (a.Stored != b.Stored) return true;
+            // both stored: the rack slot owns the pose - comparing transforms would
+            // report phantom "drift" every tick and fight the game's arrangement
+            if (a.Stored) return a.StoreShelf != b.StoreShelf || a.StoreComp != b.StoreComp;
+            return (a.Pos - b.Pos).sqrMagnitude > 0.01f || Mathf.Abs(Mathf.DeltaAngle(a.Yaw, b.Yaw)) > 3f;
+        }
+
+        /// <summary>A stored box destroyed without unhooking leaks the compartment's
+        /// box count and leaves a dangling slot reference.</summary>
+        private static void UnhookIfStored(InteractablePackagingBox_Item box)
+        {
+            try
+            {
+                if (box == null || !box.m_IsStored) return;
+                var comp = box.GetBoxStoredCompartment();
+                if (comp != null) comp.RemoveBox(box);
+                box.m_IsStored = false;
+            }
+            catch { }
+        }
+
+        private static ShelfCompartment ResolveWarehouseCompartment(int shelfIdx, int compIdx)
+        {
+            try
+            {
+                var sm = CSingleton<ShelfManager>.Instance;
+                if (sm == null) return null;
+                var list = sm.m_WarehouseShelfList;
+                for (int i = 0; i < list.Count; i++)
+                {
+                    var ws = list[i];
+                    if (ws == null || ws.GetIndex() != shelfIdx) continue;
+                    return ws.GetWarehouseCompartment(compIdx);
+                }
+            }
+            catch { }
+            return null;
         }
 
         // ---------------- host ----------------
@@ -233,7 +292,8 @@ namespace CardShopCoop.Sync
                     hash = hash * 31 + e.Id;
                     hash = hash * 31 + e.Type;
                     hash = hash * 31 + e.Count;
-                    hash = hash * 31 + ((e.IsBig ? 1 : 0) | (e.IsOpen ? 2 : 0) | (e.Carried ? 4 : 0) | (e.Settled ? 8 : 0));
+                    hash = hash * 31 + ((e.IsBig ? 1 : 0) | (e.IsOpen ? 2 : 0) | (e.Carried ? 4 : 0) | (e.Settled ? 8 : 0) | (e.Stored ? 16 : 0));
+                    hash = hash * 31 + e.StoreShelf * 311 + e.StoreComp;
                     hash = hash * 31 + (int)(e.Pos.x * 8f);
                     hash = hash * 31 + (int)(e.Pos.z * 8f);
                 }
@@ -306,7 +366,7 @@ namespace CardShopCoop.Sync
             if ((int)box.m_ItemCompartment.GetItemType() != type) return;
             if (IsLocallyCarried(box)) return;
             ApplyingRemote = true;
-            try { box.OnDestroyed(); }
+            try { UnhookIfStored(box); box.OnDestroyed(); } // OnDestroyed alone leaks the rack slot
             catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync removal: " + e.Message); }
             finally { ApplyingRemote = false; }
             _hostIds.Remove(box);
@@ -414,6 +474,7 @@ namespace CardShopCoop.Sync
                     // someone's HANDS; wait for the set-down
                     if (IsLocallyCarried(box)) continue;
                     _idOf.Remove(box);
+                    UnhookIfStored(box);
                     try { box.OnDestroyed(); } catch { }
                     box = null;
                 }
@@ -474,6 +535,7 @@ namespace CardShopCoop.Sync
                     if (IsLocallyCarried(box))
                         CoopPlugin.Log.LogWarning($"host removed the box in your hands (id {id}, {(EItemType)(int)box.m_ItemCompartment.GetItemType()}) - it was consumed host-side");
                     _idOf.Remove(box);
+                    UnhookIfStored(box);
                     try { box.OnDestroyed(); } catch { }
                 }
                 _byId.Remove(id);
@@ -538,7 +600,8 @@ namespace CardShopCoop.Sync
                     {
                         var held = truth;
                         held.Carried = true;
-                        list.Add(held);
+                        held.Stored = false; // just took it off a rack: a stale stored
+                        list.Add(held);      // flag would keep the host's copy slotted
                         continue;
                     }
                     // hidden because ANOTHER player carries it: no local truth to
@@ -571,6 +634,38 @@ namespace CardShopCoop.Sync
         {
             try
             {
+                // warehouse-rack storage FIRST: a stored box is parented to a rack slot
+                // the game owns. Syncing it as a loose box yanked stored boxes off the
+                // rack on BOTH sides ("boxes all over the place" report) and left them
+                // uninteractable - the store/unstore transition must go through the
+                // game's own methods so the compartment registration mirrors too
+                bool locallyStored = false;
+                try { locallyStored = box.m_IsStored; } catch { }
+                if (want.Stored)
+                {
+                    if (!locallyStored)
+                    {
+                        if (!box.gameObject.activeSelf) box.gameObject.SetActive(true);
+                        var rackComp = ResolveWarehouseCompartment(want.StoreShelf, want.StoreComp);
+                        // vanilla store: closes the box, lerps to the slot, AddBox,
+                        // flags - isPlayer:false silences popups/sounds/tutorial.
+                        // A null/full/wrong-type compartment self-heals: the next
+                        // snapshot retries once WorldSync has aligned the rack
+                        if (rackComp != null)
+                        {
+                            try { box.DispenseItem(isPlayer: false, rackComp); }
+                            catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync store: " + e.Message); }
+                        }
+                    }
+                    return; // slot owns pose and contents while stored
+                }
+                if (locallyStored)
+                {
+                    // remote took it off the rack: unhook before the normal apply moves it
+                    UnhookIfStored(box);
+                    try { box.transform.SetParent(null); } catch { }
+                }
+
                 // someone (remote) is carrying it: their avatar shows the box in hand,
                 // so the world copy disappears until it's set down - tags included
                 // (box price tags live in a separate canvas group)
@@ -662,7 +757,9 @@ namespace CardShopCoop.Sync
                 bw.Write(e.Id);
                 bw.Write(e.Type);
                 bw.Write((ushort)Mathf.Clamp(e.Count, 0, ushort.MaxValue));
-                bw.Write((byte)((e.IsBig ? 1 : 0) | (e.IsOpen ? 2 : 0) | (e.Carried ? 4 : 0) | (e.Settled ? 8 : 0)));
+                bw.Write((byte)((e.IsBig ? 1 : 0) | (e.IsOpen ? 2 : 0) | (e.Carried ? 4 : 0) | (e.Settled ? 8 : 0) | (e.Stored ? 16 : 0)));
+                bw.Write(e.StoreShelf);
+                bw.Write(e.StoreComp);
                 bw.Write(e.Pos.x); bw.Write(e.Pos.y); bw.Write(e.Pos.z);
                 bw.Write(e.Yaw);
             }
@@ -680,6 +777,9 @@ namespace CardShopCoop.Sync
                 e.IsOpen = (f & 2) != 0;
                 e.Carried = (f & 4) != 0;
                 e.Settled = (f & 8) != 0;
+                e.Stored = (f & 16) != 0;
+                e.StoreShelf = br.ReadByte();
+                e.StoreComp = br.ReadByte();
                 e.Pos = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
                 e.Yaw = br.ReadSingle();
                 list.Add(e);

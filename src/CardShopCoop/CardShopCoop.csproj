@@ -4,7 +4,7 @@
     <TargetFramework>net472</TargetFramework>
     <AssemblyName>CardShopCoop</AssemblyName>
     <RootNamespace>CardShopCoop</RootNamespace>
-    <Version>1.0.10</Version>
+    <Version>1.0.11</Version>
     <LangVersion>9</LangVersion>
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
