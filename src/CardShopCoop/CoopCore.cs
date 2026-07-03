@@ -75,6 +75,8 @@ namespace CardShopCoop
         private float _priceTimer = -0.45f;
         private int _lastPriceHash;
         private float _priceHeal;
+        private readonly List<KeyValuePair<int, float>> _priceBuf = new List<KeyValuePair<int, float>>();
+        private readonly HashSet<int> _priceSeenTypes = new HashSet<int>();
 
         // timers
         private float _stateTimer;
@@ -1691,14 +1693,29 @@ namespace CardShopCoop
                     // the table is indexed by RAW itemType and EPL registers modded items
                     // at huge enum values (~200k entries) - ship only the set prices as
                     // (index, price) pairs; the old whole-table send truncated its count
-                    // to 16 bits and modded prices never arrived
-                    var prices = CPlayerData.m_SetItemPriceList;
+                    // to 16 bits and modded prices never arrived.
+                    // Read through the game's WOVEN GetItemPrice, never the raw list:
+                    // EPL routes modded set-prices (index >= vanilla count) to its own
+                    // per-item save data, so the raw list simply never contains them -
+                    // hosts priced modded packs and joiners' tags stayed at "-" forever
+                    // (field screenshots; same interception as the restock catalog)
+                    _priceBuf.Clear();
+                    var seenTypes = _priceSeenTypes;
+                    seenTypes.Clear();
+                    int n = CatalogCount();
                     int hash = 17;
-                    for (int i = 0; i < prices.Count; i++)
+                    for (int i = 0; i < n; i++)
                     {
-                        if (prices[i] == 0f) continue;
-                        hash = hash * 31 + i;
-                        hash = hash * 31 + prices[i].GetHashCode();
+                        var rd = CatalogAt(i);
+                        if (rd == null) continue;
+                        int t = (int)rd.itemType;
+                        if (!seenTypes.Add(t)) continue; // big/small share one price row
+                        float v = 0f;
+                        try { v = CPlayerData.GetItemPrice(rd.itemType, preventZero: false); } catch { }
+                        if (v == 0f) continue;
+                        _priceBuf.Add(new KeyValuePair<int, float>(t, v));
+                        hash = hash * 31 + t;
+                        hash = hash * 31 + v.GetHashCode();
                     }
                     // heal beat: the hash updates BEFORE the send, so a single failed
                     // or lost broadcast used to leave those prices stale FOREVER (tag
@@ -1711,15 +1728,12 @@ namespace CardShopCoop
                         _priceHeal = 0f;
                         Broadcast(MsgType.PriceList, bw =>
                         {
-                            int nonZero = 0;
-                            for (int i = 0; i < prices.Count; i++) if (prices[i] != 0f) nonZero++;
-                            bw.Write(nonZero);
-                            for (int i = 0; i < prices.Count; i++)
-                                if (prices[i] != 0f)
-                                {
-                                    bw.Write(i);
-                                    bw.Write(prices[i]);
-                                }
+                            bw.Write(_priceBuf.Count);
+                            for (int i = 0; i < _priceBuf.Count; i++)
+                            {
+                                bw.Write(_priceBuf[i].Key);
+                                bw.Write(_priceBuf[i].Value);
+                            }
                         });
                     }
                 }
@@ -2075,40 +2089,43 @@ namespace CardShopCoop
                     using (var br = Msg.Reader(msg.Payload))
                     {
                         int n = br.ReadInt32();
-                        var prices = CPlayerData.m_SetItemPriceList;
                         Patches.GamePatches.ApplyingRemotePrice = true; // don't echo these back
                         try
                         {
                             _incomingPriced.Clear();
-                            int grown = 0, changed = 0;
+                            int changed = 0;
                             for (int k = 0; k < n; k++)
                             {
                                 int i = br.ReadInt32();
                                 float v = br.ReadSingle();
                                 _incomingPriced.Add(i);
                                 if (i < 0 || i > 500000) continue;
-                                // the table only grows on the machine that PRICES a modded
-                                // item - grow ours the same way the game pads it (Add(0f))
-                                // or the bounds check silently eats every modded price
-                                while (prices.Count <= i) { prices.Add(0f); grown++; }
-                                if (Math.Abs(prices[i] - v) > 0.0001f)
+                                // write through the game's WOVEN SetItemPrice: raw list
+                                // writes for modded types land in a shadow list the game
+                                // never reads (EPL routes those rows to its own save
+                                // data), which kept joiner tags at "-" while the value
+                                // "applied" - and SetItemPrice fires the tag-repaint
+                                // event itself
+                                float cur = 0f;
+                                try { cur = CPlayerData.GetItemPrice((EItemType)i, preventZero: false); } catch { }
+                                if (Math.Abs(cur - v) > 0.0001f)
                                 {
-                                    prices[i] = v;
-                                    changed++;
-                                    CEventManager.QueueEvent(new CEventPlayer_ItemPriceChanged((EItemType)i, v));
+                                    try { CPlayerData.SetItemPrice((EItemType)i, v); changed++; } catch { }
                                 }
                             }
-                            if (grown > 0)
-                                CoopPlugin.Log.LogInfo($"price apply: grew the price table by {grown} entries for modded items");
                             // stale-price reports were undiagnosable: applies were silent
-                            else if (changed > 0)
+                            if (changed > 0)
                                 CoopPlugin.Log.LogInfo($"price apply: {changed} price(s) updated from host");
                             // a price the host CLEARED is absent from the sparse set
                             foreach (int i in _clientPriced)
-                                if (!_incomingPriced.Contains(i) && i >= 0 && i < prices.Count && prices[i] != 0f)
+                                if (!_incomingPriced.Contains(i) && i >= 0 && i <= 500000)
                                 {
-                                    prices[i] = 0f;
-                                    CEventManager.QueueEvent(new CEventPlayer_ItemPriceChanged((EItemType)i, 0f));
+                                    float cur = 0f;
+                                    try { cur = CPlayerData.GetItemPrice((EItemType)i, preventZero: false); } catch { }
+                                    if (cur != 0f)
+                                    {
+                                        try { CPlayerData.SetItemPrice((EItemType)i, 0f); } catch { }
+                                    }
                                 }
                             var tmp = _clientPriced;
                             _clientPriced = _incomingPriced;
@@ -2770,15 +2787,15 @@ namespace CardShopCoop
                     {
                         int itemType = br.ReadInt32();
                         float price = br.ReadSingle();
-                        var prices = CPlayerData.m_SetItemPriceList;
                         if (itemType >= 0 && itemType <= 500000)
                         {
-                            // grow-on-demand: a joiner pricing a modded item the host
-                            // hasn't priced yet must not be silently dropped
-                            while (prices.Count <= itemType) prices.Add(0f);
-                            prices[itemType] = price;
+                            // WOVEN SetItemPrice, never the raw list: EPL routes modded
+                            // rows to its own save data, and a raw write is a shadow
+                            // entry the game (and our own woven-read broadcast) never
+                            // sees. Fires the tag-repaint event itself.
                             Patches.GamePatches.ApplyingRemotePrice = true;
-                            try { CEventManager.QueueEvent(new CEventPlayer_ItemPriceChanged((EItemType)itemType, price)); }
+                            try { CPlayerData.SetItemPrice((EItemType)itemType, price); }
+                            catch { }
                             finally { Patches.GamePatches.ApplyingRemotePrice = false; }
                             // the periodic PriceList broadcast echoes this to every client
                         }
