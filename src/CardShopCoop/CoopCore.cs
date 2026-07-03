@@ -936,23 +936,59 @@ namespace CardShopCoop
             return -1;
         }
 
-        private void ApplyLicenseUnlock(int itemType, bool isBig, string name)
+        private bool ApplyLicenseUnlock(int itemType, bool isBig, string name)
         {
             int idx = ResolveRestockIndex(itemType, isBig, name, out _);
             if (idx < 0)
             {
                 CoopPlugin.Log.LogWarning($"license unlock: no local product for type {itemType} big={isBig} '{name}'");
-                return;
+                return false;
             }
-            if (CPlayerData.GetIsItemLicenseUnlocked(idx)) return;
+            if (CPlayerData.GetIsItemLicenseUnlocked(idx)) return true; // already ours
             Patches.GamePatches.ApplyingRemoteLicense = true;
             try
             {
                 CPlayerData.SetUnlockItemLicense(idx);
+                // the vanilla purchase's non-UI side effects: achievements, the global
+                // flag, and the TUTORIAL TASK credit - without the last one the host's
+                // "Unlock Basic Card Box" task never cleared when the joiner bought it
                 try { AchievementManager.OnItemLicenseUnlocked((EItemType)itemType); } catch { }
+                try { GameInstance.m_IsItemLicenseUnlocked = true; } catch { }
+                try
+                {
+                    if ((EItemType)itemType == EItemType.BasicCardBox)
+                        TutorialManager.AddTaskValue(ETutorialTaskCondition.UnlockBasicCardBox, 1f);
+                }
+                catch { }
             }
             finally { Patches.GamePatches.ApplyingRemoteLicense = false; }
+            RefreshLicensePanels();
             CoopPlugin.Log.LogInfo($"license unlocked by partner: {(EItemType)itemType} big={isBig}");
+            return true;
+        }
+
+        private static readonly FieldInfo FiPanelIndex = HarmonyLib.AccessTools.Field(typeof(RestockItemPanelUI), "m_Index");
+        private static readonly FieldInfo FiPanelLicGrp = HarmonyLib.AccessTools.Field(typeof(RestockItemPanelUI), "m_LicenseUIGrp");
+        private static readonly FieldInfo FiPanelUIGrp = HarmonyLib.AccessTools.Field(typeof(RestockItemPanelUI), "m_UIGrp");
+
+        /// <summary>A phone shop that's OPEN while a partner's license lands keeps showing
+        /// the locked panel until reopened - flip freshly-unlocked panels the way the
+        /// vanilla purchase button does. Runs only on license events (rare).</summary>
+        private static void RefreshLicensePanels()
+        {
+            try
+            {
+                var panels = FindObjectsOfType<RestockItemPanelUI>(); // active = phone open
+                foreach (var p in panels)
+                {
+                    if (!(FiPanelIndex?.GetValue(p) is int idx)) continue;
+                    if (idx < 0 || idx >= CPlayerData.m_IsItemLicenseUnlocked.Count
+                        || !CPlayerData.GetIsItemLicenseUnlocked(idx)) continue;
+                    (FiPanelLicGrp?.GetValue(p) as GameObject)?.SetActive(false);
+                    (FiPanelUIGrp?.GetValue(p) as GameObject)?.SetActive(true);
+                }
+            }
+            catch { }
         }
 
         // ---- product catalog diagnosis: content DATA packs (PTCGO expansions) are
@@ -2200,10 +2236,20 @@ namespace CardShopCoop
                         int itemType = br.ReadInt32();
                         bool isBig = br.ReadBoolean();
                         string rdName = br.ReadString();
-                        ApplyLicenseUnlock(itemType, isBig, rdName);
-                        if (Role == CoopRole.Host) // echo to the other clients
-                            Broadcast(MsgType.LicenseUnlock, bw =>
-                            { bw.Write(itemType); bw.Write(isBig); bw.Write(rdName); });
+                        bool ok = ApplyLicenseUnlock(itemType, isBig, rdName);
+                        if (Role == CoopRole.Host)
+                        {
+                            if (ok) // echo to the other clients + confirm to the buyer
+                            {
+                                Broadcast(MsgType.LicenseUnlock, bw =>
+                                { bw.Write(itemType); bw.Write(isBig); bw.Write(rdName); });
+                                Send(msg.ConnId, MsgType.Toast, bw =>
+                                    bw.Write($"license unlocked for everyone: {rdName}"));
+                            }
+                            else
+                                Send(msg.ConnId, MsgType.Toast, bw =>
+                                    bw.Write($"'{rdName}' license couldn't unlock on the host (product missing) - match your content packs"));
+                        }
                     }
                     break;
                 }
@@ -2230,6 +2276,7 @@ namespace CardShopCoop
                             CPlayerData.m_IsScannerRestockUnlocked |= scanner;
                             var rl = CSingleton<InventoryBase>.Instance.m_StockItemData_SO.m_RestockDataList;
                             var flags = CPlayerData.m_IsItemLicenseUnlocked;
+                            bool anyUnlocked = false;
                             for (int i = 0; i < rl.Count && i < flags.Count; i++)
                             {
                                 if (rl[i] == null) continue;
@@ -2240,6 +2287,13 @@ namespace CardShopCoop
                                     Patches.GamePatches.ApplyingRemoteLicense = true;
                                     try { CPlayerData.SetUnlockItemLicense(i); }
                                     finally { Patches.GamePatches.ApplyingRemoteLicense = false; }
+                                    anyUnlocked = true;
+                                    try
+                                    {
+                                        if (rl[i].itemType == EItemType.BasicCardBox)
+                                            TutorialManager.AddTaskValue(ETutorialTaskCondition.UnlockBasicCardBox, 1f);
+                                    }
+                                    catch { }
                                 }
                                 else if (!should && flags[i] && i != 0 && allowLock)
                                 {
@@ -2247,6 +2301,11 @@ namespace CardShopCoop
                                     // between machines): host truth says locked
                                     flags[i] = false;
                                 }
+                            }
+                            if (anyUnlocked)
+                            {
+                                try { GameInstance.m_IsItemLicenseUnlocked = true; } catch { }
+                                RefreshLicensePanels();
                             }
                         });
                     }
