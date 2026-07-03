@@ -35,6 +35,7 @@ namespace CardShopCoop
         private readonly WorldSync _world = new WorldSync();
         private readonly NpcSync _npcs = new NpcSync();
         private readonly CardShelfSync _cardShelves = new CardShelfSync();
+        private readonly ObjMoveSync _objMoves = new ObjMoveSync();
         private readonly Sync.RegisterMirror _registerMirror = new Sync.RegisterMirror();
         private float _npcSweepTimer;
         private float _regStateTimer;
@@ -118,6 +119,13 @@ namespace CardShopCoop
                     Broadcast(MsgType.CardShelfDelta, bw => CardShelfSync.WriteEntries(bw, changes));
                 else if (Role == CoopRole.Client)
                     Send(1, MsgType.CardShelfRequest, bw => CardShelfSync.WriteEntries(bw, changes));
+            };
+            _objMoves.OnLocalChanges = changes =>
+            {
+                if (Role == CoopRole.Host)
+                    Broadcast(MsgType.ObjMoveDelta, bw => ObjMoveSync.WriteEntries(bw, changes));
+                else if (Role == CoopRole.Client)
+                    Send(1, MsgType.ObjMoveRequest, bw => ObjMoveSync.WriteEntries(bw, changes));
             };
             SceneManager.sceneLoaded += OnSceneLoaded;
 
@@ -301,6 +309,7 @@ namespace CardShopCoop
             _world.Reset();
             _npcs.Reset();
             _cardShelves.Reset();
+            _objMoves.Reset();
             _registerMirror.Reset();
             PromptLine = "";
             _lightManager = null;
@@ -526,6 +535,7 @@ namespace CardShopCoop
             _world.Reset();
             _npcs.Reset();
             _cardShelves.Reset();
+            _objMoves.Reset();
             _registerMirror.Reset();
             PromptLine = "";
             _steamLobby.Leave();
@@ -683,6 +693,7 @@ namespace CardShopCoop
             bool syncActive = Role != CoopRole.None && _net.ConnectionCount > 0 && InGameLevel();
             Guarded("world", () => _world.Tick(dt, syncActive));
             Guarded("cardshelves", () => _cardShelves.Tick(dt, syncActive));
+            Guarded("objmoves", () => _objMoves.Tick(dt, syncActive));
 
             if (Role == CoopRole.Client)
             {
@@ -1374,6 +1385,20 @@ namespace CardShopCoop
                     if (Role != CoopRole.Host || !InGameLevel()) break;
                     using (var br = Msg.Reader(msg.Payload))
                         _cardShelves.ApplyRemote(CardShelfSync.ReadEntries(br));
+                    break;
+                }
+                case MsgType.ObjMoveDelta:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                        _objMoves.ApplyRemote(ObjMoveSync.ReadEntries(br));
+                    break;
+                }
+                case MsgType.ObjMoveRequest:
+                {
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                        _objMoves.ApplyRemote(ObjMoveSync.ReadEntries(br));
                     break;
                 }
                 case MsgType.CardPriceSet:

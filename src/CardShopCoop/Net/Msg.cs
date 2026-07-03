@@ -36,6 +36,8 @@ namespace CardShopCoop.Net
         Roster = 29,           // host -> clients: connId->name table for relayed peers
         RelayState = 30,       // host -> clients: another client's PlayerState [senderId + state]
         RelayTag = 31,         // host -> clients: another client's emote/activity [senderId + kind]
+        ObjMoveDelta = 32,     // host -> client: authoritative placed-object transforms
+        ObjMoveRequest = 33,   // client -> host: joiner moved a shelf/counter/decoration
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>
