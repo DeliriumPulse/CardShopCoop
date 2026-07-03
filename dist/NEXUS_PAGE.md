@@ -66,7 +66,7 @@ If your modded card database differs from the host's, the mod syncs it automatic
 [/list]
 
 [size=4][b]Source[/b][/size]
-MIT-licensed source on GitHub: [i](add repo link here)[/i]
+MIT-licensed source on GitHub: [url=https://github.com/DeliriumPulse/CardShopCoop]DeliriumPulse/CardShopCoop[/url]
 
 ## Permissions (Nexus form suggestions)
 - Others can convert/modify with credit: yes
