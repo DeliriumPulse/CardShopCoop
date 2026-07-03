@@ -1,5 +1,7 @@
 # CardShopCoop
 
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20shop-2ec484)](https://discord.gg/eNswvvTYbQ)
+
 **True co-op multiplayer for TCG Card Shop Simulator.** Run the shop together — shared
 money, XP, collection, and customers — over Steam (invites or a public lobby browser)
 or LAN. Built mod-first: it syncs by game IDs and plays nice with the PTCGO / Enhanced
