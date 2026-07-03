@@ -39,6 +39,8 @@ namespace CardShopCoop.Sync
             AccessTools.Method(typeof(InteractableOpenCloseSign), "EvaluateSignOpenCloseMesh");
         private static readonly System.Reflection.MethodInfo MiWarehouseSignMesh =
             AccessTools.Method(typeof(InteractableWarehouseAllowEnterSign), "EvaluateSignOpenCloseMesh");
+        private static readonly System.Reflection.MethodInfo MiRoomInit =
+            AccessTools.Method(typeof(UnlockRoomManager), "Init"); // idempotent wall/door repaint
 
         public Action<Action<BinaryWriter>> SendOp;         // set by CoopCore: client -> host
         public Action<Action<BinaryWriter>> BroadcastState; // set by CoopCore: host -> clients
@@ -46,6 +48,7 @@ namespace CardShopCoop.Sync
         private float _timer;
         private int _lastHash;
         private float _heal;
+        private double _lastRoomRepaint;
         private RentBillScreen _billScreen;                        // phone screen, often inactive
         private InteractableOpenCloseSign _openSign;               // world object by the door
         private InteractableWarehouseAllowEnterSign _warehouseSign;
@@ -410,12 +413,29 @@ namespace CardShopCoop.Sync
             var urm = CSingleton<UnlockRoomManager>.Instance;
             if (urm != null)
             {
+                bool unlocksChanged = (wantShopB && !CPlayerData.m_IsWarehouseRoomUnlocked)
+                    || CPlayerData.m_UnlockRoomCount < wantRooms
+                    || CPlayerData.m_UnlockWarehouseRoomCount < wantWarehouseRooms;
                 if (wantShopB && !CPlayerData.m_IsWarehouseRoomUnlocked)
                     urm.SetUnlockWarehouseRoom(isUnlocked: true);
                 for (int guard = 0; CPlayerData.m_UnlockRoomCount < wantRooms && guard < 64; guard++)
                     urm.StartUnlockNextRoom();
                 for (int guard = 0; CPlayerData.m_UnlockWarehouseRoomCount < wantWarehouseRooms && guard < 64; guard++)
                     urm.StartUnlockNextWarehouseRoom();
+                // wall repaint heal: the incremental unlocks above animate wall pieces
+                // away, and an interrupted animation (or state applied while the scene
+                // was still streaming) leaves a wall MISSING with nothing to repair it
+                // (field screenshot: street visible through the shop front). The game's
+                // own load-time Init() is an idempotent full repaint of every blocker,
+                // glass door, and Shop-B hide/show list from the CPlayerData counts -
+                // re-run it after any unlock change, and at most once a minute otherwise
+                double nowT = Time.realtimeSinceStartupAsDouble;
+                if (unlocksChanged || nowT - _lastRoomRepaint > 60.0)
+                {
+                    _lastRoomRepaint = nowT;
+                    try { MiRoomInit?.Invoke(urm, null); }
+                    catch (Exception e) { CoopPlugin.Log.LogWarning("room repaint: " + e.Message); }
+                }
             }
 
             // signs: set the booleans the (suppressed) local sim would have written and

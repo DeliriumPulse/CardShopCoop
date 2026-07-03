@@ -130,6 +130,7 @@ namespace CardShopCoop
         private double _lastLicenseBuyTime = -999.0;
         private string _lastLightJson;
         private float _lightHeal;
+        private double _lastDayMirrorAt = -999.0;
         private int _lastLicenseHash;
         private float _licenseHeal;
 
@@ -2082,6 +2083,7 @@ namespace CardShopCoop
                                     // 08:00 clock, morning music) and let exactly one
                                     // OnDayStarted through so the HUD/day label refresh.
                                     Patches.GamePatches.AllowNextDayStarted = true;
+                                    _lastDayMirrorAt = Time.realtimeSinceStartupAsDouble;
                                     _lightManager.StartCoroutine(
                                         (System.Collections.IEnumerator)MiDayReset.Invoke(_lightManager, null));
                                     CoopPlugin.Log.LogInfo($"Mirroring host day change -> Day {day}");
@@ -2607,6 +2609,13 @@ namespace CardShopCoop
                             int localHour = FiTimeHour?.GetValue(_lightManager) is int h ? h : -1;
                             int localMin = FiTimeMin?.GetValue(_lightManager) is int m2 ? m2 : 0;
                             int driftMin = Math.Abs((data.m_TimeHour * 60 + data.m_TimeMin) - (localHour * 60 + localMin));
+                            // a day ROLLOVER is not drift: the host's clock wrapped to
+                            // morning before our day mirror ran. Racing an Init against
+                            // the mirror's DelayUpdateEnv coroutine stomped the env
+                            // updater and froze the sky in daylight (field screenshot:
+                            // "phase 4->0, drift 780min" two seconds before the mirror)
+                            if (driftMin > 600) break;
+                            if (Time.realtimeSinceStartupAsDouble - _lastDayMirrorAt < 10.0) break;
                             // re-run the game's own lighting restore only when the sky
                             // phase actually differs (avoids music/blend churn)
                             if (localIdx != data.m_TImeOfDayIndex || driftMin > 4)
