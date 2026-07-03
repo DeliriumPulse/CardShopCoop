@@ -34,11 +34,16 @@ namespace CardShopCoop.Sync
 
         private static readonly System.Reflection.MethodInfo MiSetOpenClose =
             AccessTools.Method(typeof(InteractablePackagingBox_Item), "SetOpenCloseBox");
+        private static readonly System.Reflection.FieldInfo FiAmountToSpawn =
+            AccessTools.Field(typeof(InteractablePackagingBox_Item), "m_ItemAmountToSpawn");
+        private static readonly System.Reflection.FieldInfo FiStoredList =
+            AccessTools.Field(typeof(ShelfCompartment), "m_StoredItemList");
 
         private readonly List<Entry> _lastApplied = new List<Entry>(); // client: host truth
         private readonly HashSet<int> _carriedLastTick = new HashSet<int>();
         private readonly HashSet<int> _remoteCarried = new HashSet<int>();   // host: client-held boxes
         private readonly Dictionary<int, double> _recentlyReleased = new Dictionary<int, double>(); // client: ignore stale carried echoes
+        private readonly Dictionary<int, double> _locallyTouched = new Dictionary<int, double>();   // client: my recent edits beat stale echoes
         private float _timer;
         private RestockManager _rm;
 
@@ -51,6 +56,7 @@ namespace CardShopCoop.Sync
             _carriedLastTick.Clear();
             _remoteCarried.Clear();
             _recentlyReleased.Clear();
+            _locallyTouched.Clear();
             _timer = 0f;
             _rm = null;
         }
@@ -167,9 +173,13 @@ namespace CardShopCoop.Sync
                 // a box in MY hands is mine until I put it down; a box in the HOST's
                 // hands has a transient position we don't copy
                 if (IsLocallyCarried(box)) continue;
+                double now = Time.realtimeSinceStartupAsDouble;
                 // a stale "carried" echo about a box I JUST released must not hide it
-                if (want.Carried && _recentlyReleased.TryGetValue(i, out double t)
-                    && Time.realtimeSinceStartupAsDouble - t < 6.0)
+                if (want.Carried && _recentlyReleased.TryGetValue(i, out double t) && now - t < 6.0)
+                    continue;
+                // my own recent edits (took an item, kicked it) win over stale echoes;
+                // my report reaches the host and the next echo agrees
+                if (_locallyTouched.TryGetValue(i, out double touched) && now - touched < 6.0)
                     continue;
                 ApplyToBox(box, want, applyPosition: !want.Carried);
             }
@@ -210,7 +220,11 @@ namespace CardShopCoop.Sync
                             _recentlyReleased[i] = Time.realtimeSinceStartupAsDouble;
                         }
                         var now = Snapshot(boxes[i]);
-                        if (Differs(now, _lastApplied[i])) changed = true;
+                        if (Differs(now, _lastApplied[i]))
+                        {
+                            changed = true;
+                            _locallyTouched[i] = Time.realtimeSinceStartupAsDouble;
+                        }
                         list.Add(now);
                     }
                     else
@@ -251,32 +265,40 @@ namespace CardShopCoop.Sync
                     try { box.m_ItemCompartment.SetPriceTagVisibility(true); } catch { }
                 }
 
+                // open/close FIRST: content semantics depend on the resulting state
+                if (box.IsBoxOpened() != want.IsOpen && MiSetOpenClose != null)
+                {
+                    try { MiSetOpenClose.Invoke(box, null); } catch { }
+                }
+
                 var comp = box.m_ItemCompartment;
                 int cur = comp.GetItemCount();
                 if (cur != want.Count)
                 {
-                    if (box.IsBoxOpened() && want.Count > cur)
+                    if (box.IsBoxOpened())
                     {
-                        comp.SpawnItem(want.Count, spawnFromFront: true); // loader semantics: sets count
-                    }
-                    else if (box.IsBoxOpened() && want.Count < cur)
-                    {
-                        for (int k = 0; k < cur - want.Count; k++)
+                        // atomic clear-and-rebuild: SpawnItem is a LOADER (sets the count
+                        // and appends fresh items), so incremental use duplicates objects
+                        if (FiStoredList?.GetValue(comp) is List<Item> stored && stored.Count > 0)
                         {
-                            var item = comp.GetLastItem();
-                            if (item == null) break;
-                            comp.RemoveItem(item);
-                            ItemSpawnManager.DisableItem(item);
+                            foreach (var it in new List<Item>(stored))
+                            {
+                                if (it == null) continue;
+                                comp.RemoveItem(it);
+                                ItemSpawnManager.DisableItem(it);
+                            }
+                            stored.Clear();
                         }
+                        if (want.Count > 0) comp.SpawnItem(want.Count, spawnFromFront: true);
+                        else comp.PreSpawnItemUpdate(0);
                     }
                     else
                     {
-                        comp.PreSpawnItemUpdate(want.Count); // closed box: lazy count only
+                        // closed box: items are LAZY - the visible count and the amount
+                        // spawned on first open must both track the synced count
+                        comp.PreSpawnItemUpdate(want.Count);
+                        FiAmountToSpawn?.SetValue(box, want.Count);
                     }
-                }
-                if (box.IsBoxOpened() != want.IsOpen && MiSetOpenClose != null)
-                {
-                    try { MiSetOpenClose.Invoke(box, null); } catch { }
                 }
                 if (applyPosition)
                 {
