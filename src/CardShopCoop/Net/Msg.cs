@@ -65,6 +65,8 @@ namespace CardShopCoop.Net
         TradeOp = 58,          // client -> host: joiner accepts/declines a counter trade/sell-in
         TradeState = 59,       // host -> client: live trade/sell-in offer at a counter
         TableState = 60,       // host -> client: play-table card layout digest (visuals)
+        CardBoxOp = 61,        // client -> host: joiner collects/moves a graded-returns card box
+        CardBoxState = 62,     // host -> client: card packaging box population (graded returns)
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>

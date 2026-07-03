@@ -51,6 +51,7 @@ namespace CardShopCoop
         private readonly ReportSync _report = new ReportSync();
         private readonly ContainerSync _containers = new ContainerSync();
         private readonly TournamentSync _tournament = new TournamentSync();
+        private readonly CardBoxSync _cardBoxes = new CardBoxSync();
         private string _lastShopNameSent;
         private float _shopNameTimer = -1.0f; // staggered phase (see _lightSyncTimer note)
         private readonly Sync.RegisterMirror _registerMirror = new Sync.RegisterMirror();
@@ -140,7 +141,7 @@ namespace CardShopCoop
         private CustomerManager _cmSweep;
         private bool _renamerHandled;
         private int _heldBoxFrame = -1;
-        private object _heldBoxA, _heldBoxB;
+        private object _heldBoxA, _heldBoxB, _heldBoxC;
         private readonly System.Collections.Generic.List<InMsg> _dispatchBuf
             = new System.Collections.Generic.List<InMsg>(64);
         private readonly System.Collections.Generic.HashSet<long> _dispatchSeen
@@ -189,8 +190,27 @@ namespace CardShopCoop
                         _heldBoxFrame = Time.frameCount;
                         _heldBoxA = FiHoldItemBox?.GetValue(_playerIpc);
                         _heldBoxB = FiHoldBox?.GetValue(_playerIpc);
+                        _heldBoxC = FiHoldBoxCard?.GetValue(_playerIpc);
                     }
                     return ReferenceEquals(_heldBoxA, box) || ReferenceEquals(_heldBoxB, box);
+                }
+                catch { return false; }
+            };
+            CardBoxSync.IsLocallyCarried = box =>
+            {
+                if (_playerIpc == null || box == null) return false;
+                try
+                {
+                    // card boxes land in BOTH the generic hold field and the card-box
+                    // field (OnEnterHoldBoxMode); reuse the per-frame cached reads
+                    if (_heldBoxFrame != Time.frameCount)
+                    {
+                        _heldBoxFrame = Time.frameCount;
+                        _heldBoxA = FiHoldItemBox?.GetValue(_playerIpc);
+                        _heldBoxB = FiHoldBox?.GetValue(_playerIpc);
+                        _heldBoxC = FiHoldBoxCard?.GetValue(_playerIpc);
+                    }
+                    return ReferenceEquals(_heldBoxC, box) || ReferenceEquals(_heldBoxB, box);
                 }
                 catch { return false; }
             };
@@ -247,6 +267,8 @@ namespace CardShopCoop
             _containers.SendOp = w => Send(1, MsgType.ContainerOp, w);
             _containers.BroadcastState = w => Broadcast(MsgType.ContainerState, w);
             _tournament.BroadcastState = w => Broadcast(MsgType.TournamentState, w);
+            _cardBoxes.SendOp = w => Send(1, MsgType.CardBoxOp, w);
+            _cardBoxes.BroadcastState = w => Broadcast(MsgType.CardBoxState, w);
             _actModules = ModulesTick;
             SceneManager.sceneLoaded += OnSceneLoaded;
 
@@ -502,10 +524,12 @@ namespace CardShopCoop
                 _report.HostTick(_dt, inGame); // per-frame: its report-open flag fires outside the timer
                 _containers.HostTick(_dt, inGame);
                 _tournament.HostTick(_dt, inGame);
+                _cardBoxes.HostTick(_dt, inGame);
             }
             else if (Role == CoopRole.Client)
             {
                 _trades.ClientTick(_dt, inGame); // offer countdown + accept/decline keys
+                _cardBoxes.ClientTick(_dt, inGame); // carried transitions + box moves
             }
         }
 
@@ -521,6 +545,7 @@ namespace CardShopCoop
             _report.Reset();
             _containers.Reset();
             _tournament.Reset();
+            _cardBoxes.Reset();
         }
 
         private void ModulesForceResend()
@@ -535,6 +560,7 @@ namespace CardShopCoop
             _report.ForceResend();
             _containers.ForceResend();
             _tournament.ForceResend();
+            _cardBoxes.ForceResend();
         }
 
         private void RegisterMirrorTick()
@@ -2079,6 +2105,18 @@ namespace CardShopCoop
                 {
                     if (Role != CoopRole.Client || !InGameLevel()) break;
                     using (var br = Msg.Reader(msg.Payload)) _tournament.ClientApplyState(br);
+                    break;
+                }
+                case MsgType.CardBoxOp:
+                {
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _cardBoxes.HostApplyOp(br);
+                    break;
+                }
+                case MsgType.CardBoxState:
+                {
+                    if (Role != CoopRole.Client || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload)) _cardBoxes.ClientApplyState(br);
                     break;
                 }
                 case MsgType.GradingOp:
