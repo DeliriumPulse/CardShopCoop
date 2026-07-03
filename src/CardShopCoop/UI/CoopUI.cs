@@ -95,7 +95,8 @@ namespace CardShopCoop.UI
                 if (_bigStyle == null)
                     _bigStyle = new GUIStyle(GUI.skin.label)
                     {
-                        alignment = TextAnchor.MiddleCenter, richText = true, fontStyle = FontStyle.Bold
+                        alignment = TextAnchor.UpperCenter, richText = true, fontStyle = FontStyle.Bold,
+                        wordWrap = true // refund/catalog toasts run long; clipped text reads as a bug
                     };
                 if (core.PromptLine.Length > 0)
                 {
@@ -114,7 +115,7 @@ namespace CardShopCoop.UI
                         _registerSeen = core.RegisterLine;
                         _registerText = $"<size=18><color=#8ef58a>{core.RegisterLine}</color></size>";
                     }
-                    GUI.Label(new Rect(Screen.width / 2f - 300f, Screen.height * 0.63f, 600f, 30f),
+                    GUI.Label(new Rect(Screen.width / 2f - 350f, Screen.height * 0.63f, 700f, 90f),
                         _registerText, _bigStyle);
                 }
             }
