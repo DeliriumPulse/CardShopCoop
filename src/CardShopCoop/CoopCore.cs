@@ -613,10 +613,13 @@ namespace CardShopCoop
         {
             try
             {
-                var list = Inv().m_StockItemData_SO.m_RestockDataList;
+                int total = CatalogCount(); // vanilla + EPL virtual entries
                 int h = 17;
-                foreach (var rd in list)
+                for (int i = 0; i < total; i++)
+                {
+                    var rd = CatalogAt(i);
                     if (rd != null) h = h * 31 + (((int)rd.itemType << 1) | (rd.isBigBox ? 1 : 0));
+                }
                 return h;
             }
             catch { return 0; }
@@ -987,6 +990,61 @@ namespace CardShopCoop
                 Send(1, MsgType.LicenseUnlock, bw => { bw.Write(itemType); bw.Write(isBig); bw.Write(rdName); });
         }
 
+        // ---- EPL virtual catalog bridge ----
+        // EPL never ADDS modded products to m_RestockDataList: it INTERCEPTS the
+        // game's list accesses (count/indexing) and serves the extra entries from
+        // its own ItemLibrary. Direct list reads from THIS assembly see only the
+        // ~135 vanilla rows - which is why hosts "didn't have" products sitting on
+        // their own shelves, catalogs compared "identical (135)", and modded
+        // license heals missed. Every catalog walk must span rawCount + EPL's
+        // entries and read rows through the game's INTERCEPTED GetRestockData
+        // (calling a game method executes its rewritten body - field-proven by
+        // ForwardOrder reading modded identities on the client).
+        private static bool _eplProbed;
+        private static System.Reflection.PropertyInfo _eplAssetsProp, _eplItemLibProp, _eplRestockProp;
+
+        private static int EplExtraCount()
+        {
+            try
+            {
+                if (!_eplProbed)
+                {
+                    _eplProbed = true;
+                    var t = HarmonyLib.AccessTools.TypeByName("EnhancedPrefabLoader.Core.EplRuntimeData");
+                    const BindingFlags F = BindingFlags.Static | BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
+                    _eplAssetsProp = t?.GetProperty("Assets", F);
+                    var assets = _eplAssetsProp?.GetValue(null);
+                    _eplItemLibProp = assets?.GetType().GetProperty("ItemLibrary", F);
+                    var lib = assets == null ? null : _eplItemLibProp?.GetValue(assets);
+                    _eplRestockProp = lib?.GetType().GetProperty("RestockEntries", F);
+                    CoopPlugin.Log.LogInfo(_eplRestockProp != null
+                        ? "EPL catalog bridge active (virtual restock entries visible)"
+                        : "EPL catalog bridge inactive (EPL absent or its internals changed) - vanilla catalog only");
+                }
+                var a = _eplAssetsProp?.GetValue(null);
+                var l = a == null ? null : _eplItemLibProp?.GetValue(a);
+                return (l == null ? null : _eplRestockProp?.GetValue(l) as System.Collections.ICollection)?.Count ?? 0;
+            }
+            catch { return 0; }
+        }
+
+        /// <summary>Full catalog size as the GAME sees it: raw vanilla rows plus EPL's
+        /// intercepted virtual entries.</summary>
+        private static int CatalogCount()
+        {
+            int raw = 0;
+            try { raw = Inv().m_StockItemData_SO.m_RestockDataList.Count; } catch { }
+            return raw + EplExtraCount();
+        }
+
+        /// <summary>Catalog row through the game's intercepted accessor (valid for
+        /// vanilla AND virtual indexes); null when out of range or unresolvable.</summary>
+        private static RestockData CatalogAt(int i)
+        {
+            try { return InventoryBase.GetRestockData(i); }
+            catch { return null; }
+        }
+
         /// <summary>Find OUR restock entry for a partner's (itemType, boxSize) identity.
         /// Tiered: exact -> name+size -> same product any size -> name any size. Content
         /// DATA packs are invisible to the plugin-parity hash, so catalogs CAN differ
@@ -996,22 +1054,34 @@ namespace CardShopCoop
             sizeDiffers = false;
             try
             {
-                var list = Inv().m_StockItemData_SO.m_RestockDataList;
-                for (int i = 0; i < list.Count; i++)
-                    if (list[i] != null && (int)list[i].itemType == itemType && list[i].isBigBox == isBig)
+                int n = CatalogCount();
+                for (int i = 0; i < n; i++)
+                {
+                    var rd = CatalogAt(i);
+                    if (rd != null && (int)rd.itemType == itemType && rd.isBigBox == isBig)
                         return i;
+                }
                 if (!string.IsNullOrEmpty(name))
-                    for (int i = 0; i < list.Count; i++)
-                        if (list[i] != null && list[i].name == name && list[i].isBigBox == isBig)
+                    for (int i = 0; i < n; i++)
+                    {
+                        var rd = CatalogAt(i);
+                        if (rd != null && rd.name == name && rd.isBigBox == isBig)
                             return i;
+                    }
                 sizeDiffers = true;
-                for (int i = 0; i < list.Count; i++)
-                    if (list[i] != null && (int)list[i].itemType == itemType)
+                for (int i = 0; i < n; i++)
+                {
+                    var rd = CatalogAt(i);
+                    if (rd != null && (int)rd.itemType == itemType)
                         return i;
+                }
                 if (!string.IsNullOrEmpty(name))
-                    for (int i = 0; i < list.Count; i++)
-                        if (list[i] != null && list[i].name == name)
+                    for (int i = 0; i < n; i++)
+                    {
+                        var rd = CatalogAt(i);
+                        if (rd != null && rd.name == name)
                             return i;
+                    }
             }
             catch { }
             return -1;
@@ -1062,9 +1132,12 @@ namespace CardShopCoop
                 var panels = FindObjectsOfType<RestockItemPanelUI>(); // active = phone open
                 foreach (var p in panels)
                 {
-                    if (!(FiPanelIndex?.GetValue(p) is int idx)) continue;
-                    if (idx < 0 || idx >= CPlayerData.m_IsItemLicenseUnlocked.Count
-                        || !CPlayerData.GetIsItemLicenseUnlocked(idx)) continue;
+                    if (!(FiPanelIndex?.GetValue(p) is int idx) || idx < 0) continue;
+                    // no raw-list bounds check: modded panels carry VIRTUAL indexes
+                    // beyond the raw flag list; the game's accessor handles them
+                    bool on = false;
+                    try { on = CPlayerData.GetIsItemLicenseUnlocked(idx); } catch { }
+                    if (!on) continue;
                     (FiPanelLicGrp?.GetValue(p) as GameObject)?.SetActive(false);
                     (FiPanelUIGrp?.GetValue(p) as GameObject)?.SetActive(true);
                 }
@@ -1089,11 +1162,15 @@ namespace CardShopCoop
         {
             try
             {
-                var list = Inv().m_StockItemData_SO.m_RestockDataList;
-                var entries = new List<RestockData>(list.Count);
+                int total = CatalogCount(); // vanilla + EPL virtual entries
+                var entries = new List<RestockData>(total);
                 // blank-name entries are mod UI placeholders (Collection Tracker's
                 // restock-shop replacement adds two) - not orderable, not comparable
-                foreach (var rd in list) if (rd != null && !string.IsNullOrEmpty(rd.name)) entries.Add(rd);
+                for (int i = 0; i < total; i++)
+                {
+                    var rd = CatalogAt(i);
+                    if (rd != null && !string.IsNullOrEmpty(rd.name)) entries.Add(rd);
+                }
                 Send(1, MsgType.CatalogDigest, bw =>
                 {
                     int cnt = Mathf.Min(entries.Count, ushort.MaxValue);
@@ -1120,13 +1197,13 @@ namespace CardShopCoop
                 int nameHash = br.ReadInt32();
                 joiner.Add(CatalogKey(t, big, nameHash));
             }
-            var inv = Inv();
-            if (inv == null) return; // no live world to compare against; the next digest retries
-            var list = inv.m_StockItemData_SO.m_RestockDataList;
+            if (Inv() == null) return; // no live world to compare against; the next digest retries
+            int total = CatalogCount(); // vanilla + EPL virtual entries
             int hostOnly = 0, shared = 0;
             var examples = new List<string>();
-            foreach (var rd in list)
+            for (int i = 0; i < total; i++)
             {
+                var rd = CatalogAt(i);
                 if (rd == null || string.IsNullOrEmpty(rd.name)) continue; // placeholder rows, see SendCatalogDigest
                 if (joiner.Contains(CatalogKey((int)rd.itemType, rd.isBigBox, Fnv(rd.name))))
                 {
@@ -1167,11 +1244,11 @@ namespace CardShopCoop
             {
                 if (string.IsNullOrEmpty(name)) return;
                 string probe = name.Split(' ')[0];
-                var list = Inv().m_StockItemData_SO.m_RestockDataList;
+                int total = CatalogCount(); // vanilla + EPL virtual entries
                 var found = new List<string>();
-                foreach (var rd in list)
+                for (int i = 0; i < total && found.Count < 8; i++)
                 {
-                    if (found.Count >= 8) break;
+                    var rd = CatalogAt(i);
                     if (rd?.name != null && rd.name.IndexOf(probe, StringComparison.OrdinalIgnoreCase) >= 0)
                         found.Add($"{rd.name} (type {(int)rd.itemType}, big={rd.isBigBox})");
                 }
@@ -1736,11 +1813,20 @@ namespace CardShopCoop
                 _licenseSyncTimer -= 10f;
                 try
                 {
-                    var rl = Inv().m_StockItemData_SO.m_RestockDataList;
-                    var flags = CPlayerData.m_IsItemLicenseUnlocked;
+                    // full virtual catalog + the game's INTERCEPTED flag accessor:
+                    // raw list/flag reads are vanilla-length only, so modded license
+                    // unlocks were invisible to this heal (the Hololive/Fossil
+                    // "no local product" reports)
+                    int total = CatalogCount();
                     var unlocked = new List<RestockData>();
-                    for (int i = 0; i < rl.Count && i < flags.Count; i++)
-                        if (flags[i] && rl[i] != null) unlocked.Add(rl[i]);
+                    for (int i = 0; i < total; i++)
+                    {
+                        bool on = false;
+                        try { on = CPlayerData.GetIsItemLicenseUnlocked(i); } catch { }
+                        if (!on) continue;
+                        var rd = CatalogAt(i);
+                        if (rd != null) unlocked.Add(rd);
+                    }
                     bool scanner = CPlayerData.m_IsScannerRestockUnlocked;
                     // licenses change a few times per session: broadcast on change, plus
                     // a slow heal so a client that missed one still converges
@@ -2350,26 +2436,19 @@ namespace CardShopCoop
                             // the money is already in the shared wallet (the charge fired
                             // before the spawn call we intercept) - give it back loudly
                             int hostCatalog = 0;
-                            try { hostCatalog = Inv().m_StockItemData_SO.m_RestockDataList.Count; } catch { }
+                            try { hostCatalog = CatalogCount(); } catch { }
                             CoopPlugin.Log.LogWarning($"{who} ordered unknown product type {itemType} '{rdName}' - refunding {cost:F0} (host catalog: {hostCatalog} products)");
                             LogCatalogCandidates(rdName);
                             if (cost > 0f && cost < 100000f)
                                 CEventManager.QueueEvent(new CEventPlayer_AddCoin(cost));
-                            // vanilla ships ~133 products: a bare catalog means the host's
-                            // content mods haven't registered products FOR THIS SAVE (they
-                            // register per save, on their own progression triggers), not a
-                            // missing-pack problem. Only blame the tutorial when the save
-                            // is actually young - a Day-17 host got told to "play past the
-                            // tutorial" (field report)
-                            int hostDay = 0;
-                            try { hostDay = CPlayerData.m_CurrentDay; } catch { }
-                            string reason;
-                            if (hostCatalog > 140)
-                                reason = "match your content packs to order it";
-                            else if (hostDay <= 2)
-                                reason = "the host's modded products haven't loaded yet (new save still in the tutorial) - play past the host's tutorial and rejoin";
-                            else
-                                reason = "the mod's products aren't registered in the HOST's save yet - if the host can order it from their own phone shop, have them order it once; guests can order it after that";
+                            // the resolver now spans the full EPL virtual catalog, so a
+                            // miss with a big catalog is a genuine pack difference; a
+                            // vanilla-sized catalog means the host's EPL entries aren't
+                            // visible (bundles still loading right after boot, or the
+                            // EPL bridge is inactive - the host's log says which)
+                            string reason = hostCatalog > 140
+                                ? "the host's content packs don't include this product - match your pack files"
+                                : "the host's modded catalog hasn't finished loading (or EPL is missing on the host) - wait a minute and try again, and check the host's BepInEx log";
                             Send(msg.ConnId, MsgType.Toast, bw => bw.Write(
                                 $"'{rdName}' isn't in the host's catalog - refunded ${cost:F0}. Note: {reason}"));
                         }

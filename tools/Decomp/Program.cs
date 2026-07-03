@@ -1,4 +1,5 @@
 using ICSharpCode.Decompiler;
+using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.CSharp.ProjectDecompiler;
 using ICSharpCode.Decompiler.Metadata;
 
@@ -13,9 +14,7 @@ resolver.AddSearchDirectory(Path.GetDirectoryName(asmPath));
 var settings = new DecompilerSettings(LanguageVersion.CSharp7_3)
 {
     ThrowOnAssemblyResolveErrors = false,
-    RemoveDeadCode = false,
-    UseSdkStyleProjectFormat = false,
 };
-var decompiler = new WholeProjectDecompiler(settings, resolver, resolver, null, null);
+var decompiler = new WholeProjectDecompiler(settings, resolver, null, resolver, null);
 decompiler.DecompileProject(module, outDir);
 Console.WriteLine($"Decompiled {asmPath} -> {outDir}");
