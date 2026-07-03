@@ -11,7 +11,7 @@ namespace CardShopCoop
     {
         public const string Guid = "com.zwhit.cardshopcoop";
         public const string Name = "CardShopCoop";
-        public const string Version = "0.10.1";
+        public const string Version = "0.11.0";
 
         public static ManualLogSource Log;
 
@@ -37,8 +37,10 @@ namespace CardShopCoop
                 "IP address of the host PC (remembered after a successful join).");
             PlayerName = Config.Bind("Player", "Name", System.Environment.UserName,
                 "Name shown above your head on the other player's screen.");
-            SendRateHz = Config.Bind("Network", "SendRateHz", 12f,
+            SendRateHz = Config.Bind("Network", "SendRateHz", 15f,
                 "How many position updates per second to send (8-20 is sensible).");
+            if (Mathf.Approximately(SendRateHz.Value, 12f))
+                SendRateHz.Value = 15f; // migrate configs saved by earlier builds
             AvatarsEnabled = Config.Bind("Player", "AvatarsEnabled", true,
                 "Show the other player as a walking character in your shop.");
             UiToggleKey = Config.Bind("Keys", "UiToggleKey", KeyCode.F2,

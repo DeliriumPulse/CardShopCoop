@@ -16,6 +16,11 @@ namespace CardShopCoop.Net
 
         void Send(int connId, byte[] frame);
         void Broadcast(byte[] frame);
+
+        /// <summary>Fast lane for transient state (positions, NPC batches): may be sent
+        /// unreliably and never delays behind bulk transfers. TCP treats it as Send.</summary>
+        void SendTransient(int connId, byte[] frame);
+        void BroadcastTransient(byte[] frame);
         int ConnectionCount { get; }
         double SecondsSinceLastRecv(int connId);
         List<int> ConnIds();

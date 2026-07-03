@@ -134,6 +134,7 @@ namespace CardShopCoop.Sync
             public GameObject CardSingle;
             public string CharName = "";
             public Vector3 TargetPos;
+            public Vector3 Velocity;
             public float TargetYaw;
             public float Speed;
             public NpcFlags Flags;
@@ -195,6 +196,14 @@ namespace CardShopCoop.Sync
                     p = new Puppet();
                     _puppets[key] = p;
                 }
+                float span = _now - p.LastSeen;
+                if (p.Go != null && span > 0.01f && span < 1f)
+                {
+                    var v = (pos - p.TargetPos) / span;
+                    v.y = 0f;
+                    p.Velocity = Vector3.ClampMagnitude(v, 5f);
+                }
+                else p.Velocity = Vector3.zero;
                 p.TargetPos = pos;
                 p.TargetYaw = yaw;
                 p.Speed = speed;
@@ -225,9 +234,11 @@ namespace CardShopCoop.Sync
                 }
                 if (p.Go == null) continue;
                 var t = p.Go.transform;
-                bool snap = (t.position - p.TargetPos).sqrMagnitude > 25f; // teleports (spawn, seat snap)
-                t.position = snap ? p.TargetPos : Vector3.Lerp(t.position, p.TargetPos, dt * 10f);
-                t.rotation = Quaternion.Slerp(t.rotation, Quaternion.Euler(0f, p.TargetYaw, 0f), dt * 10f);
+                float age = Mathf.Min(_now - p.LastSeen, 0.3f);
+                var predicted = p.TargetPos + p.Velocity * age;
+                bool snap = (t.position - predicted).sqrMagnitude > 25f; // teleports (spawn, seat snap)
+                t.position = snap ? predicted : Vector3.Lerp(t.position, predicted, dt * 12f);
+                t.rotation = Quaternion.Slerp(t.rotation, Quaternion.Euler(0f, p.TargetYaw, 0f), dt * 12f);
 
                 if (p.Anim != null)
                 {

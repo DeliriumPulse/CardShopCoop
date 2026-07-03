@@ -25,6 +25,10 @@ namespace CardShopCoop.Net
 
         public double TimeoutSeconds => 60.0;
 
+        // TCP is already low-latency and ordered; the fast lane is just the normal lane
+        public void SendTransient(int connId, byte[] frame) { Send(connId, frame); }
+        public void BroadcastTransient(byte[] frame) { Broadcast(frame); }
+
         /// <summary>Frame sent by a transport-owned thread every 2s per connection.
         /// Keeps the link alive even while Unity's main thread is frozen in a scene load.</summary>
         public byte[] KeepaliveFrame;

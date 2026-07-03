@@ -20,6 +20,7 @@ namespace CardShopCoop.UI
         private string _nameField;
         private string _lanIps;
         private string _lanIpsOther;
+        private bool _revealIp;
 
         // lobby browser + host options
         private bool _browserOpen;
@@ -187,9 +188,17 @@ namespace CardShopCoop.UI
                         _lanIpsOther = ips.Count > 1 ? string.Join("  ", ips.GetRange(1, ips.Count - 1)) : "";
                     }
                     GUILayout.Label("Give this to the other PC:");
-                    GUILayout.Label($"<b><size=16>{_lanIps}</size></b>  (port {CoopPlugin.Port.Value})");
-                    if (_lanIpsOther.Length > 0)
-                        GUILayout.Label($"<size=10>(other adapters, usually wrong: {_lanIpsOther})</size>");
+                    if (!_revealIp)
+                    {
+                        if (GUILayout.Button("click to show IP  (hidden for streams)"))
+                            _revealIp = true;
+                    }
+                    else
+                    {
+                        GUILayout.Label($"<b><size=16>{_lanIps}</size></b>  (port {CoopPlugin.Port.Value})");
+                        if (_lanIpsOther.Length > 0)
+                            GUILayout.Label($"<size=10>(other adapters, usually wrong: {_lanIpsOther})</size>");
+                    }
                     int count = net?.ConnectionCount ?? 0;
                     GUILayout.Label(count == 0 ? "Waiting for a player..." : PlayersLine(core));
                     if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")")) core.SendEmote();

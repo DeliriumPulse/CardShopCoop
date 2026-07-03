@@ -595,6 +595,13 @@ namespace CardShopCoop
             _net?.Broadcast(Msg.Build(type, write));
         }
 
+        /// <summary>Fast lane: transient state that must never wait behind bulk transfers
+        /// (unreliable-no-delay on Steam; a lost packet is replaced by the next tick).</summary>
+        private void BroadcastTransient(MsgType type, Action<BinaryWriter> write)
+        {
+            _net?.BroadcastTransient(Msg.Build(type, write));
+        }
+
         // ------------------------------------------------ per-frame
 
         private void Update()
@@ -791,7 +798,7 @@ namespace CardShopCoop
                     float yaw = _playerCamTf != null ? _playerCamTf.eulerAngles.y
                         : (Camera.main != null ? Camera.main.transform.eulerAngles.y : playerTf.eulerAngles.y);
                     byte hold = ComputeHoldState();
-                    Broadcast(MsgType.PlayerState, bw =>
+                    BroadcastTransient(MsgType.PlayerState, bw =>
                     {
                         bw.Write(pos.x); bw.Write(pos.y); bw.Write(pos.z);
                         bw.Write(yaw); bw.Write(speed); bw.Write(hold);
@@ -934,7 +941,7 @@ namespace CardShopCoop
                 {
                     var batch = _npcs.HostCollect(dt);
                     if (batch != null)
-                        Broadcast(MsgType.NpcState, bw => bw.Write(batch));
+                        BroadcastTransient(MsgType.NpcState, bw => bw.Write(batch));
                 });
                 Guarded("register-collect", () =>
                 {
@@ -944,7 +951,7 @@ namespace CardShopCoop
                         _regStateTimer = 0f;
                         var batch = Sync.RegisterServe.CollectStates();
                         if (batch != null)
-                            Broadcast(MsgType.RegisterState, bw => bw.Write(batch));
+                            BroadcastTransient(MsgType.RegisterState, bw => bw.Write(batch));
                     }
                 });
             }
@@ -1237,7 +1244,7 @@ namespace CardShopCoop
                                 WriteHoldPayload(bw, hold, holdTypes, holdCards);
                             });
                             foreach (int cid in _net.ConnIds())
-                                if (cid != msg.ConnId) _net.Send(cid, relay);
+                                if (cid != msg.ConnId) _net.SendTransient(cid, relay);
                         }
                         if (_gotStateFrom.Add(msg.ConnId))
                         {

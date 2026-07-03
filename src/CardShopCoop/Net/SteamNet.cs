@@ -29,8 +29,10 @@ namespace CardShopCoop.Net
         private readonly Dictionary<int, CSteamID> _peers = new Dictionary<int, CSteamID>();
         private readonly Dictionary<CSteamID, int> _ids = new Dictionary<CSteamID, int>();
         private readonly Dictionary<int, double> _lastRecv = new Dictionary<int, double>();
-        private readonly ConcurrentQueue<KeyValuePair<int, byte[]>> _outbox = new ConcurrentQueue<KeyValuePair<int, byte[]>>();
-        private KeyValuePair<int, byte[]>? _stalled; // frame Steam refused; retried first
+        private struct Outgoing { public int ConnId; public byte[] Frame; public bool Transient; }
+
+        private readonly ConcurrentQueue<Outgoing> _outbox = new ConcurrentQueue<Outgoing>();
+        private Outgoing? _stalled; // reliable frame Steam refused; retried first
         private int _nextConnId = 1;
         private byte[] _readBuf = new byte[600 * 1024];
         private float _keepaliveTimer;
@@ -108,35 +110,50 @@ namespace CardShopCoop.Net
 
         public void Send(int connId, byte[] frame)
         {
-            _outbox.Enqueue(new KeyValuePair<int, byte[]>(connId, frame));
+            _outbox.Enqueue(new Outgoing { ConnId = connId, Frame = frame });
         }
 
         public void Broadcast(byte[] frame)
         {
             foreach (int cid in ConnIds())
-                _outbox.Enqueue(new KeyValuePair<int, byte[]>(cid, frame));
+                _outbox.Enqueue(new Outgoing { ConnId = cid, Frame = frame });
+        }
+
+        public void SendTransient(int connId, byte[] frame)
+        {
+            _outbox.Enqueue(new Outgoing { ConnId = connId, Frame = frame, Transient = true });
+        }
+
+        public void BroadcastTransient(byte[] frame)
+        {
+            foreach (int cid in ConnIds())
+                _outbox.Enqueue(new Outgoing { ConnId = cid, Frame = frame, Transient = true });
         }
 
         public void PumpMainThread()
         {
             if (_stopped) return;
 
-            // ---- sends (byte-budgeted per frame; a refused frame stalls until Steam accepts) ----
+            // ---- sends (byte-budgeted per frame; a refused reliable frame stalls until
+            // Steam accepts it). Transient frames go UnreliableNoDelay - never buffered,
+            // never queued behind bulk transfers; a drop just means the next update wins.
+            // Reliable frames use plain Reliable (NOT WithBuffering, which adds ~200ms).
             int budget = 1024 * 1024;
             while (budget > 0)
             {
-                KeyValuePair<int, byte[]> entry;
+                Outgoing entry;
                 if (_stalled.HasValue) { entry = _stalled.Value; _stalled = null; }
                 else if (!_outbox.TryDequeue(out entry)) break;
 
-                if (!_peers.TryGetValue(entry.Key, out var sid)) continue; // peer gone
-                if (!SteamNetworking.SendP2PPacket(sid, entry.Value, (uint)entry.Value.Length,
-                        EP2PSend.k_EP2PSendReliableWithBuffering, Channel))
+                if (!_peers.TryGetValue(entry.ConnId, out var sid)) continue; // peer gone
+                var mode = entry.Transient ? EP2PSend.k_EP2PSendUnreliableNoDelay : EP2PSend.k_EP2PSendReliable;
+                if (!SteamNetworking.SendP2PPacket(sid, entry.Frame, (uint)entry.Frame.Length, mode, Channel)
+                    && !entry.Transient)
                 {
-                    _stalled = entry; // Steam's queue is full; retry next frame
+                    _stalled = entry; // Steam's reliable queue is full; retry next frame
                     break;
                 }
-                budget -= entry.Value.Length;
+                budget -= entry.Frame.Length;
             }
 
             // ---- keepalive ----
@@ -146,7 +163,7 @@ namespace CardShopCoop.Net
                 _keepaliveTimer = 0f;
                 foreach (var kv in _peers)
                     SteamNetworking.SendP2PPacket(kv.Value, KeepaliveFrame, (uint)KeepaliveFrame.Length,
-                        EP2PSend.k_EP2PSendReliableWithBuffering, Channel);
+                        EP2PSend.k_EP2PSendReliable, Channel);
             }
 
             // ---- receives ----

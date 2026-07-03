@@ -25,6 +25,8 @@ namespace CardShopCoop.Sync
             public GameObject HoldProp;
             public string Name = "Player";
             public Vector3 TargetPos;
+            public Vector3 Velocity;      // measured between packets, for dead reckoning
+            public float LastStateTime;   // Time.time when TargetPos arrived
             public float TargetYaw;
             public float NetSpeed;
             public byte HoldState;
@@ -69,6 +71,16 @@ namespace CardShopCoop.Sync
                 av = new RemoteAvatar();
                 _avatars[connId] = av;
             }
+            float now = Time.time;
+            float span = now - av.LastStateTime;
+            if (av.HasState && span > 0.01f && span < 1f)
+            {
+                var v = (pos - av.TargetPos) / span;
+                v.y = 0f;
+                av.Velocity = Vector3.ClampMagnitude(v, 6f);
+            }
+            else av.Velocity = Vector3.zero;
+            av.LastStateTime = now;
             av.TargetPos = pos;
             av.TargetYaw = yaw;
             av.NetSpeed = speed;
@@ -196,9 +208,14 @@ namespace CardShopCoop.Sync
                 }
 
                 var t = av.Go.transform;
-                t.position = Vector3.Lerp(t.position, av.TargetPos, dt * 12f);
+                // dead reckoning: chase where the player IS NOW (last packet + predicted
+                // travel), capped at 250ms of extrapolation so overshoots stay tiny
+                float age = Mathf.Min(Time.time - av.LastStateTime, 0.25f);
+                var predicted = av.TargetPos + av.Velocity * age;
+                bool snap = (t.position - predicted).sqrMagnitude > 25f;
+                t.position = snap ? predicted : Vector3.Lerp(t.position, predicted, dt * 14f);
                 var targetRot = Quaternion.Euler(0f, av.TargetYaw, 0f);
-                t.rotation = Quaternion.Slerp(t.rotation, targetRot, dt * 12f);
+                t.rotation = Quaternion.Slerp(t.rotation, targetRot, dt * 14f);
 
                 if (av.Anim != null)
                 {
