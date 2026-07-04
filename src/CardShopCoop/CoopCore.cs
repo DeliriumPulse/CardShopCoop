@@ -400,6 +400,7 @@ namespace CardShopCoop
                 bw.Write(_joinPassword ?? "");
                 bw.Write(Util.ModParity.PluginHash());
                 bw.Write(Util.ModParity.EnumHash());
+                bw.Write(Util.ModParity.CardsHash());
             });
         }
 
@@ -1925,17 +1926,20 @@ namespace CardShopCoop
                     if (Role != CoopRole.Host) break;
                     using (var br = Msg.Reader(msg.Payload))
                     {
+                        // Version is checked FIRST so a peer on a different version (which
+                        // may not send the newer handshake fields) is rejected before we
+                        // try to read them.
                         string version = br.ReadString();
-                        string name = br.ReadString();
-                        string password = br.ReadString();
-                        string pluginHash = br.ReadString();
-                        string enumHash = br.ReadString();
-
                         if (version != CoopPlugin.Version)
                         {
                             RejectConn(msg.ConnId, $"version mismatch - host runs CardShopCoop {CoopPlugin.Version}, you have {version}");
                             break;
                         }
+                        string name = br.ReadString();
+                        string password = br.ReadString();
+                        string pluginHash = br.ReadString();
+                        string enumHash = br.ReadString();
+                        string cardsHash = br.ReadString();
                         if (HostPassword.Length > 0 && password != HostPassword)
                         {
                             RejectConn(msg.ConnId, "wrong password");
@@ -1964,6 +1968,14 @@ namespace CardShopCoop
                             }
                             catch (Exception e) { CoopPlugin.Log.LogWarning("enum sync send: " + e.Message); }
                             RejectConn(msg.ConnId, "your custom-card database differed - it has been synced from the host; RESTART your game, then join again");
+                            break;
+                        }
+                        // Custom CreateCards/CardForge cards aren't covered by the enum
+                        // registry above, so check their ID mapping directly. These are
+                        // loose files we can't auto-sync, so it's a clear hard stop.
+                        if (cardsHash != Util.ModParity.CardsHash())
+                        {
+                            RejectConn(msg.ConnId, "your custom cards differ from the host's - both players need the same custom cards installed (identical files + IDs), then restart. Share the exact card package (e.g. from CardForge).");
                             break;
                         }
 

@@ -17,6 +17,44 @@ namespace CardShopCoop.Util
     {
         private static string _plugins;
         private static string _enum;
+        private static string _cards;
+
+        /// <summary>Hash of the custom-card ID space minted by CreateCards: each
+        /// MonsterConfig's "Monster Type = Monster Type ID" mapping, sorted. This is
+        /// exactly what WriteCard/ReadCard sync depends on. The plugin and enum hashes
+        /// do NOT cover it - custom EMonsterType cards aren't in EPL's enum_values.json -
+        /// so without this, two players could pass the handshake and then silently show
+        /// the wrong card. Cosmetic fields (art, stats, description) are excluded on
+        /// purpose so a shared card with tweaked flavor still matches.</summary>
+        public static string CardsHash()
+        {
+            if (_cards != null) return _cards;
+            try
+            {
+                string dir = Path.Combine(BepInEx.Paths.BepInExRootPath, "patchers", "CreateCardsPreloader", "MonsterConfigs");
+                var entries = new List<string>();
+                if (Directory.Exists(dir))
+                {
+                    foreach (var f in Directory.GetFiles(dir, "*.ini"))
+                    {
+                        string name = null, id = null;
+                        foreach (var line in File.ReadAllLines(f))
+                        {
+                            int eq = line.IndexOf('=');
+                            if (eq <= 0) continue;
+                            string k = line.Substring(0, eq).Trim();
+                            if (k.Equals("Monster Type", StringComparison.OrdinalIgnoreCase)) name = line.Substring(eq + 1).Trim();
+                            else if (k.Equals("Monster Type ID", StringComparison.OrdinalIgnoreCase)) id = line.Substring(eq + 1).Trim();
+                        }
+                        if (name != null && id != null) entries.Add(name + "=" + id);
+                    }
+                }
+                entries.Sort(StringComparer.Ordinal);
+                _cards = entries.Count == 0 ? "none" : Short(Sha1(string.Join(";", entries)));
+            }
+            catch { _cards = "err"; }
+            return _cards;
+        }
 
         /// <summary>Hash of the loaded BepInEx plugin set (guid=version, sorted).</summary>
         public static string PluginHash()

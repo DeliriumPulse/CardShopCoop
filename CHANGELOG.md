@@ -5,6 +5,13 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.0.21
+**Custom cards are now checked at join — no more silent desync from mismatched custom cards.**
+- The join handshake already checked mod versions and the modded-item database, but **custom cards added by CreateCards/CardForge weren't covered** (they live in a different ID space that the old checks couldn't see). Two players with different custom cards could connect and then silently see the wrong card. The handshake now also compares the custom-card ID mapping and stops the join with a clear message if they differ, telling you to install the same custom cards (identical files) and restart.
+- Harmless if neither player uses custom cards.
+
+Both players must update — the launcher does it automatically.
+
 ## 1.0.20
 **Fixed: a guest buying furniture (e.g. the play table) charged them but nothing arrived.**
 - When a guest ordered furniture, the host spawned it through the game's placement code, which runs an interactive-move cleanup step meant for when *you* drag-and-drop an object. With no drag in progress that step hit a null reference and aborted the delivery halfway — so the furniture never finished spawning even though the money was already taken. The cleanup is now skipped when there's nothing to clean up, and the delivery completes normally.
