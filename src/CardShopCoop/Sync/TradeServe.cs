@@ -508,6 +508,23 @@ namespace CardShopCoop.Sync
         /// Animation.Play on an inactive object is a no-op) and rolls the offer from
         /// CPlayerData. The stored CustomerTradeData is replayed verbatim by any later
         /// SetCustomer call - so the host clicking the customer sees THIS same offer.</summary>
+        /// <summary>Freeze a snapshot of a game CardData: the trade screen reuses one
+        /// object across customers, so anything we keep past this frame must be a copy.</summary>
+        private static CardData CopyCard(CardData src)
+        {
+            if (src == null) return null;
+            var c = new CardData();
+            try { c.CopyData(src); }
+            catch
+            {
+                c.expansionType = src.expansionType; c.monsterType = src.monsterType;
+                c.borderType = src.borderType; c.isFoil = src.isFoil; c.isDestiny = src.isDestiny;
+                c.isChampionCard = src.isChampionCard; c.isNew = src.isNew;
+                c.cardGrade = src.cardGrade; c.gradedCardIndex = src.gradedCardIndex;
+            }
+            return c;
+        }
+
         private CustomerTradeData PreRoll(CustomerManager cm, Customer cust)
         {
             // without the storage field every roll would be lost and re-rolled (and
@@ -530,8 +547,13 @@ namespace CardShopCoop.Sync
                     m_SellCardMarketPrice = FiScrMarket?.GetValue(screen) is float mp ? mp : 0f,
                     m_MaxDeclineCount = FiScrMaxDecline?.GetValue(screen) is int md ? md : 0,
                     m_DeclineCount = FiScrDecline?.GetValue(screen) is int dc ? dc : 0,
-                    m_CardData_L = FiScrCardL?.GetValue(screen) as CardData,
-                    m_CardData_R = FiScrCardR?.GetValue(screen) as CardData,
+                    // DEEP COPY, never the screen's reference: the game reuses one
+                    // CardData object across customers (hence CardData.CopyData), so a
+                    // stored reference gets mutated by the NEXT pre-roll - corrupting
+                    // the grade (fake graded card) and the monsterType (wrong name on
+                    // wrong art). Freezing a copy is the fix for both field reports.
+                    m_CardData_L = CopyCard(FiScrCardL?.GetValue(screen) as CardData),
+                    m_CardData_R = CopyCard(FiScrCardR?.GetValue(screen) as CardData),
                 };
                 if (data.m_CardData_L == null)
                 {

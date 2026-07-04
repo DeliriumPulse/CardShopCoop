@@ -456,6 +456,15 @@ namespace CardShopCoop
 
         private static void ApplyCardDelta(bool isAdd, int amount, CardData card)
         {
+            // grades are only ever 1-10; anything else is corruption (the trade-card
+            // aliasing bug produced values like 1.3 billion). AddCard routes cardGrade>0
+            // into the graded inventory keyed BY the grade, so a garbage grade makes a
+            // permanent "fake" card that never matches or displays - refuse it.
+            if (card.cardGrade != 0 && (card.cardGrade < 1 || card.cardGrade > 10))
+            {
+                CoopPlugin.Log.LogWarning($"card delta: dropping corrupt graded card {card.monsterType} (grade {card.cardGrade}) - not applied");
+                return;
+            }
             Patches.GamePatches.ApplyingRemoteCards = true;
             try
             {

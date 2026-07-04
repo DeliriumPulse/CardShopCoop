@@ -5,6 +5,13 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.0.19
+**Fixes fake graded cards, wrong card names, and a stuck-box loop.**
+- **Fixed: traded graded cards turning "fake," and cards showing the wrong name/art** (e.g. "Uncommon Golem" on the wrong picture). One root cause: the customer's trade offer was stored by *reference* to a card object the game reuses for the next customer, so a later trade would silently overwrite it — scrambling the grade and the card identity. Offers are now frozen as copies. A safety net also refuses any card with an impossible grade instead of creating a broken one.
+- **Fixed: a box that couldn't fit on a storage rack retrying forever** (log spam every 30s, and boxes left frozen/unpickable). After a few tries it now leaves the box loose and grabbable, and retries only if the rack situation changes. This should also clear the "empty boxes can't be picked up" case where a stuck box was left frozen.
+
+Both players must update — the launcher does it automatically.
+
 ## 1.0.18
 **Busy shops now mirror every customer + trade fixes.**
 - Fixed: in a busy shop, the guest only saw ~20 customers no matter how many the host had (trade/sell customers at counters often among the invisible ones). The fast network lane was collapsing the host's multi-packet customer batches down to one packet per tick, so only a fraction of the crowd ever arrived. All customer packets now go through. (Only showed up with large crowds — smaller shops fit in one packet.)

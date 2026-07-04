@@ -229,6 +229,10 @@ namespace CardShopCoop.Sync
         // silently found zero racks forever (second storage field report)
         private static ShelfManager _sm;
         private static double _lastResolveWarn;
+        // storage-rack give-up tracking: after a few failed store attempts for a box
+        // (full/mismatched slot) we stop retrying and leave it loose
+        private static readonly Dictionary<ushort, int> _storeFails = new Dictionary<ushort, int>();
+        private static readonly HashSet<ushort> _storeGaveUp = new HashSet<ushort>();
 
         private static ShelfCompartment ResolveWarehouseCompartment(int shelfIdx, int compIdx)
         {
@@ -702,7 +706,13 @@ namespace CardShopCoop.Sync
                     // live-lock the store forever (closed-box path is data-only, safe
                     // whether stored already or about to be)
                     ApplyClosedCount(box, want.Count);
-                    if (!locallyStored)
+                    if (locallyStored) return;              // already stored; slot owns it
+                    // give-up guard: a genuinely full/mismatched rack slot rejects the
+                    // store on EVERY tick, and the old code retried forever (field log:
+                    // "rejected box id 252 ... retrying" every 30s all session). Once we
+                    // give up, fall through to the loose apply below - visible and
+                    // grabbable beats eternal churn (a later snapshot retries on change)
+                    if (!_storeGaveUp.Contains(want.Id))
                     {
                         if (!box.gameObject.activeSelf) box.gameObject.SetActive(true);
                         var rackComp = ResolveWarehouseCompartment(want.StoreShelf, want.StoreComp);
@@ -718,21 +728,31 @@ namespace CardShopCoop.Sync
                                 box.DispenseItem(isPlayer: false, rackComp);
                             }
                             catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync store: " + e.Message); }
-                            // no silent rejections: DispenseItem returns void and eats
-                            // failures - if the store didn't take, say so (throttled)
-                            if (!box.m_IsStored)
+                            if (box.m_IsStored)
                             {
-                                box.SetPhysicsEnabled(true); // don't leave a loose box frozen
-                                double nowT = Time.realtimeSinceStartupAsDouble;
-                                if (nowT - _lastResolveWarn > 30.0)
-                                {
-                                    _lastResolveWarn = nowT;
-                                    CoopPlugin.Log.LogWarning($"BoxSync store: rack {want.StoreShelf}/{want.StoreComp} rejected box id {want.Id} (slot full or size/type mismatch) - retrying");
-                                }
+                                _storeFails.Remove(want.Id);
+                                return; // stored successfully; slot owns pose
+                            }
+                            // DispenseItem returns void and eats failures: count and give up
+                            box.SetPhysicsEnabled(true); // don't leave a loose box frozen
+                            _storeFails.TryGetValue(want.Id, out int fails);
+                            _storeFails[want.Id] = ++fails;
+                            if (fails >= 4)
+                            {
+                                _storeGaveUp.Add(want.Id);
+                                CoopPlugin.Log.LogWarning($"BoxSync store: rack {want.StoreShelf}/{want.StoreComp} keeps rejecting box id {want.Id} (slot full or size/type mismatch) - leaving it loose");
                             }
                         }
+                        return; // still trying (or no rack yet); don't apply a loose pose mid-attempt
                     }
-                    return; // slot owns pose while stored
+                    // gave up: fall through and render it as a normal loose box
+                }
+                else
+                {
+                    // host says NOT stored: clear any give-up state so a future store
+                    // (rack slot freed up, box re-placed) is attempted fresh
+                    if (_storeGaveUp.Count > 0) _storeGaveUp.Remove(want.Id);
+                    if (_storeFails.Count > 0) _storeFails.Remove(want.Id);
                 }
                 if (locallyStored)
                 {
