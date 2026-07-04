@@ -62,6 +62,15 @@ namespace CardShopCoop.Patches
             Try(h, typeof(ShelfManager), "SpawnInteractableObjectInPackageBox",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(FurnitureOrderPrefix)));
 
+            // A joiner's forwarded furniture spawn runs BoxUpObject -> OnPlacedMovedObject,
+            // whose interactive-move teardown DisableMoveObjectPreviewMode dereferences
+            // m_MoveObjectPreviewModel. With no live player-move preview (there isn't one
+            // for a programmatic spawn) that's null and NRE'd, aborting the spawn mid-way
+            // so the delivery box never finished and the table never arrived - money gone
+            // (field report: PlayTable). Skip the teardown when there's nothing to tear down.
+            Try(h, typeof(ShelfManager), "DisableMoveObjectPreviewMode",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(DisablePreviewGuardPrefix)));
+
             // A trashed box must die on the host too, or the next broadcast resurrects
             // it at its old spot on the ground.
             Try(h, typeof(InteractablePackagingBox_Item), "OnDestroyed",
@@ -143,6 +152,25 @@ namespace CardShopCoop.Patches
             if (CoopCore.Role != CoopRole.Client) return true;
             CoopCore.Instance?.ForwardOrder(restockIndex, count);
             return false; // no local phantom boxes; the host's delivery mirrors back
+        }
+
+        /// <summary>Skip the move-preview teardown when there's no preview to tear down
+        /// (a programmatically-spawned forwarded furniture order). The vanilla body
+        /// dereferences m_MoveObjectPreviewModel unconditionally and NRE'd there,
+        /// aborting the furniture spawn - so the table never arrived but was paid for.
+        /// Runs only inside the game's own DisableMoveObjectPreviewMode call, so the
+        /// ShelfManager provably exists (no fake-singleton hazard).</summary>
+        public static bool DisablePreviewGuardPrefix()
+        {
+            try
+            {
+                var sm = CSingleton<ShelfManager>.Instance;
+                // no live preview model = no interactive move in progress = nothing to
+                // clean up; skipping avoids the NRE and lets the spawn finish
+                if (sm == null || sm.m_MoveObjectPreviewModel == null) return false;
+            }
+            catch { return false; }
+            return true; // real interactive move: run the vanilla teardown
         }
 
         public static bool RenamerBlockPrefix()
