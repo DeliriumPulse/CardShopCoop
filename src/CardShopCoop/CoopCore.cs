@@ -452,6 +452,8 @@ namespace CardShopCoop
         private readonly List<PendingCard> _pendingCardDeltas = new List<PendingCard>();
         private readonly List<KeyValuePair<CardData, float>> _pendingCardPrices = new List<KeyValuePair<CardData, float>>();
 
+        private static InteractionPlayerController _deltaIpc; // NEVER CSingleton<>.Instance (fake-manager landmine)
+
         private static void ApplyCardDelta(bool isAdd, int amount, CardData card)
         {
             Patches.GamePatches.ApplyingRemoteCards = true;
@@ -461,6 +463,18 @@ namespace CardShopCoop
                 else CPlayerData.ReduceCard(card, amount);
             }
             finally { Patches.GamePatches.ApplyingRemoteCards = false; }
+            // "cards didn't show up in the binder" reports were undiagnosable from the
+            // receiving side - applies were completely silent
+            CoopPlugin.Log.LogInfo($"card delta applied: {(isAdd ? "+" : "-")}{amount} {card.monsterType}{(card.cardGrade > 0 ? $" (grade {card.cardGrade})" : card.isFoil ? " (foil)" : "")}");
+            // the vanilla trade/pack flows poke the binder's sort refresh after AddCard;
+            // a bare AddCard leaves an OPEN binder stale until something else pokes it
+            try
+            {
+                if (_deltaIpc == null) _deltaIpc = FindObjectOfType<InteractionPlayerController>();
+                if (_deltaIpc != null && _deltaIpc.m_CollectionBinderFlipAnimCtrl != null)
+                    _deltaIpc.m_CollectionBinderFlipAnimCtrl.SetCanUpdateSort(canSort: true);
+            }
+            catch { }
         }
 
         private void FlushPendingCardWork()

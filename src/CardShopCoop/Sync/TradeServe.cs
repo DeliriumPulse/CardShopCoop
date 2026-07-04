@@ -279,6 +279,9 @@ namespace CardShopCoop.Sync
             if (t == null) return false;
             int idx = t._pendingCounter;
             float price = FiScrPriceSet?.GetValue(__instance) is float p ? p : 0f;
+            // a zero/garbage field means "at the asking price" (-1 tells the host so);
+            // a genuine $0 bid is never what an accept press means
+            if (price <= 0f) price = -1f;
             CoopPlugin.Log.LogInfo($"TradeServe client: accept pressed on native screen (counter {idx}, price {price:F2})");
             if (idx >= 0)
                 t.SendOpFor(OpAccept, idx, price, "answering the customer...");
@@ -907,8 +910,11 @@ namespace CardShopCoop.Sync
                 m_CardData_R = offer.CardR,
                 m_SellCardAskPrice = offer.Price,
                 m_SellCardMarketPrice = 0f, // SetCustomer recomputes from GetCardMarketPrice
-                m_PriceSet = 0f,
-                m_LastPriceSet = 0f,
+                // prefill the ASK: the price field only writes m_PriceSet when edited,
+                // so accepting a sell-in untouched forwarded $0.00 and the haggle RNG
+                // refused it as a lowball every time (field logs: "they refuse $0.00")
+                m_PriceSet = offer.Trading ? 0f : offer.Price,
+                m_LastPriceSet = offer.Trading ? 0f : offer.Price,
                 m_MaxDeclineCount = 0, // the haggle RNG never runs here (accept is forwarded)
                 m_DeclineCount = 0,
             };

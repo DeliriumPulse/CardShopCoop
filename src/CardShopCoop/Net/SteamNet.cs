@@ -157,7 +157,19 @@ namespace CardShopCoop.Net
             _newestTransient.Clear();
             while (_transientOutbox.TryDequeue(out var tr))
             {
-                int key = (tr.ConnId << 8) | tr.Frame[4]; // MsgType byte follows the 4-byte length prefix
+                byte msgType = tr.Frame[4]; // MsgType byte follows the 4-byte length prefix
+                // CHUNKED transients carry a DIFFERENT slice of data per frame, so
+                // newest-wins coalescing (right for a single replaceable state like
+                // PlayerState) would drop every chunk but the last. NpcState splits a
+                // big crowd across several packets - collapsing them capped the guest
+                // at one chunk (~20 of 55 customers, trade-waiters among the lost);
+                // RelayState multiplexes several senders and must survive whole too.
+                if (msgType == (byte)MsgType.NpcState || msgType == (byte)MsgType.RelayState)
+                {
+                    _transientScratch.Add(tr);
+                    continue;
+                }
+                int key = (tr.ConnId << 8) | msgType;
                 if (_newestTransient.TryGetValue(key, out int prev))
                     _transientScratch[prev] = new Outgoing(); // superseded; null Frame skips it below
                 _newestTransient[key] = _transientScratch.Count;
