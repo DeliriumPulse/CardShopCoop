@@ -5,6 +5,15 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.0.26
+**More field fixes: host-pause freeze, trade customers, box-off-shelf, card prices.**
+- **Fixed: the host pausing froze everything for the guest.** The pause menu sets the game's time to a full stop, which also stopped the co-op network tick. In a session the world now keeps running under the pause menu, so neither player can freeze the other by opening pause.
+- **Fixed: the guest couldn't answer trade / sell-in customers** (the ones with the red "!"). The trade worked, but there was no way to discover it — clicking the customer does nothing on the guest's side, and the "press the serve key at the counter" prompt only showed when you were already right at the till. Now a **walk-up hint** appears whenever a customer wants to trade, telling you to go to the counter and press your serve key (V by default), and the trade prompt no longer gets hidden behind the checkout prompt.
+- **Fixed: a box taken off a storage rack didn't update for the other player** (it stayed stuck on the shelf on their screen). The take now mirrors reliably in both directions.
+- **Fixed: card prices set on a display not showing for the other player.** Card prices now re-send periodically (change-gated) so a single dropped update self-corrects — same self-heal item prices already had. Note: *play tables* can't hold priced cards at all (they're for customer card games) — use the glass display counter to sell cards.
+
+Both players must update — the launcher does it automatically.
+
 ## 1.0.25
 **Field-report batch: guest soft-lock, diagonal furniture, floating boxes, grading countdown.**
 - **Fixed a guest soft-lock:** if a box you were holding got consumed on the host's side, the game left you stuck in "carry" mode with an invisible box — unable to interact with anything, not even the trash. The mod now releases carry mode before retiring a held box, and there's a safety net that auto-frees anyone who was already stuck.

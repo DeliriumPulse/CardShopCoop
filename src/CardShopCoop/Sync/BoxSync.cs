@@ -348,7 +348,10 @@ namespace CardShopCoop.Sync
                     if (boxes[i] == null) continue;
                     var e = Snapshot(boxes[i]);
                     e.Id = HostIdFor(boxes[i]);
-                    if (_remoteCarried.Contains(e.Id)) e.Carried = true; // a client holds it
+                    // a client holds it: mark carried AND not-stored, so a not-yet-processed
+                    // m_IsStored=true on our side can't broadcast a Stored=true echo that
+                    // re-pins the taker's report back to stored (the rack-take desync)
+                    if (_remoteCarried.Contains(e.Id)) { e.Carried = true; e.Stored = false; }
                     list.Add(e);
                 }
                 // skip identical snapshots (boxes sit still most of the time); a slow
@@ -684,11 +687,24 @@ namespace CardShopCoop.Sync
                     // truth VERBATIM - if our local store mirror was rejected (full slot,
                     // stale type), reporting our not-stored state would command the host
                     // to yank its legitimately-stored box off the rack (revert war). The
-                    // carried branch above is the one legitimate exit: the player took it
+                    // carried branch above is the one legitimate exit: the player took it.
+                    // EXCEPTION: if WE physically took this exact box off the rack (it's no
+                    // longer stored locally AND we recently carried+released it), report the
+                    // real loose state so the take mirrors even when the transient Carried
+                    // frame was missed and a stale host Stored=true echo re-pinned us -
+                    // otherwise the box stays frozen slotted on the other screen forever.
                     if (truth.Stored)
                     {
-                        list.Add(truth);
-                        continue;
+                        bool reallyStored = true;
+                        try { reallyStored = box.m_IsStored; } catch { }
+                        bool weTookItOff = !reallyStored
+                            && _recentlyReleased.TryGetValue(truth.Id, out double rel) && nowT - rel < 6.0;
+                        if (!weTookItOff)
+                        {
+                            list.Add(truth);
+                            continue;
+                        }
+                        // else fall through to Snapshot(box): reports Stored=false + real pose
                     }
                     // hidden because ANOTHER player carries it: no local truth to
                     // report (its transform is parked at the hide spot, contents

@@ -145,6 +145,10 @@ namespace CardShopCoop
         private float _cardResyncTimer = -5.2f;  // one frame (the rhythmic-hitch bug)
         private int _lastCardResyncHash;         // change-gate for the 12s full card repaint
         private float _cardResyncHeal;           // forces a repaint every 30s regardless
+        private float _cardPriceHealTimer = -2.1f; // periodic displayed-card price rebroadcast
+        private int _lastCardPriceHash;            // change-gate for the card-price heal
+        private float _cardPriceHealBeat;          // forces a card-price resend every 30s
+        private readonly List<KeyValuePair<CardData, float>> _cardPriceBuf = new List<KeyValuePair<CardData, float>>();
         private float _licenseSyncTimer = -3.7f;
         private double _lastLicenseBuyTime = -999.0;
         private string _lastLightJson;
@@ -737,7 +741,16 @@ namespace CardShopCoop
                 _regStateTimer -= 0.5f;
                 var tf = ResolvePlayer();
                 int near = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, CoopPlugin.ServeReach.Value, quiet: true) : -1;
-                PromptLine = _registerMirror.PromptFor(near) ?? _trades.PromptFor(near) ?? "";
+                // Prefer the TRADE prompt over the register prompt at a shared counter - a
+                // trade/sell customer is the rarer, time-limited event and was being shadowed.
+                string prompt = _trades.PromptFor(near) ?? _registerMirror.PromptFor(near);
+                // Walk-up hint: on the guest the "!" trade customer is a collider-less render
+                // puppet, so clicking it (the vanilla serve gesture) does nothing and the
+                // guest never learns to stand at the counter. Proactively teach it whenever a
+                // trade offer is live and no closer prompt is showing.
+                if (prompt == null && Role == CoopRole.Client && _trades.AnyKnownOffer())
+                    prompt = $"a customer wants to trade - go to the counter and press {CoopPlugin.ServeKey.Value}";
+                PromptLine = prompt ?? "";
             }
         }
 
@@ -2005,6 +2018,46 @@ namespace CardShopCoop
                     }
                 }
                 catch (Exception e) { CoopPlugin.Log.LogWarning("card resync: " + e.Message); }
+            }
+
+            // card PRICE heal: card prices sync only via a single MsgType.CardPriceSet
+            // broadcast with no re-send, so one dropped frame stranded a displayed card's
+            // price forever (guest set a price on a display, host never saw it). Item prices
+            // already self-heal (PriceList); give card prices the same change-gated beat.
+            _cardPriceHealTimer += dt;
+            if (_cardPriceHealTimer >= 3f && InGameLevel())
+            {
+                _cardPriceHealTimer -= 3f;
+                try
+                {
+                    var full = _cardShelves.BuildFullState();
+                    int h = 17;
+                    _cardPriceBuf.Clear();
+                    foreach (var e in full)
+                    {
+                        if (!e.Occupied || e.Card == null) continue;
+                        if (e.Card.cardGrade > 10) continue; // composite grade would IndexOutOfRange GetCardPrice
+                        float p; try { p = CPlayerData.GetCardPrice(e.Card); } catch { continue; }
+                        if (p <= 0f) continue;
+                        _cardPriceBuf.Add(new KeyValuePair<CardData, float>(e.Card, p));
+                        h = h * 31 + e.Key;
+                        h = h * 31 + p.GetHashCode();
+                    }
+                    _cardPriceHealBeat += 3f;
+                    if ((h != _lastCardPriceHash || _cardPriceHealBeat >= 30f) && _cardPriceBuf.Count > 0)
+                    {
+                        _lastCardPriceHash = h;
+                        _cardPriceHealBeat = 0f;
+                        // one message per card (CardPriceSet is a single-card frame); small
+                        // and change-gated, so this only fires when a displayed price moved
+                        for (int i = 0; i < _cardPriceBuf.Count; i++)
+                        {
+                            var kv = _cardPriceBuf[i];
+                            Broadcast(MsgType.CardPriceSet, bw => { Msg.WriteCard(bw, kv.Key); bw.Write(kv.Value); });
+                        }
+                    }
+                }
+                catch (Exception e) { CoopPlugin.Log.LogWarning("card price heal: " + e.Message); }
             }
 
             // shared product licenses, identity-keyed: the save-file bool list is indexed

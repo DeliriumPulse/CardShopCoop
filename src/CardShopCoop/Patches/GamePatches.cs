@@ -103,6 +103,13 @@ namespace CardShopCoop.Patches
             Try(h, typeof(CPlayerData), "RemoveGradedCard",
                 prefix: null, postfix: new HarmonyMethod(typeof(GamePatches), nameof(RemoveGradedCardPostfix)));
 
+            // The pause menu sets Time.timeScale = 0, which zeroes Time.deltaTime for the
+            // WHOLE process - freezing the co-op tick's sends and the other player's world
+            // ("if host pauses, everything freezes on guest"). In a session, keep the world
+            // running under the menu so nobody's pause freezes the shared shop.
+            Try(h, typeof(PauseScreen), "OpenScreen",
+                prefix: null, postfix: new HarmonyMethod(typeof(GamePatches), nameof(PauseNoFreezePostfix)));
+
             // Domain sync modules register their own patch sets (each guarded internally).
             TryModule("staff", Sync.StaffSync.ApplyPatches, h);
             TryModule("shopstate", Sync.ShopStateSync.ApplyPatches, h);
@@ -274,6 +281,14 @@ namespace CardShopCoop.Patches
             {
                 CoopPlugin.Log.LogWarning($"Patch failed for {type.Name}.{method}: {e.Message}");
             }
+        }
+
+        /// <summary>Keep the world running while the pause menu is open during co-op, so a
+        /// host (or guest) opening pause doesn't zero Time.timeScale and freeze the other
+        /// player's shop + the network tick. The menu still shows; only the freeze is undone.</summary>
+        public static void PauseNoFreezePostfix()
+        {
+            if (CoopCore.Role != CoopRole.None) UnityEngine.Time.timeScale = 1f;
         }
 
         public static bool SaveGuardPrefix()

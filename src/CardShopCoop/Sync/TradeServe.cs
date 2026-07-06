@@ -887,6 +887,16 @@ namespace CardShopCoop.Sync
             return counterIdx >= 0 && _offers.ContainsKey(counterIdx);
         }
 
+        /// <summary>Client: true if ANY live offer is answerable (has pre-rolled card data).
+        /// Drives a walk-up hint teaching the guest to go to the counter and press the serve
+        /// key - on the guest the "!" customer is a collider-less render puppet, so clicking
+        /// it (the vanilla action) does nothing and the guest never learns the interaction.</summary>
+        public bool AnyKnownOffer()
+        {
+            foreach (var kv in _offers) if (kv.Value.Known) return true;
+            return false;
+        }
+
         /// <summary>Client: prompt for the nearest counter's live offer, or null
         /// (composes with RegisterMirror.PromptFor in CoopCore).</summary>
         public string PromptFor(int nearestCounter)
