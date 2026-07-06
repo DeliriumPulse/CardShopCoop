@@ -240,7 +240,23 @@ namespace CardShopCoop.Patches
         public static void AddCardPostfix(CardData cardData, int addAmount)
         {
             if (ApplyingRemoteCards || CoopCore.Role == CoopRole.None) return;
-            try { CoopCore.Instance?.ForwardCardDelta(cardData, addAmount, isAdd: true); }
+            try
+            {
+                // Forward the ENCODED grade for a graded card. Some display/album paths
+                // transiently set cardData.cardGrade to the bare 1-10 while the true encoded
+                // value lives in Grading Overhaul's registry; forwarding a bare 1-10 would
+                // make the other side treat it as an ungraded card. Read the registry and
+                // send the encoded value, restoring the game's live object afterwards.
+                int enc = Util.GradingInterop.Present ? Util.GradingInterop.Encoded(cardData) : cardData.cardGrade;
+                if (enc > 10 && cardData.cardGrade <= 10 && cardData.cardGrade != 0)
+                {
+                    int saved = cardData.cardGrade;
+                    cardData.cardGrade = enc;
+                    try { CoopCore.Instance?.ForwardCardDelta(cardData, addAmount, isAdd: true); }
+                    finally { cardData.cardGrade = saved; } // never leave the game's object mutated
+                }
+                else CoopCore.Instance?.ForwardCardDelta(cardData, addAmount, isAdd: true);
+            }
             catch (Exception e) { CoopPlugin.Log.LogWarning("AddCardPostfix forward failed: " + e.Message); }
         }
 

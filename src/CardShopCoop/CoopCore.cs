@@ -479,19 +479,28 @@ namespace CardShopCoop
 
         private static void ApplyCardDelta(bool isAdd, int amount, CardData card)
         {
-            // grades are only ever 1-10; anything else is corruption (the trade-card
-            // aliasing bug produced values like 1.3 billion). AddCard routes cardGrade>0
-            // into the graded inventory keyed BY the grade, so a garbage grade makes a
-            // permanent "fake" card that never matches or displays - refuse it.
-            if (card.cardGrade != 0 && (card.cardGrade < 1 || card.cardGrade > 10))
+            // A cardGrade > 10 is NOT corruption when Grading Overhaul is installed: it's an
+            // ENCODED grade (company + 1-10 grade + cert serial). The old hard 1-10 drop-guard
+            // discarded every real graded card. Only a >10 grade WITHOUT Grading Overhaul is
+            // impossible/genuine corruption (vanilla only writes 1-10), so still refuse that.
+            if (card.cardGrade != 0 && (card.cardGrade < 1 || card.cardGrade > 10) && !Util.GradingInterop.Present)
             {
-                CoopPlugin.Log.LogWarning($"card delta: dropping corrupt graded card {card.monsterType} (grade {card.cardGrade}) - not applied");
+                CoopPlugin.Log.LogWarning($"card delta: dropping corrupt graded card {card.monsterType} (grade {card.cardGrade}) - not applied (Grading Overhaul absent)");
                 return;
             }
             Patches.GamePatches.ApplyingRemoteCards = true;
             try
             {
-                if (isAdd) CPlayerData.AddCard(card, amount);
+                if (isAdd)
+                {
+                    // Register the host's cert with Grading Overhaul BEFORE AddCard, so its
+                    // anti-cheat AddCard prefix sees the cert burned+bound and does NOT
+                    // re-encode this card as FAKE (the ~20s changing-grade churn). BindCert
+                    // is keyed by cardSaveIndex/expansion/isDestiny, so it survives AddCard's
+                    // compaction into a fresh CompactCardDataAmount.
+                    if (card.cardGrade > 10) Util.GradingInterop.Remember(card);
+                    CPlayerData.AddCard(card, amount);
+                }
                 else if (card.cardGrade > 0)
                 {
                     // graded cards live in m_GradedCardInventoryList; ReduceCard would miss
@@ -508,6 +517,22 @@ namespace CardShopCoop
             // receiving side - applies were completely silent
             CoopPlugin.Log.LogInfo($"card delta applied: {(isAdd ? "+" : "-")}{amount} {card.monsterType}{(card.cardGrade > 0 ? $" (grade {card.cardGrade})" : card.isFoil ? " (foil)" : "")}");
             RefreshOpenBinder();
+        }
+
+        /// <summary>Apply a received card price. For an ENCODED (>10) graded grade, register the
+        /// card with Grading Overhaul first (so its price-store key matches) and let GO's own
+        /// SetCardPrice patch route the write into its store; without GO, skip - the vanilla
+        /// 10-slot price array can't index an encoded grade. Callers hold ApplyingRemotePrice.</summary>
+        private static void ApplyRemoteCardPrice(CardData card, float price)
+        {
+            if (card == null) return;
+            if (card.cardGrade > 10)
+            {
+                if (!Util.GradingInterop.Present) return; // modded grade, no grading mod: can't price
+                Util.GradingInterop.Remember(card);       // bind cert so GO's price-store key matches
+            }
+            try { CPlayerData.SetCardPrice(card, price); }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("card price apply: " + e.Message); }
         }
 
         // NEVER CSingleton<>.Instance (fake-manager landmine); cached, Unity re-resolves.
@@ -547,7 +572,7 @@ namespace CardShopCoop
                     CoopPlugin.Log.LogInfo($"applied {_pendingCardDeltas.Count} card change(s) held during loading");
                 _pendingCardDeltas.Clear();
                 Patches.GamePatches.ApplyingRemotePrice = true;
-                try { foreach (var p in _pendingCardPrices) if (p.Key.cardGrade <= 10) CPlayerData.SetCardPrice(p.Key, p.Value); }
+                try { foreach (var p in _pendingCardPrices) ApplyRemoteCardPrice(p.Key, p.Value); }
                 catch (Exception e) { CoopPlugin.Log.LogWarning("pending card price apply: " + e.Message); }
                 finally { Patches.GamePatches.ApplyingRemotePrice = false; }
                 _pendingCardPrices.Clear();
@@ -2036,7 +2061,9 @@ namespace CardShopCoop
                     foreach (var e in full)
                     {
                         if (!e.Occupied || e.Card == null) continue;
-                        if (e.Card.cardGrade > 10) continue; // composite grade would IndexOutOfRange GetCardPrice
+                        // an encoded (>10) grade only prices via Grading Overhaul's own store
+                        // (its GetCardPrice patch reads it); without GO it would IndexOutOfRange
+                        if (e.Card.cardGrade > 10 && !Util.GradingInterop.Present) continue;
                         float p; try { p = CPlayerData.GetCardPrice(e.Card); } catch { continue; }
                         if (p <= 0f) continue;
                         _cardPriceBuf.Add(new KeyValuePair<CardData, float>(e.Card, p));
@@ -3154,12 +3181,10 @@ namespace CardShopCoop
                             break;
                         }
                         Patches.GamePatches.ApplyingRemotePrice = true;
-                        // a graded card with a composite/un-clamped grade (>10, from Grading
-                        // Overhaul + GradeDataLifeSaver) would IndexOutOfRange the vanilla
-                        // 10-slot price array; that price is owned by the grading mod, so skip
-                        // the vanilla write instead of crashing the whole message dispatch.
-                        try { if (card.cardGrade <= 10) CPlayerData.SetCardPrice(card, price); }
-                        catch (Exception e) { CoopPlugin.Log.LogWarning("card price apply: " + e.Message); }
+                        // graded (>10 encoded) prices route through Grading Overhaul's own store
+                        // (register the card, then GO's SetCardPrice patch handles it); ungraded
+                        // prices use the vanilla path; no-op for a modded grade without GO.
+                        try { ApplyRemoteCardPrice(card, price); }
                         finally { Patches.GamePatches.ApplyingRemotePrice = false; }
                     }
                     break;

@@ -5,6 +5,17 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.0.27
+**Graded cards now sync (Grading Overhaul).** ⚠️ Please test this one with a real graded card.
+
+The mod was throwing away every graded card. With **Grading Overhaul** installed, a graded card's grade is an *encoded* value (grading company + grade + certificate number), not a plain 1–10 — and an old safety guard treated everything above 10 as "corrupt" and dropped it. That's why graded cards never appeared in the other player's binder, showed only the red "!", or turned "fake" (the game's grading anti-cheat was re-stamping them because they arrived un-registered).
+
+- The guard is gone; graded cards now register properly with Grading Overhaul on arrival (binding the host's certificate), so they appear in the other player's binder with the correct grade and stop churning.
+- **Graded-card prices** now sync too (routed through Grading Overhaul's own price store instead of the vanilla one that couldn't hold them).
+- Both players still need the **same grading mods** (the join handshake enforces matching mods). Without a grading mod, nothing changes.
+
+This is the first build that actually attempts modded-grade sync, so if a graded card looks wrong, grab a `BepInEx\CardShopCoop_<number>.log` from both PCs. Everything from 1.0.26 is included.
+
 ## 1.0.26
 **Big field-report batch from live co-op testing** — thanks to everyone reporting in the Discord.
 
