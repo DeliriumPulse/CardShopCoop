@@ -5,7 +5,7 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
-## 1.0.25
+## 1.0.26
 **Big field-report batch from live co-op testing** — thanks to everyone reporting in the Discord.
 
 **Placement, boxes & machines**
