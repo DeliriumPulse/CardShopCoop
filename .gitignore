@@ -9,3 +9,4 @@ diag/
 # via GitHub Releases and Nexus, not the source tree
 dist/
 tools/coop-vanilla-profile.ps1
+decompiled-grading/
