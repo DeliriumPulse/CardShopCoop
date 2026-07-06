@@ -123,6 +123,12 @@ namespace CardShopCoop.Sync
             _lastHostHash = 0;
             _hostHeal = 0f;
             _rm = null;
+            // static store-retry state leaks across sessions; a reused box id could inherit
+            // a prior session's "gave up storing" and never get placed on the rack
+            _storeFails.Clear();
+            _storeGaveUp.Clear();
+            _sm = null;
+            _lastResolveWarn = 0;
         }
 
         /// <summary>Force the next HostTick to broadcast the loose-box population immediately,
@@ -153,7 +159,12 @@ namespace CardShopCoop.Sync
             bool settled = true;
             try
             {
-                var rb = box.GetComponentInChildren<Rigidbody>();
+                // use the box's REAL physics body, not GetComponentInChildren<Rigidbody>():
+                // the prefab's open/close rig mesh (m_RigMeshGrp) carries its own KINEMATIC
+                // child body that depth-first search returns first, so we'd read "settled"
+                // while the real body is still mid-fall -> the host broadcasts a mid-air pose
+                // and the box hangs frozen on the guest (the "floating boxes" report)
+                var rb = box.m_Rigidbody;
                 settled = rb == null || rb.isKinematic || rb.IsSleeping()
                     || rb.velocity.sqrMagnitude < 0.04f;
             }
@@ -352,6 +363,7 @@ namespace CardShopCoop.Sync
                     hash = hash * 31 + ((e.IsBig ? 1 : 0) | (e.IsOpen ? 2 : 0) | (e.Carried ? 4 : 0) | (e.Settled ? 8 : 0) | (e.Stored ? 16 : 0));
                     hash = hash * 31 + e.StoreShelf * 311 + e.StoreComp;
                     hash = hash * 31 + (int)(e.Pos.x * 8f);
+                    hash = hash * 31 + (int)(e.Pos.y * 8f); // include height: a box that settled to a corrected Y must re-broadcast
                     hash = hash * 31 + (int)(e.Pos.z * 8f);
                 }
                 _hostHeal += 1.5f;
@@ -590,7 +602,14 @@ namespace CardShopCoop.Sync
                 if (box != null)
                 {
                     if (IsLocallyCarried(box))
+                    {
                         CoopPlugin.Log.LogWarning($"host removed the box in your hands (id {id}, {(EItemType)(int)box.m_ItemCompartment.GetItemType()}) - it was consumed host-side");
+                        // CRITICAL: OnDestroyed does NOT exit hold-box mode, so destroying a
+                        // box the guest is holding strands the controller in HoldingBoxState
+                        // forever (soft-lock: can't interact with anything, not even the trash).
+                        // Release hold-box mode FIRST via the game's own exit.
+                        try { CoopCore.ForceExitHoldBox(box); } catch { }
+                    }
                     _idOf.Remove(box);
                     UnhookIfStored(box);
                     try { box.OnDestroyed(); } catch { }
@@ -839,8 +858,10 @@ namespace CardShopCoop.Sync
                         try
                         {
                             // kill local tumble and WAKE the body: a sleeping rigidbody
-                            // teleported mid-air hangs there frozen until poked
-                            var rb = box.GetComponentInChildren<Rigidbody>();
+                            // teleported mid-air hangs there frozen until poked. Use the
+                            // REAL body (m_Rigidbody), not GetComponentInChildren which can
+                            // return the kinematic rig-mesh child and skip the wake entirely.
+                            var rb = box.m_Rigidbody;
                             if (rb != null && !rb.isKinematic)
                             {
                                 rb.velocity = Vector3.zero;

@@ -543,7 +543,8 @@ namespace CardShopCoop
                     CoopPlugin.Log.LogInfo($"applied {_pendingCardDeltas.Count} card change(s) held during loading");
                 _pendingCardDeltas.Clear();
                 Patches.GamePatches.ApplyingRemotePrice = true;
-                try { foreach (var p in _pendingCardPrices) CPlayerData.SetCardPrice(p.Key, p.Value); }
+                try { foreach (var p in _pendingCardPrices) if (p.Key.cardGrade <= 10) CPlayerData.SetCardPrice(p.Key, p.Value); }
+                catch (Exception e) { CoopPlugin.Log.LogWarning("pending card price apply: " + e.Message); }
                 finally { Patches.GamePatches.ApplyingRemotePrice = false; }
                 _pendingCardPrices.Clear();
             });
@@ -862,6 +863,56 @@ namespace CardShopCoop
         private static readonly FieldInfo FiHoldBoxShelf = HarmonyLib.AccessTools.Field(typeof(InteractionPlayerController), "m_CurrentHoldingBoxShelf");
         private static readonly FieldInfo FiHoldBoxCard = HarmonyLib.AccessTools.Field(typeof(InteractionPlayerController), "m_CurrentHoldingBoxCard");
         private static readonly FieldInfo FiHoldItemList = HarmonyLib.AccessTools.Field(typeof(InteractionPlayerController), "m_HoldItemList");
+        private static readonly FieldInfo FiIsHoldBoxMode = HarmonyLib.AccessTools.Field(typeof(InteractionPlayerController), "m_IsHoldBoxMode");
+
+        /// <summary>A box the local player is actively holding is about to be destroyed by a
+        /// reconcile. The game's InteractablePackagingBox.OnDestroyed does NOT exit hold-box
+        /// mode (only Throw/Place/Store/Discard do), so m_IsHoldBoxMode + the HoldingBoxState
+        /// would stay set forever pointing at a fake-null box - and Update() then ONLY
+        /// dispatches RaycastHoldBoxState, so the player can't interact with anything, not even
+        /// the trash (the guest soft-lock report). Call the game's own public exit first so the
+        /// state clears cleanly. No-op unless the box really is one the player holds.</summary>
+        public static void ForceExitHoldBox(UnityEngine.Object heldBox)
+        {
+            var self = Instance;
+            var ipc = self != null ? self._playerIpc : null;
+            if (ipc == null) return;
+            try
+            {
+                var a = FiHoldItemBox?.GetValue(ipc);
+                var b = FiHoldBox?.GetValue(ipc);
+                var c = FiHoldBoxCard?.GetValue(ipc);
+                if (!ReferenceEquals(a, heldBox) && !ReferenceEquals(b, heldBox) && !ReferenceEquals(c, heldBox)) return;
+                ipc.OnExitHoldBoxMode();
+                CoopPlugin.Log.LogInfo("ForceExitHoldBox: released hold-box mode for a box being retired by reconcile");
+            }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("ForceExitHoldBox: " + e.Message); }
+        }
+
+        /// <summary>Per-frame safety net: if the game is stuck in hold-box mode but the held
+        /// box is gone (fake-null) - e.g. a player who hit the soft-lock before this fix -
+        /// exit hold-box mode so they can interact again.</summary>
+        private void RecoverStuckHoldBox()
+        {
+            if (_playerIpc == null) return;
+            try
+            {
+                if (FiIsHoldBoxMode?.GetValue(_playerIpc) is bool held && held)
+                {
+                    var box = FiHoldBox?.GetValue(_playerIpc) as UnityEngine.Object;
+                    var itemBox = FiHoldItemBox?.GetValue(_playerIpc) as UnityEngine.Object;
+                    var cardBox = FiHoldBoxCard?.GetValue(_playerIpc) as UnityEngine.Object;
+                    // Unity fake-null: a destroyed object == null. If hold-box mode is on but
+                    // every candidate box is null/destroyed, nothing can ever clear it.
+                    if (box == null && itemBox == null && cardBox == null)
+                    {
+                        _playerIpc.OnExitHoldBoxMode();
+                        CoopPlugin.Log.LogInfo("RecoverStuckHoldBox: cleared a stranded hold-box lock (no live held box)");
+                    }
+                }
+            }
+            catch { }
+        }
 
         private readonly List<int> _holdTypesBuf = new List<int>(6);
         private readonly List<CardData> _holdCardsBuf = new List<CardData>(4);
@@ -1471,6 +1522,9 @@ namespace CardShopCoop
             // there and clears only after they actually return to the menu.
             if (GuestBorrowedWorld && Role == CoopRole.None && !InGameLevel())
                 GuestBorrowedWorld = false;
+
+            // guest soft-lock safety net: recover from a stranded hold-box mode
+            if (Role == CoopRole.Client && InGameLevel()) RecoverStuckHoldBox();
 
             AutoTick(Time.deltaTime);
 
@@ -3044,7 +3098,12 @@ namespace CardShopCoop
                             break;
                         }
                         Patches.GamePatches.ApplyingRemotePrice = true;
-                        try { CPlayerData.SetCardPrice(card, price); }
+                        // a graded card with a composite/un-clamped grade (>10, from Grading
+                        // Overhaul + GradeDataLifeSaver) would IndexOutOfRange the vanilla
+                        // 10-slot price array; that price is owned by the grading mod, so skip
+                        // the vanilla write instead of crashing the whole message dispatch.
+                        try { if (card.cardGrade <= 10) CPlayerData.SetCardPrice(card, price); }
+                        catch (Exception e) { CoopPlugin.Log.LogWarning("card price apply: " + e.Message); }
                         finally { Patches.GamePatches.ApplyingRemotePrice = false; }
                     }
                     break;

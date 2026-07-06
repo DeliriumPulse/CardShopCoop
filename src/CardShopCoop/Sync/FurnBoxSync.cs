@@ -508,12 +508,22 @@ namespace CardShopCoop.Sync
                     {
                         if (boxed == null || lastCarried)
                         {
+                            // if a player is holding this box, release hold-box mode first or
+                            // OnDestroyed strands them in the soft-lock (no-op if not held)
+                            try { CoopCore.ForceExitHoldBox(box); } catch { }
                             box.OnDestroyed(); // boxed object (if any) dies too - the sell
                         }
                         else
                         {
-                            var p = box.transform.position; p.y = 0f;
-                            PlaceFromBox(boxed, p, box.transform.eulerAngles.y);
+                            // Unpack inferred from the delivery box vanishing. Do NOT fabricate
+                            // a placement rotation from the box's COSMETIC (random) spawn yaw -
+                            // that placed furniture DIAGONALLY and then became the authoritative
+                            // pose. Unbox in place, keeping the object's own (straight) rotation;
+                            // PopulationSync + ObjMoveSync carry the real placed pose to us.
+                            FiMovingValid?.SetValue(boxed, true);
+                            boxed.gameObject.SetActive(true);
+                            boxed.PlaceMovedObject();
+                            ObjMoveSync.SyncTagGroup(boxed.transform);
                         }
                     }
                     catch (Exception e) { CoopPlugin.Log.LogWarning("FurnBoxSync retire: " + e.Message); }
@@ -803,8 +813,10 @@ namespace CardShopCoop.Sync
                     ObjMoveSync.SyncTagGroup(t); // box price tags ride in their own group
                     try
                     {
-                        // a sleeping rigidbody teleported mid-air hangs there frozen
-                        var rb = box.GetComponentInChildren<Rigidbody>();
+                        // a sleeping rigidbody teleported mid-air hangs there frozen. Use the
+                        // real body (m_Rigidbody), not GetComponentInChildren (which can return
+                        // the kinematic rig-mesh child and skip the wake -> frozen floating box).
+                        var rb = box.m_Rigidbody;
                         if (rb != null && !rb.isKinematic)
                         {
                             rb.velocity = Vector3.zero;

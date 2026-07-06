@@ -112,7 +112,10 @@ namespace CardShopCoop.Sync
 
         public static bool MatureBlockPrefix()
         {
-            return CoopCore.Role != CoopRole.Client;
+            // block guest-side maturation whenever we're a client OR still standing in the
+            // host's borrowed world (post-disconnect), same guard as the save-guard; the
+            // host owns grading progress and the guest is a pure mirror
+            return CoopCore.Role != CoopRole.Client && !CoopCore.GuestBorrowedWorld;
         }
 
         public static bool SubmitPrefix(GradedCardSubmitSelectScreen __instance)
@@ -364,6 +367,18 @@ namespace CardShopCoop.Sync
                     m_MinutePassed = br.ReadSingle(),
                     m_CardDataList = new List<CardData>(MaxSlots),
                 };
+                // The vanilla status UI draws days-left as (m_ServiceDays - m_DayPassed) with
+                // NO lower clamp. On the host a set is destroyed the instant it matures, so it
+                // never shows <=0. The guest doesn't run maturation, so a mirrored m_DayPassed
+                // that reaches/exceeds m_ServiceDays would render "-1 Jour". Clamp so days-left
+                // is always >= 1 for anything the guest can display (matches vanilla semantics).
+                try
+                {
+                    var svc = Inv()?.m_MonsterData_SO?.GetGradeCardServiceData(set.m_ServiceLevel);
+                    if (svc != null)
+                        set.m_DayPassed = Mathf.Clamp(set.m_DayPassed, 0, Mathf.Max(0, svc.m_ServiceDays - 1));
+                }
+                catch { }
                 int n = Mathf.Min(br.ReadByte(), MaxSlots);
                 for (int j = 0; j < n; j++) set.m_CardDataList.Add(Msg.ReadCard(br));
                 // GradedCardSetCheckStatusScreen repaints exactly m_CardDataList.Count

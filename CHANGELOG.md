@@ -5,6 +5,16 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.0.25
+**Field-report batch: guest soft-lock, diagonal furniture, floating boxes, grading countdown.**
+- **Fixed a guest soft-lock:** if a box you were holding got consumed on the host's side, the game left you stuck in "carry" mode with an invisible box — unable to interact with anything, not even the trash. The mod now releases carry mode before retiring a held box, and there's a safety net that auto-frees anyone who was already stuck.
+- **Fixed furniture placing diagonally** (for host and guest): the other player was rebuilding just-unpacked furniture using the *delivery box's* random rotation instead of the real placement, and that wrong angle then became authoritative. Unpacked furniture now keeps its true placed pose.
+- **Fixed boxes floating frozen in mid-air** on storage shelves: the mod was reading the wrong (rig-mesh) rigidbody, so it broadcast un-settled poses and never woke the teleported box. It now uses the box's real physics body, so loose boxes settle and wake correctly.
+- **Fixed grading status showing "-1 day"** remaining for the joiner: the countdown was computed from the guest's own day counter; it's now clamped to the shared host progress so it can't go negative.
+- **Graded cards (partial):** stopped a possible crash when a graded card's price arrives with an un-clamped grade (from Grading Overhaul / GradeDataLifeSaver). Full graded-card sync on modded grades is still being worked on — if both players run the same grading mods, some graded cards may not appear in the other's binder yet. (Both players must run the identical grading mods for graded cards to sync at all.)
+
+Both players must update — the launcher does it automatically.
+
 ## 1.0.24
 **Fixed: the guest was autosaving the host's world into its own save slot.**
 - We claimed a joiner never saves, but a hole let it through: our save guard only blocked saves while you were actively connected (`Role == Client`). After the host left — or the day rolled over, or you quit — you were still *standing in the host's shop* but no longer "a client," so the game's autosave fired and wrote the **host's** world over **your** save slot (the "saves get bundled together" reports).
