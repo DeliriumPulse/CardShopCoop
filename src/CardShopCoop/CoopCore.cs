@@ -18,6 +18,14 @@ namespace CardShopCoop
     {
         public static CoopCore Instance { get; private set; }
         public static CoopRole Role { get; private set; } = CoopRole.None;
+        /// <summary>True from the moment the guest joins until it returns to the title
+        /// screen. The guest is standing in the HOST'S world; saving would overwrite the
+        /// guest's own slot with the host's shop. This stays set through a mid-session
+        /// disconnect (when Role goes back to None but the guest is STILL in the borrowed
+        /// world - the "keep walking around" state), so a day-end autosave or a quit-save
+        /// after the host leaves can't pollute the guest's save. Cleared once the guest is
+        /// safely back at the title (no session AND out of any game level) - see Update.</summary>
+        public static bool GuestBorrowedWorld;
 
         public string StatusLine = "Not connected";
         public string ErrorLine = "";
@@ -375,6 +383,7 @@ namespace CardShopCoop
             if (InGameLevel()) { ErrorLine = "Go to the main menu first, then accept the invite again."; return; }
             if (!_steamLobby.SteamAvailable()) { ErrorLine = "Steam isn't running."; return; }
             Role = CoopRole.Client;
+            GuestBorrowedWorld = true; // block ALL saves until we're back at the title screen
             IsSteamSession = true;
             _joinPassword = password ?? "";
             LastFailedLobby = lobby;
@@ -943,6 +952,7 @@ namespace CardShopCoop
 
             CoopPlugin.LastJoinIP.Value = ip;
             Role = CoopRole.Client;
+            GuestBorrowedWorld = true; // block ALL saves until we're back at the title screen
             StatusLine = "Connecting to " + ip + "...";
             var net = new Transport { KeepaliveFrame = Msg.Build(MsgType.Ping) };
             _net = net;
@@ -1414,6 +1424,12 @@ namespace CardShopCoop
             _pendingKicks.Clear();
             Application.runInBackground = false; // back to the game's normal behavior
             Role = CoopRole.None;
+            // Only clear the save guard if we're NOT in a level - i.e. a join that failed at
+            // the title before loading the host's world. A mid-session disconnect leaves the
+            // guest standing in the borrowed world, so the guard MUST persist (a day-end
+            // autosave or quit-save would otherwise write the host's shop to the guest's slot).
+            // The title screen clears it on the clean way out.
+            if (!InGameLevel()) GuestBorrowedWorld = false;
             if (reason != null)
             {
                 StatusLine = "Not connected (" + reason + ")";
@@ -1448,6 +1464,13 @@ namespace CardShopCoop
             {
                 try { act(); } catch (Exception e) { CoopPlugin.Log.LogError(e); }
             }
+
+            // Release the guest save-guard only once we're safely back at the title: no
+            // session AND out of any game level. Post-disconnect the guest is Role.None but
+            // still standing in the host's world (InGameLevel true), so the guard persists
+            // there and clears only after they actually return to the menu.
+            if (GuestBorrowedWorld && Role == CoopRole.None && !InGameLevel())
+                GuestBorrowedWorld = false;
 
             AutoTick(Time.deltaTime);
 

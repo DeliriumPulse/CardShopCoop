@@ -5,6 +5,13 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.0.24
+**Fixed: the guest was autosaving the host's world into its own save slot.**
+- We claimed a joiner never saves, but a hole let it through: our save guard only blocked saves while you were actively connected (`Role == Client`). After the host left — or the day rolled over, or you quit — you were still *standing in the host's shop* but no longer "a client," so the game's autosave fired and wrote the **host's** world over **your** save slot (the "saves get bundled together" reports).
+- The guard now tracks a *borrowed-world* state that's set the moment you join and stays set through a disconnect until you actually return to the **title screen** — so no autosave, day-end save, or quit-save can touch your own saves while you're in someone else's shop. Your solo saves are now genuinely never touched.
+
+Both players must update — the launcher does it automatically.
+
 ## 1.0.23
 **Tutorial/task progression now syncs to the guest.**
 - Previously every tutorial task was host-only: the guest's task panel stayed stuck on "Set the shop sign to OPEN" (and never advanced past any later task) because the actions that credit tasks were forwarded to the host and only advanced the *host's* tutorial. The host now ships its authoritative task progress with the rest of the shop state, and the guest replays it — so both players' task lists advance together.

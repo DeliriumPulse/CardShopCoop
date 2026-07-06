@@ -276,13 +276,17 @@ namespace CardShopCoop.Patches
             }
         }
 
-        public static bool SaveGuardPrefix(ref int saveSlotIndex)
+        public static bool SaveGuardPrefix()
         {
             // A joiner is a visitor in the HOST's save: it re-downloads the world at every
-            // join, so client-side saving is pure waste - and each autosave is a full JSON
-            // serialize + GC.Collect stutter. Joiners write nothing; the host's save is
-            // the single source of truth.
-            return CoopCore.Role != CoopRole.Client;
+            // join, so client-side saving is pure waste - and worse, it would overwrite the
+            // guest's OWN save slot with the host's shop. Block a save whenever we're a
+            // client OR still holding a borrowed (host) world - the latter covers the
+            // window AFTER a mid-session disconnect (Role back to None) while the guest is
+            // still standing in the host's world, where a day-end autosave or a quit-save
+            // used to slip through and pollute the guest's slot. The host's save is the
+            // single source of truth. (No ref param: we only ever block, never reroute.)
+            return CoopCore.Role != CoopRole.Client && !CoopCore.GuestBorrowedWorld;
         }
 
         public static bool ClientBlockPrefix()
