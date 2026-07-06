@@ -453,24 +453,31 @@ namespace CardShopCoop.Sync
             var p = Get<InteractableAutoPackOpener>(KindPackOpener, idx);
             if (p == null) return;
             var output = p.GetCompactCardDataAmountList();
-            if (output == null || output.Count == 0) return; // stale collect - already taken
-            // the collector's reveal already put its snapshot of the cards into the
-            // shared binder (via the AddCard mirror); only bank the DIFFERENCE - packs
-            // that finished after the client's last state echo
-            for (int i = 0; i < output.Count; i++)
+            // Even if there's nothing left to bank (a stale/duplicate collect, or the host
+            // already collected), still force the machine idle below. The old early-return
+            // left m_IsProcessing pinned TRUE, and the heal then rebroadcast processing=true
+            // to the guest forever - so the guest could never add packs again ("no empty
+            // slot") after the first collect, while the host was unaffected.
+            if (output != null && output.Count > 0)
             {
-                var o = output[i];
-                if (o == null) continue;
-                int rem = o.amount - AmountFor(revealed, o);
-                if (rem <= 0) continue;
-                var cd = CPlayerData.GetCardData(o.cardSaveIndex, o.expansionType, o.isDestiny);
-                if (cd != null) CPlayerData.AddCard(cd, rem); // mirrored back to the collector
+                // the collector's reveal already put its snapshot of the cards into the
+                // shared binder (via the AddCard mirror); only bank the DIFFERENCE - packs
+                // that finished after the client's last state echo
+                for (int i = 0; i < output.Count; i++)
+                {
+                    var o = output[i];
+                    if (o == null) continue;
+                    int rem = o.amount - AmountFor(revealed, o);
+                    if (rem <= 0) continue;
+                    var cd = CPlayerData.GetCardData(o.cardSaveIndex, o.expansionType, o.isDestiny);
+                    if (cd != null) CPlayerData.AddCard(cd, rem); // mirrored back to the collector
+                }
+                int opened = p.GetPackOpenedCount();
+                CPlayerData.m_GameReportDataCollect.cardPackOpened += opened;
+                CPlayerData.m_GameReportDataCollectPermanent.cardPackOpened += opened;
+                AchievementManager.OnCardPackOpened(CPlayerData.m_GameReportDataCollectPermanent.cardPackOpened);
+                output.Clear();
             }
-            int opened = p.GetPackOpenedCount();
-            CPlayerData.m_GameReportDataCollect.cardPackOpened += opened;
-            CPlayerData.m_GameReportDataCollectPermanent.cardPackOpened += opened;
-            AchievementManager.OnCardPackOpened(CPlayerData.m_GameReportDataCollectPermanent.cardPackOpened);
-            output.Clear();
             FiPoOpenedCount?.SetValue(p, 0);
             FiPoIsProcessing?.SetValue(p, false);
             p.m_CurrentState = 0;
@@ -479,6 +486,7 @@ namespace CardShopCoop.Sync
                 ui.SetUIState(0);
                 ui.UpdatePackCountText(0, p.m_MaxPackCount);
             }
+            _lastHash.Remove((KindPackOpener << 8) | idx); // force an idle rebroadcast next tick
         }
 
         private void HostApplyBoxTake(int idx, Vector3 reqPos)
@@ -553,6 +561,12 @@ namespace CardShopCoop.Sync
                             m.Timer = timer;
                             m.OpenedCount = opened;
                             m.Output = output;
+                            // the pack opener was the only container kind with NO touch guard:
+                            // a stale/heal "processing=true" echo arriving right after the
+                            // guest's own local collect re-pinned m_IsProcessing and blocked
+                            // any further insert ("no empty slot"). Skip a stale echo for ~6s
+                            // after a local collect/insert (the record is already consumed).
+                            if (IsTouched(kind, idx)) break;
                             ApplyPackMirrorToMachine(p, m);
                             break;
                         }
@@ -754,6 +768,7 @@ namespace CardShopCoop.Sync
                     bw.Write((byte)idx);
                     WriteCards(bw, revealed);
                 });
+                Touch(KindPackOpener, idx); // protect the local "now idle" state from a stale echo
                 m.Output.Clear();
                 m.Processing = false;
                 m.OpenedCount = 0;
@@ -861,6 +876,7 @@ namespace CardShopCoop.Sync
                     bw.Write((byte)idx);
                     bw.Write(itemType);
                 });
+                self.Touch(KindPackOpener, idx); // protect the local insert from a stale echo
             }
             // the caller strips the item out of its (synced) box either way; retire it
             // here so it doesn't float in the world - the host's insert echoes back

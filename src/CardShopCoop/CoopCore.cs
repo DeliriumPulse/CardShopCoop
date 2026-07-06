@@ -3133,7 +3133,10 @@ namespace CardShopCoop
                     using (var br = Msg.Reader(msg.Payload))
                     {
                         var entries = ObjMoveSync.ReadEntries(br);
-                        _objMoves.ApplyRemote(entries);
+                        // host authority: never let a client's (possibly stale) move-request
+                        // override an object the host is actively dragging - that echo is what
+                        // snapped placed machines back to their old spot every guest tick
+                        _objMoves.ApplyRemote(entries, dropIfHostMoving: true);
                         if (_net.ConnectionCount > 1) // see ShelfRequest note
                             Broadcast(MsgType.ObjMoveDelta, bw => ObjMoveSync.WriteEntries(bw, entries));
                     }

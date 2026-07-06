@@ -90,6 +90,15 @@ namespace CardShopCoop.Sync
                 var obj = list[i] as Component;
                 if (obj == null || !obj.gameObject.activeInHierarchy) continue; // boxed/carried
                 int key = (kind << 24) | (i & 0xFFFF);
+                // Never author a move for an object the game is actively moving (a drag in
+                // progress). On the guest there is nothing legitimate to report mid-drag, and
+                // reporting the pre-settle pose is exactly the packet that races the host's
+                // settle-delta and starts the snap-back / off-grid-rotation echo war.
+                if (obj is InteractableObject moving && moving.GetIsMovingObject())
+                {
+                    _candidate.Remove(key);
+                    continue;
+                }
                 var p = obj.transform.position;
                 var r = obj.transform.rotation;
 
@@ -114,7 +123,17 @@ namespace CardShopCoop.Sync
             }
         }
 
-        public void ApplyRemote(List<Entry> entries)
+        // the auto pack opener's world-space UI panel is NOT a child of the machine, so a
+        // bare transform set leaves it stranded at the old spot; SetUITransform re-anchors it
+        // (private - runs on OnPlacedMovedObject, which a headless remote move never triggers).
+        private static readonly System.Reflection.MethodInfo _miOpenerSetUI =
+            HarmonyLib.AccessTools.Method(typeof(InteractableAutoPackOpener), "SetUITransform");
+
+        /// <summary>Apply remote object poses. <paramref name="dropIfHostMoving"/> is set on
+        /// the HOST when applying a client's move-request: an object the host is currently
+        /// dragging must NOT be yanked to the client's stale pose (the snap-back echo war) -
+        /// the baseline is refreshed so Walk won't re-echo, but the object is left alone.</summary>
+        public void ApplyRemote(List<Entry> entries, bool dropIfHostMoving = false)
         {
             var sm = Sm();
             if (sm == null) return;
@@ -124,8 +143,19 @@ namespace CardShopCoop.Sync
                 {
                     var t = Resolve(sm, e.Key);
                     if (t == null) continue;
+                    var io = t.GetComponent<InteractableObject>();
+                    if (dropIfHostMoving && io != null && io.GetIsMovingObject())
+                    {
+                        // the game's move machinery owns this transform right now; writing a
+                        // stale incoming pose fights the drag and re-asserts the old pose.
+                        // Just refresh the baseline so our own Walk won't re-report it.
+                        _sent[e.Key] = new Pose { P = t.position, R = t.rotation, Valid = true };
+                        _candidate.Remove(e.Key);
+                        continue;
+                    }
                     t.SetPositionAndRotation(e.Pos, e.Rot);
                     SyncTagGroup(t);
+                    if (io is InteractableAutoPackOpener) { try { _miOpenerSetUI?.Invoke(io, null); } catch { } }
                     _sent[e.Key] = new Pose { P = e.Pos, R = e.Rot, Valid = true };
                     _candidate.Remove(e.Key);
                 }

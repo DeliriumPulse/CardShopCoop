@@ -5,22 +5,23 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
-## 1.0.26
-**More field fixes: host-pause freeze, trade customers, box-off-shelf, card prices.**
-- **Fixed: the host pausing froze everything for the guest.** The pause menu sets the game's time to a full stop, which also stopped the co-op network tick. In a session the world now keeps running under the pause menu, so neither player can freeze the other by opening pause.
-- **Fixed: the guest couldn't answer trade / sell-in customers** (the ones with the red "!"). The trade worked, but there was no way to discover it — clicking the customer does nothing on the guest's side, and the "press the serve key at the counter" prompt only showed when you were already right at the till. Now a **walk-up hint** appears whenever a customer wants to trade, telling you to go to the counter and press your serve key (V by default), and the trade prompt no longer gets hidden behind the checkout prompt.
-- **Fixed: a box taken off a storage rack didn't update for the other player** (it stayed stuck on the shelf on their screen). The take now mirrors reliably in both directions.
-- **Fixed: card prices set on a display not showing for the other player.** Card prices now re-send periodically (change-gated) so a single dropped update self-corrects — same self-heal item prices already had. Note: *play tables* can't hold priced cards at all (they're for customer card games) — use the glass display counter to sell cards.
-
-Both players must update — the launcher does it automatically.
-
 ## 1.0.25
-**Field-report batch: guest soft-lock, diagonal furniture, floating boxes, grading countdown.**
-- **Fixed a guest soft-lock:** if a box you were holding got consumed on the host's side, the game left you stuck in "carry" mode with an invisible box — unable to interact with anything, not even the trash. The mod now releases carry mode before retiring a held box, and there's a safety net that auto-frees anyone who was already stuck.
-- **Fixed furniture placing diagonally** (for host and guest): the other player was rebuilding just-unpacked furniture using the *delivery box's* random rotation instead of the real placement, and that wrong angle then became authoritative. Unpacked furniture now keeps its true placed pose.
-- **Fixed boxes floating frozen in mid-air** on storage shelves: the mod was reading the wrong (rig-mesh) rigidbody, so it broadcast un-settled poses and never woke the teleported box. It now uses the box's real physics body, so loose boxes settle and wake correctly.
-- **Fixed grading status showing "-1 day"** remaining for the joiner: the countdown was computed from the guest's own day counter; it's now clamped to the shared host progress so it can't go negative.
-- **Graded cards (partial):** stopped a possible crash when a graded card's price arrives with an un-clamped grade (from Grading Overhaul / GradeDataLifeSaver). Full graded-card sync on modded grades is still being worked on — if both players run the same grading mods, some graded cards may not appear in the other's binder yet. (Both players must run the identical grading mods for graded cards to sync at all.)
+**Big field-report batch from live co-op testing** — thanks to everyone reporting in the Discord.
+
+**Placement, boxes & machines**
+- **Fixed: placed objects/machines snapping back** to their old spot when the host moved them, and **objects landing a few degrees off the rotation grid** (couldn't align, showed red). Both were the same bug — an object-move tug-of-war where the guest kept re-asserting the old pose. The host is now authoritative over an object it's actively moving, and the guest no longer fights it.
+- **Fixed the auto card opener** in co-op: the guest couldn't add packs after collecting once ("no empty slot" — the machine stayed stuck "processing"), and the machine's UI panel floated at the old spot after the host moved it. Both fixed; you no longer have to leave it in one place.
+- **Fixed a guest soft-lock:** if a box you were holding got consumed on the host's side, you'd be stuck in "carry" mode with an invisible box — unable to interact with anything, not even the trash. Now it releases carry mode first, plus a safety net that auto-frees anyone already stuck.
+- **Fixed furniture placing diagonally** (host and guest): unpacked furniture now keeps its true placed pose instead of the delivery box's random angle.
+- **Fixed boxes floating frozen in mid-air** on storage shelves (the mod was reading the wrong rigidbody) and **a box taken off a storage rack** staying stuck on the shelf for the other player.
+
+**Customers, prices & world**
+- **Fixed: the host pausing froze everything for the guest.** Pause stops game time, which stopped the co-op tick; the world now keeps running under the pause menu during a session.
+- **Fixed: the guest couldn't answer trade / sell-in customers** (the red "!" ones). It worked, but was undiscoverable — clicking the customer does nothing on the guest, and the prompt only showed right at the till. Now a **walk-up hint** tells the guest to go to the counter and press the serve key (V) whenever a customer wants to trade.
+- **Fixed: card prices set on a display not showing for the other player** — card prices now re-send periodically so a dropped update self-corrects. (Note: *play tables* can't hold priced cards — use the glass display counter to sell cards.)
+- **Fixed grading status showing "-1 day"** remaining for the joiner (clamped to the shared host progress).
+
+**Grading (partial):** guarded a possible crash from modded (un-clamped) grade values. Full graded-card sync with grading mods is still WIP — both players must run the **identical** grading mods, and some graded cards may not yet appear in the other's binder.
 
 Both players must update — the launcher does it automatically.
 
