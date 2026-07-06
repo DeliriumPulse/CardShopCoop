@@ -60,6 +60,10 @@ namespace CardShopCoop.Sync
         public Action<Action<BinaryWriter>> SendOp;
         /// <summary>Set by CoopCore: host -> clients state (MsgType.ContainerState).</summary>
         public Action<Action<BinaryWriter>> BroadcastState;
+        /// <summary>Set by CoopCore: ask BoxSync to broadcast the loose-box population on the
+        /// next tick, so a freshly dispensed empty box appears on the guest within one tick
+        /// instead of up to ~1.5s.</summary>
+        public Action RequestBoxResync;
 
         /// <summary>True while sync code itself mutates a container, so the forwarding
         /// patches don't mistake an applied echo for a local player action.</summary>
@@ -391,6 +395,10 @@ namespace CardShopCoop.Sync
                         int idx = br.ReadByte();
                         var reqPos = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
                         HostApplyBoxTake(idx, reqPos);
+                        // forget the cached count so the corrected value re-broadcasts on the
+                        // NEXT tick instead of waiting up to ~15s for the heal (else the guest
+                        // sees a stale-high count and each further click "can't pick up")
+                        _lastHash.Remove((KindBoxStorage << 8) | idx);
                         break;
                     }
                     case OpBoxStore:
@@ -402,6 +410,7 @@ namespace CardShopCoop.Sync
                         if (s.GetBoxStoredCount() >= max) break;
                         FiEbCount?.SetValue(s, s.GetBoxStoredCount() + 1);
                         MiEbEval?.Invoke(s, null);
+                        _lastHash.Remove((KindBoxStorage << 8) | idx);
                         break;
                     }
                     case OpCleanserToggle:
@@ -488,6 +497,8 @@ namespace CardShopCoop.Sync
             box.SetOpenCloseBox(isOpen: false, isPlayer: false);
             FiEbCount?.SetValue(s, s.GetBoxStoredCount() - 1);
             MiEbEval?.Invoke(s, null);
+            // push the freshly spawned box to the guest promptly (else up to ~1.5s late)
+            RequestBoxResync?.Invoke();
         }
 
         // ---------------- client: apply authoritative state ----------------
@@ -549,7 +560,12 @@ namespace CardShopCoop.Sync
                         {
                             int count = br.ReadInt32();
                             var s = Get<InteractableEmptyBoxStorage>(kind, idx);
-                            if (s == null || IsTouched(kind, idx)) break;
+                            // do NOT gate on IsTouched here: on a TAKE the guest suppresses
+                            // its local count entirely (no local write to protect), so the
+                            // touch-guard only stranded the authoritative count for ~15s and
+                            // made further takes look like "can't pick up". The record is
+                            // already consumed above, so stream position is safe.
+                            if (s == null) break;
                             FiEbCount?.SetValue(s, count);
                             MiEbEval?.Invoke(s, null);
                             break;

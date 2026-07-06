@@ -96,9 +96,12 @@ namespace CardShopCoop.Sync
                     int n = list?.Count ?? 0;
                     hash = hash * 31 + n;
                     if (list != null)
-                        for (int i = 0; i < n && i < 250; i++)
+                        for (int i = 0; i < n; i++)
                             if (list[i] is InteractableObject obj)
-                                hash = hash * 31 + (int)obj.m_ObjectType;
+                                // decorations (kind 5) have m_ObjectType == None(-1); their
+                                // real identity is m_DecoObjectType, so hash THAT or a deco
+                                // add/remove that preserves count never re-broadcasts
+                                hash = hash * 31 + ((kind == 5) ? (int)obj.m_DecoObjectType : (int)obj.m_ObjectType);
                 }
                 _heal += 3f;
                 if (hash == _lastHash && _heal < 30f) return;
@@ -111,13 +114,15 @@ namespace CardShopCoop.Sync
                     var entries = new List<Entry>(list?.Count ?? 0);
                     if (list != null)
                     {
-                        for (int i = 0; i < list.Count && i < 250; i++)
+                        for (int i = 0; i < list.Count; i++)
                         {
                             var obj = list[i] as InteractableObject;
                             if (obj == null) continue;
                             entries.Add(new Entry
                             {
-                                ObjType = (int)obj.m_ObjectType,
+                                // kind 5 = decorations: serialize the deco enum, not the -1
+                                // m_ObjectType, so the guest can actually spawn them
+                                ObjType = (kind == 5) ? (int)obj.m_DecoObjectType : (int)obj.m_ObjectType,
                                 Pos = obj.transform.position,
                                 Rot = obj.transform.rotation,
                             });
@@ -165,9 +170,12 @@ namespace CardShopCoop.Sync
             {
                 var obj = list[i] as InteractableObject;
                 if (obj == null) continue;
-                if ((int)obj.m_ObjectType != want[i].ObjType)
+                // compare on the correct identity per kind, or a wrong deco variant (whose
+                // m_ObjectType is always -1) could never be detected and repaired
+                int cur = (kind == 5) ? (int)obj.m_DecoObjectType : (int)obj.m_ObjectType;
+                if (cur != want[i].ObjType)
                 {
-                    CoopPlugin.Log.LogInfo($"population: repairing index {i} (kind {kind}): {obj.m_ObjectType} -> {(EObjectType)want[i].ObjType}");
+                    CoopPlugin.Log.LogInfo($"population: repairing index {i} (kind {kind}): {cur} -> {want[i].ObjType}");
                     obj.OnDestroyed();
                     OnClientStructureChanged?.Invoke(kind);
                     return; // re-align next tick
@@ -180,10 +188,15 @@ namespace CardShopCoop.Sync
             while (list.Count < want.Count && guard-- > 0)
             {
                 var e = want[list.Count];
-                var spawned = ShelfManager.SpawnInteractableObject((EObjectType)e.ObjType);
+                // decorations self-register into m_DecoObjectList via SpawnDecoObject; the
+                // generic SpawnInteractableObject would land them in the wrong list (and
+                // resolve a null prefab from EObjectType.None), so they never appeared
+                var spawned = (kind == 5)
+                    ? ShelfManager.SpawnDecoObject((EDecoObject)e.ObjType)
+                    : ShelfManager.SpawnInteractableObject((EObjectType)e.ObjType);
                 if (spawned == null) break;
                 spawned.transform.SetPositionAndRotation(e.Pos, e.Rot);
-                CoopPlugin.Log.LogInfo($"population: spawned {(EObjectType)e.ObjType} (kind {kind})");
+                CoopPlugin.Log.LogInfo($"population: spawned {(kind == 5 ? ((EDecoObject)e.ObjType).ToString() : ((EObjectType)e.ObjType).ToString())} (kind {kind})");
                 OnClientStructureChanged?.Invoke(kind);
                 list = GetList(sm, kind);
             }
@@ -196,8 +209,10 @@ namespace CardShopCoop.Sync
             bw.Write((byte)all.Count);
             foreach (var entries in all)
             {
-                bw.Write((byte)Mathf.Min(entries.Count, 250));
-                for (int i = 0; i < entries.Count && i < 250; i++)
+                // ushort count (was byte capped at 250): a big shop can hold >250 of one
+                // kind, and a byte cap silently dropped the tail AND could wedge the gate
+                bw.Write((ushort)entries.Count);
+                for (int i = 0; i < entries.Count; i++)
                 {
                     var e = entries[i];
                     bw.Write(e.ObjType);
@@ -213,7 +228,7 @@ namespace CardShopCoop.Sync
             var all = new List<List<Entry>>(kinds);
             for (int k = 0; k < kinds; k++)
             {
-                int n = br.ReadByte();
+                int n = br.ReadUInt16();
                 var entries = new List<Entry>(n);
                 for (int i = 0; i < n; i++)
                 {

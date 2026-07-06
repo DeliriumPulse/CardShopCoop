@@ -149,7 +149,7 @@ namespace CardShopCoop.Sync
         private CustomerManager _cm;
         private InteractionPlayerController _ipc;
         private readonly List<Offer> _hostBuf = new List<Offer>();
-        private readonly HashSet<int> _preRollFailed = new HashSet<int>();   // customer ids; warn once
+        private readonly Dictionary<int, float> _preRollFailUntil = new Dictionary<int, float>(); // customer id -> retry-after (transient failure backoff, never permanent)
         private readonly HashSet<int> _unknownLogged = new HashSet<int>();   // customer ids; log known=false once
 
         // client
@@ -181,7 +181,7 @@ namespace CardShopCoop.Sync
             _cm = null;
             _ipc = null;
             _hostBuf.Clear();
-            _preRollFailed.Clear();
+            _preRollFailUntil.Clear();
             _unknownLogged.Clear();
             _offers.Clear();
             _staleTimer = 0f;
@@ -278,6 +278,25 @@ namespace CardShopCoop.Sync
             var t = _live;
             if (t == null) return false;
             int idx = t._pendingCounter;
+            // THE haggle "$0" bug: the game only writes m_PriceSet on the input field's
+            // onEndEdit (CustomerTradeCardScreen.OnInputTextUpdated). Typing alone runs
+            // OnInputChanged, which updates the DISPLAY only. Pressing Accept (mouse or
+            // our forwarded button) can beat that commit, so m_PriceSet stays stale/$0
+            // while the field visibly shows the typed amount - "it shows the last entered
+            // amount but reads $0". Force-commit the visible field so the forwarded bid is
+            // exactly what the player sees. Sell-in only (trades carry no price field).
+            bool trading = FiScrTrading?.GetValue(__instance) is bool tr && tr;
+            if (!trading)
+            {
+                try
+                {
+                    var field = __instance.m_SetPriceInput;
+                    string txt = field != null ? field.text : null;
+                    if (!string.IsNullOrWhiteSpace(txt))
+                        __instance.OnInputTextUpdated(txt); // parses visible text -> m_PriceSet
+                }
+                catch (Exception e) { CoopPlugin.Log.LogWarning("TradeServe client: price commit: " + e.Message); }
+            }
             float price = FiScrPriceSet?.GetValue(__instance) is float p ? p : 0f;
             // a zero/garbage field means "at the asking price" (-1 tells the host so);
             // a genuine $0 bid is never what an accept press means
@@ -534,7 +553,9 @@ namespace CardShopCoop.Sync
             // never stomp a live trade the host is running in the real UI
             if (screen == null || cm.m_IsPlayerTrading || screen.IsScreenOpened()) return null;
             int id = cust.GetInstanceID();
-            if (_preRollFailed.Contains(id)) return null;
+            // transient backoff, NOT a permanent blacklist: one flaky roll used to mark the
+            // offer host-only for the customer's whole life (guest could never answer it)
+            if (_preRollFailUntil.TryGetValue(id, out var until) && Time.time < until) return null;
             try
             {
                 screen.SetCustomer(cust, null); // sets m_IsPlayerTrading = true itself
@@ -557,8 +578,9 @@ namespace CardShopCoop.Sync
                 };
                 if (data.m_CardData_L == null)
                 {
-                    _preRollFailed.Add(id);
-                    CoopPlugin.Log.LogWarning("TradeServe: pre-roll produced no card; offer left for the host to serve");
+                    // no poison: the card can be momentarily null during pooled activation;
+                    // just retry next tick instead of marking the offer host-only forever
+                    CoopPlugin.Log.LogWarning("TradeServe: pre-roll produced no card; will retry next tick");
                     return null;
                 }
                 FiTradeData?.SetValue(cust, data);
@@ -567,7 +589,7 @@ namespace CardShopCoop.Sync
             }
             catch (Exception e)
             {
-                _preRollFailed.Add(id);
+                _preRollFailUntil[id] = Time.time + 5f; // back off 5s, then retry
                 CoopPlugin.Log.LogWarning("TradeServe pre-roll: " + e.Message);
                 return null;
             }
@@ -678,6 +700,7 @@ namespace CardShopCoop.Sync
 
             if (op == OpDecline)
             {
+                _preRollFailUntil.Remove(cust.GetInstanceID()); // pooled id reuse must not carry backoff
                 FinishCustomer(cust, counter);
                 Result("trade declined - the customer moves on");
                 return;
@@ -763,6 +786,7 @@ namespace CardShopCoop.Sync
 
             if (accepted)
             {
+                _preRollFailUntil.Remove(cust.GetInstanceID()); // pooled id reuse must not carry backoff
                 FinishCustomer(cust, counter);
                 Result(data.m_IsTrading
                     ? $"traded {CardName(data.m_CardData_R)} for {CardName(data.m_CardData_L)}"
@@ -781,6 +805,7 @@ namespace CardShopCoop.Sync
                 // neither the haggle nor the plain-refusal branch ran: vanilla's final
                 // else (out of patience, its CloseScreen no-ops on the closed screen) -
                 // the customer walks, exactly like its own resolution would
+                _preRollFailUntil.Remove(cust.GetInstanceID()); // pooled id reuse must not carry backoff
                 FinishCustomer(cust, counter);
                 Result("the customer lost patience and left");
                 return;
@@ -943,6 +968,16 @@ namespace CardShopCoop.Sync
             // fill BEFORE touching input state: a throw here leaves nothing to unwind
             // (bar m_IsPlayerTrading, which the caller's catch resets)
             screen.SetCustomer(carrier, data);
+            // Seed the EDITABLE input field with the ask. SetCustomer(data != null)
+            // fills the display texts but SKIPS the field init the vanilla (data == null)
+            // path does via OnInputTextUpdated("0") - so without this the field carries a
+            // stale amount from a prior haggle round. SetTextWithoutNotify keeps the
+            // m_PriceSet SetCustomer just wrote authoritative (no onValueChanged/onEndEdit).
+            if (!offer.Trading && screen.m_SetPriceInput != null)
+            {
+                try { screen.m_SetPriceInput.SetTextWithoutNotify(GameInstance.GetPriceString(offer.Price, useDashAsZero: false, useCurrencySymbol: false)); }
+                catch (Exception e) { CoopPlugin.Log.LogWarning("TradeServe client: seed price field: " + e.Message); }
+            }
             var ipc = Ipc();
             if (ipc == null) throw new InvalidOperationException("no InteractionPlayerController");
             ipc.EnterWorkerInteractMode();
@@ -978,6 +1013,10 @@ namespace CardShopCoop.Sync
                     foreach (var kv in _offers) _keyBuf.Add(kv.Key);
                     for (int i = 0; i < _keyBuf.Count; i++)
                     {
+                        // the counter whose native screen the guest currently holds must NOT
+                        // be locally timed out mid-interaction - defer to the host, which
+                        // drops the offer from its broadcast when the customer truly leaves
+                        if (_keyBuf[i] == _pendingCounter) continue;
                         var o = _offers[_keyBuf[i]];
                         o.Remaining -= dt;
                         if (o.Remaining <= 0f) _offers.Remove(_keyBuf[i]);

@@ -52,6 +52,15 @@ namespace CardShopCoop.Patches
             Try(h, typeof(RestockManager), "SpawnPackageBoxItemMultipleFrame",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(OrderPrefix)));
 
+            // The client is a pure box mirror. RestockManager.Update's out-of-bounds /
+            // warehouse-lock sweep teleports stray boxes to an INDEPENDENT random spawn
+            // point; run on the guest it scatters boxes to spots that diverge from the host
+            // (then get adopted as authoritative). Keep the OOB timer pinned below its 5s
+            // threshold on the client so that sweep never fires, while the spawn-drip and
+            // delayed-reset work earlier in Update still run.
+            Try(h, typeof(RestockManager), "Update",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(RestockUpdatePrefix)));
+
             // The shop already has a name (the host's); the joiner's copy must neither
             // prompt for one nor let it be changed.
             Try(h, typeof(ShopRenamer), "ShowRenameShopScreen",
@@ -87,6 +96,12 @@ namespace CardShopCoop.Patches
             // the shared binder silently keeps cards the other side already consumed.
             Try(h, typeof(CPlayerData), "ReduceCardUsingIndex",
                 prefix: null, postfix: new HarmonyMethod(typeof(GamePatches), nameof(ReduceCardIndexPostfix)));
+
+            // Graded cards leave the album ONLY via RemoveGradedCard (a direct list edit
+            // ReduceCard never sees). Mirror it so a graded card traded/donated/re-graded
+            // away on one side also leaves the other side's album instead of ghosting.
+            Try(h, typeof(CPlayerData), "RemoveGradedCard",
+                prefix: null, postfix: new HarmonyMethod(typeof(GamePatches), nameof(RemoveGradedCardPostfix)));
 
             // Domain sync modules register their own patch sets (each guarded internally).
             TryModule("staff", Sync.StaffSync.ApplyPatches, h);
@@ -131,8 +146,9 @@ namespace CardShopCoop.Patches
 
         public static void LicenseUnlockPostfix(int index)
         {
-            if (!ApplyingRemoteLicense && CoopCore.Role != CoopRole.None)
-                CoopCore.Instance?.ForwardLicense(index);
+            if (ApplyingRemoteLicense || CoopCore.Role == CoopRole.None) return;
+            try { CoopCore.Instance?.ForwardLicense(index); }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("LicenseUnlockPostfix forward failed: " + e.Message); }
         }
 
         public static bool FurnitureOrderPrefix(EObjectType objType, UnityEngine.Vector3 spawnPos, UnityEngine.Quaternion spawnRot)
@@ -152,6 +168,18 @@ namespace CardShopCoop.Patches
             if (CoopCore.Role != CoopRole.Client) return true;
             CoopCore.Instance?.ForwardOrder(restockIndex, count);
             return false; // no local phantom boxes; the host's delivery mirrors back
+        }
+
+        private static readonly System.Reflection.FieldInfo FiOobTimer =
+            AccessTools.Field(typeof(RestockManager), "m_OutofBoundCheckTimer");
+
+        public static void RestockUpdatePrefix(RestockManager __instance)
+        {
+            // client only: hold the OOB timer under its 5s trigger so the teleport sweep
+            // (RestockManager.Update, guarded by `if (!(m_OutofBoundCheckTimer > 5f)) return`)
+            // never runs; the host owns box placement and re-broadcasts it every 1.5s.
+            if (CoopCore.Role != CoopRole.Client) return;
+            try { FiOobTimer?.SetValue(__instance, 0f); } catch { }
         }
 
         /// <summary>Skip the move-preview teardown when there's no preview to tear down
@@ -188,24 +216,45 @@ namespace CardShopCoop.Patches
 
         public static void SetCardPricePostfix(CardData cardData, float priceSet)
         {
-            if (!ApplyingRemotePrice && CoopCore.Role != CoopRole.None)
-                CoopCore.Instance?.ForwardCardPrice(cardData, priceSet);
+            if (ApplyingRemotePrice || CoopCore.Role == CoopRole.None) return;
+            try { CoopCore.Instance?.ForwardCardPrice(cardData, priceSet); }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("SetCardPricePostfix forward failed: " + e.Message); }
         }
 
         /// <summary>True while we're applying a card delta that came over the network,
         /// so the postfixes don't echo it back forever.</summary>
         public static bool ApplyingRemoteCards;
 
+        // These postfixes run INSIDE the game's own AddCard/ReduceCard calls - including
+        // the manual pack-open loop (CardOpeningSequence.OpenScreen) which AddCards all 7
+        // cards BEFORE building its reveal lists. A throw escaping here aborts that loop
+        // half-built, and the per-frame reveal then IndexOutOfRanges forever = the guest
+        // "freezes on the first card". Never let a forward failure escape into the caller.
         public static void AddCardPostfix(CardData cardData, int addAmount)
         {
-            if (!ApplyingRemoteCards && CoopCore.Role != CoopRole.None)
-                CoopCore.Instance?.ForwardCardDelta(cardData, addAmount, isAdd: true);
+            if (ApplyingRemoteCards || CoopCore.Role == CoopRole.None) return;
+            try { CoopCore.Instance?.ForwardCardDelta(cardData, addAmount, isAdd: true); }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("AddCardPostfix forward failed: " + e.Message); }
         }
 
         public static void ReduceCardPostfix(CardData cardData, int reduceAmount)
         {
-            if (!ApplyingRemoteCards && CoopCore.Role != CoopRole.None)
-                CoopCore.Instance?.ForwardCardDelta(cardData, reduceAmount, isAdd: false);
+            if (ApplyingRemoteCards || CoopCore.Role == CoopRole.None) return;
+            try { CoopCore.Instance?.ForwardCardDelta(cardData, reduceAmount, isAdd: false); }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("ReduceCardPostfix forward failed: " + e.Message); }
+        }
+
+        /// <summary>Mirror host-side graded-card REMOVALS (trade-in of a wanted-back graded
+        /// card, grading re-submit, donation). Graded cards live in a separate inventory
+        /// (m_GradedCardInventoryList) that ReduceCard never touches, so without this the
+        /// other side keeps a ghost graded card the owner no longer has - the "graded card
+        /// turned fake" report. Runs inside the game's RemoveGradedCard; must never throw.</summary>
+        public static void RemoveGradedCardPostfix(CardData cardData)
+        {
+            if (ApplyingRemoteCards || CoopCore.Role == CoopRole.None) return;
+            if (cardData == null || cardData.cardGrade <= 0) return;
+            try { CoopCore.Instance?.ForwardGradedRemoval(cardData); }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("RemoveGradedCardPostfix forward failed: " + e.Message); }
         }
 
         private static void Try(Harmony h, Type type, string method,

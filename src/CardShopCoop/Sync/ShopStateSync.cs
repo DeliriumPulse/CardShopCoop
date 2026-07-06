@@ -23,6 +23,7 @@ namespace CardShopCoop.Sync
         private const byte OpPayBill = 1;    // + byte: 0=all, else (byte)EBillType
         private const byte OpUnlock = 2;     // + byte kind: 0=room, 1=warehouseRoom, 2=shopB
         private const byte OpToggleSign = 3; // + byte which: 0=open/close, 1=warehouse entry
+        private const byte OpToggleLight = 4; // + byte (unused): guest flipped the shop light switch
 
         private static ShopStateSync _instance; // patches are static; ops route through here
 
@@ -41,6 +42,12 @@ namespace CardShopCoop.Sync
             AccessTools.Method(typeof(InteractableWarehouseAllowEnterSign), "EvaluateSignOpenCloseMesh");
         private static readonly System.Reflection.MethodInfo MiRoomInit =
             AccessTools.Method(typeof(UnlockRoomManager), "Init"); // idempotent wall/door repaint
+        // tutorial/task progress mirror: the subgroup progress fields are private, so we
+        // reset them by reflection before re-feeding the host's authoritative values
+        private static readonly System.Reflection.FieldInfo FiSgCurrent =
+            AccessTools.Field(typeof(TutorialSubGroup), "m_CurrentValue");
+        private static readonly System.Reflection.FieldInfo FiSgFinish =
+            AccessTools.Field(typeof(TutorialSubGroup), "m_IsTaskFinish");
 
         public Action<Action<BinaryWriter>> SendOp;         // set by CoopCore: client -> host
         public Action<Action<BinaryWriter>> BroadcastState; // set by CoopCore: host -> clients
@@ -147,6 +154,12 @@ namespace CardShopCoop.Sync
                 prefix: new HarmonyMethod(typeof(ShopStateSync), nameof(OpenSignPrefix)));
             Try(h, typeof(InteractableWarehouseAllowEnterSign), "OnMouseButtonUp",
                 prefix: new HarmonyMethod(typeof(ShopStateSync), nameof(WarehouseSignPrefix)));
+
+            // Shop light: a joiner's wall-switch click only flipped its own local light.
+            // Forward it; the host toggles authoritatively and the LightState broadcast
+            // flips everyone's light (applied surgically in CoopCore's LightState handler).
+            Try(h, typeof(InteractableLightSwitch), "OnMouseButtonUp",
+                prefix: new HarmonyMethod(typeof(ShopStateSync), nameof(LightSwitchPrefix)));
         }
 
         private static void Try(Harmony h, Type type, string method,
@@ -211,6 +224,15 @@ namespace CardShopCoop.Sync
             return false;
         }
 
+        public static bool LightSwitchPrefix()
+        {
+            if (CoopCore.Role != CoopRole.Client || ApplyingRemote) return true;
+            // block the local-only toggle; forward it (the trailing byte satisfies HostApplyOp's
+            // op+arg read). The host echoes the flipped light back via LightState.
+            _instance?.SendOp?.Invoke(bw => { bw.Write(OpToggleLight); bw.Write((byte)0); });
+            return false;
+        }
+
         public static bool WarehouseSignPrefix()
         {
             if (CoopCore.Role != CoopRole.Client || ApplyingRemote) return true;
@@ -242,6 +264,12 @@ namespace CardShopCoop.Sync
                 hash = hash * 31 + ((CPlayerData.m_IsWarehouseRoomUnlocked ? 1 : 0)
                                   | (CPlayerData.m_IsShopOpen ? 2 : 0)
                                   | (CPlayerData.m_IsWarehouseDoorClosed ? 4 : 0));
+                // re-broadcast when task progress changes so the guest's panel advances
+                hash = hash * 31 + CPlayerData.m_TutorialIndex;
+                var tutList = CPlayerData.m_TutorialDataList;
+                if (tutList != null)
+                    foreach (var td in tutList)
+                        hash = hash * 31 + ((int)td.tutorialTaskCondition * 397) + (int)(td.value * 100f);
                 _heal += 1f;
                 if (hash == _lastHash && _heal < 15f) return;
                 _lastHash = hash;
@@ -264,6 +292,20 @@ namespace CardShopCoop.Sync
             bw.Write(CPlayerData.m_IsWarehouseRoomUnlocked);
             bw.Write(CPlayerData.m_IsShopOpen);
             bw.Write(CPlayerData.m_IsWarehouseDoorClosed);
+
+            // tutorial/task progression: host-only until now, so the guest's task panel
+            // stuck on "Set the shop sign to OPEN" (and every later task) forever. Ship
+            // the host's authoritative task snapshot; the guest replays it. APPEND-ONLY
+            // (read in the same order at the end of ClientApplyInner).
+            var tut = CPlayerData.m_TutorialDataList;
+            bw.Write(CPlayerData.m_TutorialIndex);
+            bw.Write(tut != null ? tut.Count : 0);
+            if (tut != null)
+                foreach (var td in tut)
+                {
+                    bw.Write((int)td.tutorialTaskCondition);
+                    bw.Write(td.value);
+                }
         }
 
         public void HostApplyOp(BinaryReader br)
@@ -278,10 +320,19 @@ namespace CardShopCoop.Sync
                     case OpPayBill: HostPayBill(arg); break;
                     case OpUnlock: HostUnlock(arg); break;
                     case OpToggleSign: HostToggleSign(arg); break;
+                    case OpToggleLight: HostToggleLight(); break;
                 }
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("ShopStateSync op " + op + ": " + e.Message); }
             ForceResend(); // echo promptly even if the op was refused (re-aligns the joiner)
+        }
+
+        /// <summary>Host: run the guest's forwarded shop-light toggle in the real sim. The
+        /// LightState broadcaster then ships the flipped m_IsShopLightOn to all clients.</summary>
+        private void HostToggleLight()
+        {
+            var lm = CSingleton<LightManager>.Instance;
+            if (lm != null) lm.ToggleShopLight();
         }
 
         private void HostPayBill(byte billType)
@@ -417,6 +468,21 @@ namespace CardShopCoop.Sync
             bool wantShopOpen = br.ReadBoolean();
             bool wantWarehouseClosed = br.ReadBoolean();
 
+            // tutorial snapshot (appended last in WriteState) - read here in wire order,
+            // apply after the rest of the state below
+            int tutIndex = br.ReadInt32();
+            int tutN = br.ReadInt32();
+            var incomingTut = new System.Collections.Generic.List<TutorialData>();
+            for (int i = 0; i < tutN && i < 4096; i++)
+            {
+                var td = new TutorialData
+                {
+                    tutorialTaskCondition = (ETutorialTaskCondition)br.ReadInt32(),
+                    value = br.ReadSingle(),
+                };
+                incomingTut.Add(td);
+            }
+
             if (billsChanged && BillScreen() != null)
             {
                 // repaint the totals if the screen happens to be open, and keep the
@@ -470,6 +536,49 @@ namespace CardShopCoop.Sync
                 if (sign != null) { try { MiWarehouseSignMesh?.Invoke(sign, null); } catch { } }
                 else if (urm != null) urm.EvaluateWarehouseRoomOpenClose(); // entry gate still must move
             }
+
+            ApplyTutorial(tutIndex, incomingTut);
+        }
+
+        /// <summary>Client: replay the host's authoritative task progress so the guest's
+        /// tutorial panel advances in step. No-ops when nothing changed (so a routine
+        /// ShopState heal doesn't churn the panel). Resets each subgroup's private progress
+        /// then re-feeds the snapshot value ONCE, which sets rather than accumulates.</summary>
+        private void ApplyTutorial(int tutIndex, System.Collections.Generic.List<TutorialData> incoming)
+        {
+            var cur = CPlayerData.m_TutorialDataList;
+            // skip if identical to what we already have (avoids UI churn every heal)
+            bool same = tutIndex == CPlayerData.m_TutorialIndex && cur != null && cur.Count == incoming.Count;
+            if (same)
+                for (int i = 0; i < incoming.Count; i++)
+                    if (cur[i].tutorialTaskCondition != incoming[i].tutorialTaskCondition
+                        || Mathf.Abs(cur[i].value - incoming[i].value) > 0.001f) { same = false; break; }
+            if (same) return;
+
+            if (CPlayerData.m_TutorialDataList == null)
+                CPlayerData.m_TutorialDataList = new System.Collections.Generic.List<TutorialData>();
+            CPlayerData.m_TutorialDataList.Clear();
+            CPlayerData.m_TutorialDataList.AddRange(incoming);
+            CPlayerData.m_TutorialIndex = tutIndex;
+
+            var tm = UnityEngine.Object.FindObjectOfType<TutorialManager>(); // NOT CSingleton (fake-manager trap)
+            if (tm == null || tm.m_TutorialSubGroupList == null) return;
+            foreach (var sg in tm.m_TutorialSubGroupList)
+            {
+                if (sg == null) continue;
+                try
+                {
+                    FiSgCurrent?.SetValue(sg, 0f);
+                    FiSgFinish?.SetValue(sg, false);
+                    if (sg.m_TutorialData != null) sg.m_TutorialData.value = 0f;
+                    // only the subgroup whose condition matches actually consumes each value
+                    for (int i = 0; i < incoming.Count; i++)
+                        sg.AddTaskValue(incoming[i].value, incoming[i].tutorialTaskCondition);
+                }
+                catch (Exception e) { CoopPlugin.Log.LogWarning("tutorial subgroup apply: " + e.Message); }
+            }
+            try { tm.EvaluateTaskVisibility(); }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("tutorial visibility: " + e.Message); }
         }
     }
 }

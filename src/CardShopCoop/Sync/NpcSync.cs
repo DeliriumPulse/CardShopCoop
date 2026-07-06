@@ -57,6 +57,8 @@ namespace CardShopCoop.Sync
             IsPlaying = 8,
             IsHoldingBox = 16,
             Smelly = 32,
+            Exclaim = 64,   // the red "!" trade-prompt mesh is showing
+            Female = 128,   // puppet should spawn from the female prefab (workers esp.)
         }
 
         // ---------------- host: collect & serialize ----------------
@@ -121,6 +123,9 @@ namespace CardShopCoop.Sync
                 // smelly is sim state, not an animator bool - without it the joiner
                 // can't see the stink cloud the host (and the cleansers) react to
                 try { if (c.IsSmelly()) flags |= NpcFlags.Smelly; } catch { }
+                // the red "!" trade/sell-in prompt is a plain mesh toggle, not an animator
+                // bool - mirror it so the guest can see which customer wants to be served
+                try { if (c.m_ExclaimationMesh != null && c.m_ExclaimationMesh.activeSelf) flags |= NpcFlags.Exclaim; } catch { }
                 WriteEntry(chunks, hostTime, KindCustomer, (ushort)i, cc.CharacterName,
                     c.transform, c.m_CurrentMoveSpeed, flags);
             }
@@ -134,8 +139,12 @@ namespace CardShopCoop.Sync
                     if (w == null || !w.m_IsActive || !w.gameObject.activeSelf) continue;
                     var cc = w.m_CharacterCustom;
                     if (cc == null || string.IsNullOrEmpty(cc.CharacterName)) continue;
+                    // worker names aren't prefixed "Female", so gender must ride a flag or
+                    // female workers spawn from the male customer prefab on the guest
+                    var wflags = CollectFlags(w.m_Anim);
+                    if (w.m_IsFemale) wflags |= NpcFlags.Female;
                     WriteEntry(chunks, hostTime, KindWorker, (ushort)i, cc.CharacterName,
-                        w.transform, 0f, CollectFlags(w.m_Anim), speedFromAnim: w.m_Anim);
+                        w.transform, 0f, wflags, speedFromAnim: w.m_Anim);
                 }
             }
 
@@ -226,6 +235,8 @@ namespace CardShopCoop.Sync
             public GameObject CardFan;
             public GameObject CardSingle;
             public GameObject Smelly;
+            public GameObject Exclaim;   // the red "!" trade prompt mesh
+            public bool Female;          // which prefab this puppet was spawned from
             public string CharName = "";
             public readonly Snap[] Buf = new Snap[4]; // ring buffer, newest at BufHead
             public int BufHead;
@@ -321,10 +332,11 @@ namespace CardShopCoop.Sync
                     _puppets[key] = p;
                 }
 
+                bool female = (flags & NpcFlags.Female) != 0;
                 if (hasName && p.CharName != charName)
-                    ReDress(p, charName, pos);
+                    ReDress(p, charName, pos, female);
                 else if (p.Go == null && p.CharName.Length > 0)
-                    Spawn(p, p.CharName, pos); // retry a spawn that failed (e.g. manager not ready)
+                    Spawn(p, p.CharName, pos, female); // retry a spawn that failed (e.g. manager not ready)
 
                 // reject stale/duplicate packets (unreliable channel can reorder)
                 if (p.BufCount == 0 || snapTime > p.Buf[p.BufHead].Time + 0.0005f)
@@ -349,15 +361,17 @@ namespace CardShopCoop.Sync
         /// game's own Initialize() (m_HasInit routes to LoadFromJSON, which re-applies
         /// hair/apparel for the new name). Full respawn only when there is no clone yet
         /// or the male/female prefab no longer matches.</summary>
-        private void ReDress(Puppet p, string charName, Vector3 pos)
+        private void ReDress(Puppet p, string charName, Vector3 pos, bool femaleHint)
         {
-            bool genderChanged = p.CharName.Length > 0
-                && p.CharName.StartsWith("Female") != charName.StartsWith("Female");
+            // gender from the transmitted flag (workers) OR the "Female..." name prefix
+            // (customers); compared to the prefab we actually spawned from (p.Female)
+            bool female = femaleHint || (charName != null && charName.StartsWith("Female"));
+            bool genderChanged = p.Go != null && p.Female != female;
             if (p.Go == null || p.Custom == null || genderChanged)
             {
                 if (p.Go != null) Object.Destroy(p.Go);
                 p.Go = null;
-                Spawn(p, charName, pos);
+                Spawn(p, charName, pos, femaleHint);
                 return;
             }
             p.CharName = charName;
@@ -376,8 +390,13 @@ namespace CardShopCoop.Sync
         /// <summary>Client only. Interpolate puppets; despawn ones the host stopped sending.</summary>
         public void TickPuppets(float dt, bool inGame)
         {
-            _now += dt;
+            // Freeze the local clock while out of game: ApplyBatch also skips LastSeen
+            // updates while !inGame, so advancing _now during a loading flicker would make
+            // (_now - LastSeen) blow past the 6s despawn timeout and blink the WHOLE crowd
+            // out on resume. Keeping _now anchored keeps both on the same timeline; the
+            // clock-offset re-base on the first post-gap batch re-syncs interpolation.
             if (!inGame || dt <= 0f) return;
+            _now += dt;
 
             float renderTime = _now - InterpDelay;
             // frame-rate-independent blend factors (never dt*k, which overshoots at low fps)
@@ -439,6 +458,7 @@ namespace CardShopCoop.Sync
                     Toggle(p.CardFan, (p.Flags & NpcFlags.IsPlaying) != 0);
                     Toggle(p.CardSingle, (p.Flags & NpcFlags.IsPlaying) != 0);
                     Toggle(p.Smelly, (p.Flags & NpcFlags.Smelly) != 0);
+                    Toggle(p.Exclaim, (p.Flags & NpcFlags.Exclaim) != 0);
                     p.AppliedFlags = (int)p.Flags;
                 }
             }
@@ -498,12 +518,15 @@ namespace CardShopCoop.Sync
             if (go != null && go.activeSelf != on) go.SetActive(on);
         }
 
-        private void Spawn(Puppet p, string charName, Vector3 pos)
+        private void Spawn(Puppet p, string charName, Vector3 pos, bool femaleHint)
         {
             if (_cmClient == null) _cmClient = Object.FindObjectOfType<CustomerManager>();
             if (_cmClient == null) return;
 
-            bool female = charName.StartsWith("Female");
+            // workers carry gender in the flag (their names aren't "Female"-prefixed);
+            // customers still carry it in the name
+            bool female = femaleHint || charName.StartsWith("Female");
+            p.Female = female;
             var prefab = female ? _cmClient.m_CustomerFemalePrefab : _cmClient.m_CustomerPrefab;
             if (prefab == null) return;
 
@@ -538,6 +561,7 @@ namespace CardShopCoop.Sync
                 p.CardFan = cust.m_GameCardFanOut;
                 p.CardSingle = cust.m_GameCardSingle;
                 p.Smelly = cust.m_SmellyFX; // plain child FX object, survives the strip
+                p.Exclaim = cust.m_ExclaimationMesh; // the "!" trade prompt, driven by flags below
                 try
                 {
                     Toggle(p.Bag, false); Toggle(p.Cash, false);

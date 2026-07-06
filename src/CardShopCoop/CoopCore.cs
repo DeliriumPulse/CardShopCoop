@@ -91,6 +91,12 @@ namespace CardShopCoop
         // host economy/progression change detection
         private double _lastCoinSent = double.MinValue;
         private long _lastProgressSent = long.MinValue;
+        private float _coinHeal;      // re-send the wallet every 15s even if unchanged
+        private float _progressHeal;  // ...and shop exp/level/fame, so a dropped packet self-heals
+        // guest spends applied so far THIS frame; lets the host reject a spend the guest
+        // passed against its stale (0.5s-lagged) wallet mirror before the shared balance
+        // goes negative. Reset once per frame before the message drain.
+        private double _pendingReduceThisFrame = 0.0;
 
         // one-time link confirmation logging
         private readonly HashSet<int> _gotStateFrom = new HashSet<int>();
@@ -129,6 +135,8 @@ namespace CardShopCoop
         private float _lightSyncTimer = -2.3f;   // timers carry staggered phases so the
         private LightManager _lightManager;      // periodic broadcasts never bunch into
         private float _cardResyncTimer = -5.2f;  // one frame (the rhythmic-hitch bug)
+        private int _lastCardResyncHash;         // change-gate for the 12s full card repaint
+        private float _cardResyncHeal;           // forces a repaint every 30s regardless
         private float _licenseSyncTimer = -3.7f;
         private double _lastLicenseBuyTime = -999.0;
         private string _lastLightJson;
@@ -287,6 +295,7 @@ namespace CardShopCoop
             _report.BroadcastState = w => Broadcast(MsgType.ReportState, w);
             _containers.SendOp = w => Send(1, MsgType.ContainerOp, w);
             _containers.BroadcastState = w => Broadcast(MsgType.ContainerState, w);
+            _containers.RequestBoxResync = () => _boxes.ForceBroadcastNextTick();
             _tournament.BroadcastState = w => Broadcast(MsgType.TournamentState, w);
             _cardBoxes.SendOp = w => Send(1, MsgType.CardBoxOp, w);
             _cardBoxes.BroadcastState = w => Broadcast(MsgType.CardBoxState, w);
@@ -470,21 +479,49 @@ namespace CardShopCoop
             try
             {
                 if (isAdd) CPlayerData.AddCard(card, amount);
+                else if (card.cardGrade > 0)
+                {
+                    // graded cards live in m_GradedCardInventoryList; ReduceCard would miss
+                    // them and wrongly decrement the ungraded array. Route through
+                    // RemoveGradedCard (the graded-remove mirror normally arrives as
+                    // MsgType.GradedRemove; this defends the CardDelta path too).
+                    for (int i = 0; i < amount && CPlayerData.HasGradedCardInAlbum(card); i++)
+                        CPlayerData.RemoveGradedCard(card, ignoreGradedCardIndex: true);
+                }
                 else CPlayerData.ReduceCard(card, amount);
             }
             finally { Patches.GamePatches.ApplyingRemoteCards = false; }
             // "cards didn't show up in the binder" reports were undiagnosable from the
             // receiving side - applies were completely silent
             CoopPlugin.Log.LogInfo($"card delta applied: {(isAdd ? "+" : "-")}{amount} {card.monsterType}{(card.cardGrade > 0 ? $" (grade {card.cardGrade})" : card.isFoil ? " (foil)" : "")}");
-            // the vanilla trade/pack flows poke the binder's sort refresh after AddCard;
-            // a bare AddCard leaves an OPEN binder stale until something else pokes it
+            RefreshOpenBinder();
+        }
+
+        // NEVER CSingleton<>.Instance (fake-manager landmine); cached, Unity re-resolves.
+        private static readonly System.Reflection.MethodInfo MiBinderResort =
+            HarmonyLib.AccessTools.Method(typeof(CollectionBinderFlipAnimCtrl), "OnSortingMethodUpdated");
+        private static readonly System.Reflection.FieldInfo FiBinderIsBookOpen =
+            HarmonyLib.AccessTools.Field(typeof(CollectionBinderFlipAnimCtrl), "m_IsBookOpen");
+
+        /// <summary>Make an ALREADY-OPEN collection binder re-lay-out after a card change.
+        /// SetCanUpdateSort alone only ARMS a gate the vanilla per-frame Update never
+        /// consumes, so a traded/pulled card stayed invisible until the player flipped a
+        /// page or reopened the binder. When the book is open we also invoke the game's own
+        /// OnSortingMethodUpdated (backToFirstPage:false, keeps the current page) which
+        /// rebuilds the sorted list + relays out all page groups, so the card appears now.</summary>
+        private static void RefreshOpenBinder()
+        {
             try
             {
                 if (_deltaIpc == null) _deltaIpc = FindObjectOfType<InteractionPlayerController>();
-                if (_deltaIpc != null && _deltaIpc.m_CollectionBinderFlipAnimCtrl != null)
-                    _deltaIpc.m_CollectionBinderFlipAnimCtrl.SetCanUpdateSort(canSort: true);
+                var ctrl = _deltaIpc != null ? _deltaIpc.m_CollectionBinderFlipAnimCtrl : null;
+                if (ctrl == null) return;
+                ctrl.SetCanUpdateSort(canSort: true);
+                bool isOpen = FiBinderIsBookOpen != null && (bool)FiBinderIsBookOpen.GetValue(ctrl);
+                if (isOpen && MiBinderResort != null)
+                    MiBinderResort.Invoke(ctrl, new object[] { false }); // backToFirstPage:false
             }
-            catch { }
+            catch (System.Exception e) { CoopPlugin.Log.LogWarning($"binder relayout after card change failed: {e.Message}"); }
         }
 
         private void FlushPendingCardWork()
@@ -558,7 +595,6 @@ namespace CardShopCoop
             _lightManager = null;
             _cmSweep = null;
             _inventory = null;
-            _cashScreen = null;
             _renamerHandled = false;
             _catalogSent = false;
             if (ClientReloading) _reloadGrace = 10f; // countdown starts once in-game
@@ -586,7 +622,6 @@ namespace CardShopCoop
         // (see WorldSync.ResolveShelfManager). Cached; the Unity fake-null re-resolves
         // after scene loads, and OnSceneLoaded clears them besides.
         private static InventoryBase _inventory;
-        private static UI_CashCounterScreen _cashScreen;
 
         private static InventoryBase Inv()
         {
@@ -964,6 +999,15 @@ namespace CardShopCoop
                 bw.Write(amount);
                 Msg.WriteCard(bw, card);
             });
+        }
+
+        /// <summary>Both roles: mirror a GRADED-card removal (trade-in, donation, re-grade).
+        /// Graded cards live in a separate album ReduceCard/CardDelta never touch, so this
+        /// is its own message; the receiver applies RemoveGradedCard by identity.</summary>
+        public void ForwardGradedRemoval(CardData card)
+        {
+            if (Role == CoopRole.None || _net == null || card == null || card.cardGrade <= 0) return;
+            Broadcast(MsgType.GradedRemove, bw => Msg.WriteCard(bw, card));
         }
 
         /// <summary>Client: the joiner bought restock - spawn the delivery on the host.</summary>
@@ -1491,7 +1535,12 @@ namespace CardShopCoop
                 CoopPlugin.Log.LogInfo("Connection " + joined + " opened");
                 // fresh joiner: defeat every module's unchanged-hash gate so full
                 // authoritative state goes out on the next tick, not the next heal
-                if (Role == CoopRole.Host) ModulesForceResend();
+                if (Role == CoopRole.Host)
+                {
+                    ModulesForceResend();
+                    _lastCoinSent = double.MinValue;   // guarantee the wallet + progress
+                    _lastProgressSent = long.MinValue; // snapshot the very next tick
+                }
             }
             while (_net.Disconnects.TryDequeue(out int left))
             {
@@ -1519,6 +1568,7 @@ namespace CardShopCoop
             // a cascade. For snapshot types only the NEWEST per (type, sender) matters.
             // (NpcState is chunked - every chunk carries different NPCs - and RelayState
             // multiplexes senders inside the payload, so neither may be coalesced.)
+            _pendingReduceThisFrame = 0.0; // reset the per-frame guest-spend accumulator
             _dispatchBuf.Clear();
             while (_net != null && _net.Incoming.TryDequeue(out var msg))
                 _dispatchBuf.Add(msg);
@@ -1781,9 +1831,14 @@ namespace CardShopCoop
             {
                 _econTimer -= 0.5f;
                 double coin = CPlayerData.m_CoinAmountDouble;
-                if (Math.Abs(coin - _lastCoinSent) > 0.0001)
+                // heal beat like PriceList/LightState: change-gated alone stranded the
+                // guest's wallet forever on a single dropped/failed CoinSet. Re-send every
+                // 15s regardless so a missed economy packet self-corrects.
+                _coinHeal += 0.5f;
+                if (Math.Abs(coin - _lastCoinSent) > 0.0001 || _coinHeal >= 15f)
                 {
                     _lastCoinSent = coin;
+                    _coinHeal = 0f;
                     float coinF = CPlayerData.m_CoinAmount;
                     Broadcast(MsgType.CoinSet, bw => { bw.Write(coin); bw.Write(coinF); });
                 }
@@ -1792,9 +1847,11 @@ namespace CardShopCoop
                 int level = CPlayerData.m_ShopLevel;
                 int fame = CPlayerData.m_FamePoint;
                 long progress = ((long)level << 40) ^ ((long)fame << 20) ^ (uint)exp;
-                if (progress != _lastProgressSent)
+                _progressHeal += 0.5f;
+                if (progress != _lastProgressSent || _progressHeal >= 15f)
                 {
                     _lastProgressSent = progress;
+                    _progressHeal = 0f;
                     Broadcast(MsgType.ProgressSet, bw => { bw.Write(exp); bw.Write(level); bw.Write(fame); });
                 }
             }
@@ -1838,7 +1895,37 @@ namespace CardShopCoop
                 {
                     var full = _cardShelves.BuildFullState();
                     if (full.Count > 0)
-                        Broadcast(MsgType.CardShelfDelta, bw => CardShelfSync.WriteEntries(bw, full));
+                    {
+                        // change-gate the full repaint like every other heal (PriceList,
+                        // Population, Box): a big card wall was emitting a multi-KB reliable
+                        // packet every 12s even when nothing moved. Hash full card identity;
+                        // resend only on change, plus a 30s forced heal for a dropped delta.
+                        int h = 17;
+                        foreach (var e in full)
+                        {
+                            h = h * 31 + e.Key;
+                            h = h * 31 + (e.Occupied ? 1 : 0);
+                            var c = e.Card;
+                            if (e.Occupied && c != null)
+                            {
+                                h = h * 31 + (int)c.monsterType;
+                                h = h * 31 + (int)c.expansionType;
+                                h = h * 31 + (int)c.borderType;
+                                h = h * 31 + c.cardGrade;
+                                h = h * 31 + c.gradedCardIndex;
+                                h = h * 31 + (c.isFoil ? 1 : 0);
+                                h = h * 31 + (c.isDestiny ? 1 : 0);
+                                h = h * 31 + (c.isChampionCard ? 1 : 0);
+                            }
+                        }
+                        _cardResyncHeal += 12f;
+                        if (h != _lastCardResyncHash || _cardResyncHeal >= 30f)
+                        {
+                            _lastCardResyncHash = h;
+                            _cardResyncHeal = 0f;
+                            Broadcast(MsgType.CardShelfDelta, bw => CardShelfSync.WriteEntries(bw, full));
+                        }
+                    }
                 }
                 catch (Exception e) { CoopPlugin.Log.LogWarning("card resync: " + e.Message); }
             }
@@ -2402,6 +2489,23 @@ namespace CardShopCoop
                     }
                     break;
                 }
+                case MsgType.GradedRemove:
+                {
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        var card = Msg.ReadCard(br);
+                        if (card == null) break;
+                        if (!InGameLevel())
+                        {
+                            // hold until the world is up, same as CardDelta; the graded
+                            // branch of ApplyCardDelta routes it through RemoveGradedCard
+                            _pendingCardDeltas.Add(new PendingCard { IsAdd = false, Amount = 1, Card = card });
+                            break;
+                        }
+                        ApplyCardDelta(isAdd: false, amount: 1, card: card);
+                    }
+                    break;
+                }
                 case MsgType.NpcState:
                 {
                     if (Role != CoopRole.Client) break;
@@ -2451,8 +2555,46 @@ namespace CardShopCoop
                         var pos = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
                         var rot = new Quaternion(br.ReadSingle(), br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
                         string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : "player";
-                        CoopPlugin.Log.LogInfo($"{who} bought furniture: {(EObjectType)objType}");
-                        ShelfManager.SpawnInteractableObjectInPackageBox((EObjectType)objType, pos, rot);
+                        var eObj = (EObjectType)objType;
+
+                        // The guest already paid: its CEventPlayer_ReduceCoin was forwarded
+                        // and debited the shared wallet BEFORE this spawn. If the prefab
+                        // isn't in the host's catalog (different mods / load order), the
+                        // vanilla spawn Instantiate(null)s and throws - swallowed by the
+                        // per-message try/catch - so the money vanished with no box, no
+                        // delivery, no refund (the field report). Match the restock-order
+                        // path: pre-check, refund from the host's authoritative price, notify.
+                        float refund = 0f;
+                        try { var fp = InventoryBase.GetFurniturePurchaseData(eObj); if (fp != null) refund = fp.price; }
+                        catch { } // GetFurniturePurchaseData indexes a parallel list; a catalog mismatch can throw
+
+                        if (InventoryBase.GetSpawnInteractableObjectPrefab(eObj) == null)
+                        {
+                            CoopPlugin.Log.LogWarning($"{who} bought furniture {eObj} not in host catalog - refunding {refund:F0}");
+                            if (refund > 0f && refund < 100000f)
+                                CEventManager.QueueEvent(new CEventPlayer_AddCoin(refund));
+                            Send(msg.ConnId, MsgType.Toast, bw => bw.Write(
+                                refund > 0f
+                                    ? $"that furniture isn't in the host's catalog - refunded ${refund:F0}"
+                                    : "that furniture isn't in the host's catalog - nothing was delivered"));
+                            break;
+                        }
+
+                        CoopPlugin.Log.LogInfo($"{who} bought furniture: {eObj}");
+                        try
+                        {
+                            ShelfManager.SpawnInteractableObjectInPackageBox(eObj, pos, rot);
+                        }
+                        catch (Exception e)
+                        {
+                            CoopPlugin.Log.LogWarning("furniture spawn failed on host: " + e.Message);
+                            if (refund > 0f && refund < 100000f)
+                                CEventManager.QueueEvent(new CEventPlayer_AddCoin(refund));
+                            Send(msg.ConnId, MsgType.Toast, bw => bw.Write(
+                                refund > 0f
+                                    ? $"furniture failed to deliver on the host - refunded ${refund:F0}"
+                                    : "furniture failed to deliver on the host"));
+                        }
                     }
                     break;
                 }
@@ -2787,6 +2929,17 @@ namespace CardShopCoop
                             // "phase 4->0, drift 780min" two seconds before the mirror)
                             if (driftMin > 600) break;
                             if (Time.realtimeSinceStartupAsDouble - _lastDayMirrorAt < 10.0) break;
+                            // apply the SHOP-LIGHT bit surgically (cheap: just flips the group
+                            // + re-evaluates UI brightness) so a wall-switch toggle propagates
+                            // without a full lighting Init and its music/skybox churn. This is
+                            // the guest half of the light-switch sync (host runs ToggleShopLight
+                            // via the forwarded op; here we mirror the resulting state).
+                            try
+                            {
+                                if (LightManager.IsShopLightOn() != data.m_IsShopLightOn)
+                                    _lightManager.ToggleShopLight();
+                            }
+                            catch (Exception le) { CoopPlugin.Log.LogWarning("shop-light apply: " + le.Message); }
                             // re-run the game's own lighting restore only when the sky
                             // phase actually differs (avoids music/blend churn)
                             if (localIdx != data.m_TImeOfDayIndex || driftMin > 4)
@@ -2904,19 +3057,11 @@ namespace CardShopCoop
                     }
                     if (RegisterLine == "sale complete!")
                     {
-                        // clear the vanilla checkout screen AND the counters' running
-                        // totals for the next customer. Each counter spawns its OWN
-                        // screen and deactivates it between checkouts
-                        // (InteractableCashierCounter.OnExit...:473), so the plain
-                        // overload misses them - include inactive. One arbitrary
-                        // screen, exactly like the old CSingleton lookup picked.
-                        try
-                        {
-                            if (_cashScreen == null)
-                                _cashScreen = FindObjectOfType<UI_CashCounterScreen>(true);
-                            if (_cashScreen != null) _cashScreen.ResetCounter();
-                        }
-                        catch { }
+                        // clear EACH counter's own checkout screen AND the counters' running
+                        // totals for the next customer. Resetting one arbitrary screen (the
+                        // old behavior) left the scanned-item bar stale on the OTHER counters
+                        // of a multi-counter shop.
+                        Guarded("reset-screens", Sync.RegisterServe.ClientResetScreens);
                         Guarded("reset-totals", Sync.RegisterServe.ClientResetTotals);
                     }
                     break;
@@ -2953,7 +3098,25 @@ namespace CardShopCoop
                         switch (kind)
                         {
                             case 1: CEventManager.QueueEvent(new CEventPlayer_AddCoin(v)); break;
-                            case 2: CEventManager.QueueEvent(new CEventPlayer_ReduceCoin(v)); break;
+                            case 2:
+                            {
+                                // The guest's wallet is a 0.5s-lagged mirror that does NOT
+                                // reflect its own in-flight forwarded spends, so it can pass
+                                // several affordability checks against the same stale balance.
+                                // The host is authoritative: reject a spend the SHARED wallet
+                                // (minus what other guest spends already claimed this frame)
+                                // can't cover, instead of driving it negative.
+                                double bal = CPlayerData.m_CoinAmountDouble - _pendingReduceThisFrame;
+                                if ((double)v > bal + 0.0001)
+                                {
+                                    Send(msg.ConnId, MsgType.Toast, w => w.Write("purchase declined - the shared wallet is short"));
+                                    _lastCoinSent = double.MinValue; // force the guest's balance to correct next tick
+                                    break;
+                                }
+                                _pendingReduceThisFrame += (double)v;
+                                CEventManager.QueueEvent(new CEventPlayer_ReduceCoin(v));
+                                break;
+                            }
                             case 3: CEventManager.QueueEvent(new CEventPlayer_AddShopExp((int)v)); break;
                             case 4: CEventManager.QueueEvent(new CEventPlayer_AddFame((int)v)); break;
                         }

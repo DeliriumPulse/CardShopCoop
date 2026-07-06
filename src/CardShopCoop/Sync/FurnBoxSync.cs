@@ -477,7 +477,10 @@ namespace CardShopCoop.Sync
             {
                 var obj = ResolveEntryObject(hostList[i]);
                 wantedObjs.Add(obj);
-                if (obj == null) allResolved = false;
+                // a generic (kind-15) entry can NEVER resolve by (kind,index) - it's outside
+                // PopulationSync's mirror - so letting it clear allResolved permanently
+                // vetoed retirement of EVERY typed box. Exempt it from the veto.
+                if (obj == null && hostList[i].Kind != GenericKind) allResolved = false;
             }
 
             // vanished entries: replay what the host did. Last seen CARRIED means a
@@ -492,6 +495,10 @@ namespace CardShopCoop.Sync
                     var box = live[i];
                     if (box == null) continue;
                     var boxed = BoxedObject(box);
+                    // generic boxes aren't index-mirrored, so their absence from the snapshot
+                    // can't be distinguished from index divergence - never retire them (a
+                    // stale ghost box is the acceptable lesser evil vs. destroying live furniture)
+                    if (boxed != null && boxed.m_IsGenericObject) continue;
                     bool wanted = false;
                     for (int j = 0; j < wantedObjs.Count; j++)
                         if (ReferenceEquals(wantedObjs[j], boxed) && boxed != null) { wanted = true; break; }
@@ -529,13 +536,32 @@ namespace CardShopCoop.Sync
                     // was charged in FurnitureShopUIScreen, never here)
                     if (want.Kind == GenericKind && now - _suppressBoxUp >= 6.0)
                     {
-                        try
+                        // kind 15 can't resolve by (kind,index) - it's outside PopulationSync's
+                        // mirror - so a naive fallback spawned a NEW duplicate object+box on
+                        // every heal (~10s). Dedup against the live box population by type +
+                        // position: if we already fallback-spawned a matching box near here,
+                        // don't spawn another.
+                        bool already = false;
+                        var liveBoxes = LiveBoxes();
+                        for (int b = 0; b < liveBoxes.Count; b++)
                         {
-                            ShelfManager.SpawnInteractableObjectInPackageBox(
-                                (EObjectType)ResolveObjType(want.WireType, want.NameHash),
-                                want.Pos, Quaternion.Euler(0f, want.Yaw, 0f));
+                            var lb = liveBoxes[b];
+                            if (lb == null) continue;
+                            if (!BoxedTypeMatches(lb, want.WireType, want.NameHash)) continue;
+                            var bp = lb.transform.position;
+                            float dx = bp.x - want.Pos.x, dz = bp.z - want.Pos.z;
+                            if (dx * dx + dz * dz <= 1.0f) { already = true; break; }
                         }
-                        catch (Exception e) { CoopPlugin.Log.LogWarning("FurnBoxSync spawn: " + e.Message); }
+                        if (!already)
+                        {
+                            try
+                            {
+                                ShelfManager.SpawnInteractableObjectInPackageBox(
+                                    (EObjectType)ResolveObjType(want.WireType, want.NameHash),
+                                    want.Pos, Quaternion.Euler(0f, want.Yaw, 0f));
+                            }
+                            catch (Exception e) { CoopPlugin.Log.LogWarning("FurnBoxSync spawn: " + e.Message); }
+                        }
                     }
                     continue;
                 }

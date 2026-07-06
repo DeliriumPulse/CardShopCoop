@@ -5,6 +5,49 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.0.23
+**Tutorial/task progression now syncs to the guest.**
+- Previously every tutorial task was host-only: the guest's task panel stayed stuck on "Set the shop sign to OPEN" (and never advanced past any later task) because the actions that credit tasks were forwarded to the host and only advanced the *host's* tutorial. The host now ships its authoritative task progress with the rest of the shop state, and the guest replays it — so both players' task lists advance together.
+- Please test this one specifically (it's the first release to sync tutorial state). If a task looks wrong on the guest, a `BepInEx\CardShopCoop_<number>.log` from both PCs helps.
+- Also fixed: on a shop with multiple checkout counters, the guest's scanned-item bar could carry over to the next customer (each counter's checkout screen is now cleared on a completed sale, not just one).
+
+Both players must update — the launcher does it automatically.
+
+## 1.0.22
+**Big bug-fix pass — a verified sweep of the whole mod. 24 fixes across trades, money, packs, boxes, furniture, customers, world sync, and networking.**
+
+Trades & haggling
+- **Fixed the haggle price reading as $0.** When you typed a counter-offer on a sell-in, the game only committed the number when the field lost focus — pressing Accept could beat that, so it sent $0 (or your *last* amount) while the field showed what you typed. The price is now force-committed on Accept and the field is seeded with the asking price, so what you see is what you send.
+- **Fixed a traded-in graded card staying in your binder as a "fake."** Graded cards leave the album through a path the shared-binder mirror didn't cover, so a graded card traded/donated/re-graded away on one side ghosted on the other. That removal is now mirrored.
+- A one-off pre-roll hiccup no longer marks a customer's offer "host-only" for the rest of their visit (it retries), and the offer you're mid-trade with can no longer time out and close the screen under you.
+
+Money
+- **A guest purchase can no longer be silently eaten.** Ordering furniture that isn't in the host's catalog charged the shared wallet and delivered nothing, with no refund — now it refunds (from the host's real price) and says why, exactly like restock orders already did.
+- The shared wallet can no longer be overspent negative by a guest buying against a slightly-stale balance — the host now rejects an unaffordable spend and corrects the guest.
+- The wallet and shop XP/level/fame now re-send every 15s, so a single dropped economy packet no longer strands the guest's money display.
+
+Packs & binder
+- **Fixed the guest freezing on the first card when opening a pack.** A card-mirror hiccup could throw *inside* the game's pack-open loop and wedge the reveal forever; the mirror is now crash-isolated so the reveal always completes.
+- A traded/pulled card now appears in an **already-open** binder immediately, instead of only after you flip a page or reopen it.
+
+Customers & workers
+- **Customers no longer blink out for the guest** on a brief loading flicker.
+- The red **"!" trade prompt** above a customer is now visible on the guest.
+- **Female workers** now show as female (they were spawning from the male model).
+
+Boxes, storage & furniture
+- **Empty boxes can be taken from the guest again** — the dispenser count no longer strands too-high for ~15s (which made every further click do nothing), and a freshly taken box now appears within a tick instead of up to 1.5s later.
+- Loose boxes no longer get randomly scattered to the wrong spot on the guest (the guest's own out-of-bounds sweep is suppressed; the host owns placement).
+- Furniture delivered from the generic catalog no longer **duplicates** on every re-sync, and an unresolved generic box no longer **blocks all furniture from being sold/unpacked** on the guest.
+
+World & performance
+- **The shop light switch now syncs** — flipping it toggles the light for both players (host-authoritative) instead of only locally, and a light that got out of step self-heals.
+- **Decorations now appear for the guest** (they were never syncing).
+- The full card-wall repaint now only re-sends when it actually changed (was an unconditional reliable spike every 12s), and a single oversized reliable packet can no longer wedge the whole reliable lane and freeze all state for the guest.
+- Population sync no longer silently stops past 250 objects of one kind.
+
+Both players must update — the launcher does it automatically.
+
 ## 1.0.21
 **Custom cards are now checked at join — no more silent desync from mismatched custom cards.**
 - The join handshake already checked mod versions and the modded-item database, but **custom cards added by CreateCards/CardForge weren't covered** (they live in a different ID space that the old checks couldn't see). Two players with different custom cards could connect and then silently see the wrong card. The handshake now also compares the custom-card ID mapping and stops the join with a clear message if they differ, telling you to install the same custom cards (identical files) and restart.

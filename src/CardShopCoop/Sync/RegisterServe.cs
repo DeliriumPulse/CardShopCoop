@@ -201,6 +201,25 @@ namespace CardShopCoop.Sync
                     FiTotalScanned?.SetValue(sm.m_CashierCounterList[i], 0.0);
         }
 
+        private static readonly FieldInfo FiCashScreen =
+            AccessTools.Field(typeof(InteractableCashierCounter), "m_UICashCounterScreen");
+
+        /// <summary>Client: clear EVERY counter's own checkout screen on a completed sale.
+        /// The old code reset one arbitrary UI_CashCounterScreen, so on a multi-counter shop
+        /// the guest's scanned-item bar carried over to the next customer.</summary>
+        public static void ClientResetScreens()
+        {
+            var sm = Shelf();
+            if (sm == null) return;
+            for (int i = 0; i < sm.m_CashierCounterList.Count; i++)
+            {
+                var c = sm.m_CashierCounterList[i];
+                if (c == null) continue;
+                var screen = FiCashScreen?.GetValue(c) as UI_CashCounterScreen;
+                if (screen != null) screen.ResetCounter();
+            }
+        }
+
         // ================= register state mirroring (host -> client) =================
 
         public struct CounterInfo

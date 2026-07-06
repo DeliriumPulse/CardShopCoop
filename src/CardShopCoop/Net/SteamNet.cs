@@ -36,6 +36,8 @@ namespace CardShopCoop.Net
         private readonly ConcurrentQueue<Outgoing> _transientOutbox = new ConcurrentQueue<Outgoing>();
         private readonly ConcurrentQueue<Outgoing> _reliableOutbox = new ConcurrentQueue<Outgoing>();
         private Outgoing? _stalled; // reliable frame Steam refused; retried first
+        private int _stallRetries;  // consecutive refusals of _stalled; drop after N so one
+                                    // doomed (e.g. >1MB) frame can't wedge the whole lane
 
         // transient coalescing scratch, reused every pump (main thread only)
         private readonly List<Outgoing> _transientScratch = new List<Outgoing>(32);
@@ -202,13 +204,25 @@ namespace CardShopCoop.Net
                 if (_stalled.HasValue) { entry = _stalled.Value; _stalled = null; }
                 else if (!_reliableOutbox.TryDequeue(out entry)) break;
 
-                if (!_peers.TryGetValue(entry.ConnId, out var sid)) continue; // peer gone
+                if (!_peers.TryGetValue(entry.ConnId, out var sid)) { _stallRetries = 0; continue; } // peer gone
                 if (!SteamNetworking.SendP2PPacket(sid, entry.Frame, (uint)entry.Frame.Length,
                         EP2PSend.k_EP2PSendReliable, Channel))
                 {
-                    _stalled = entry; // Steam's reliable queue is full; retry next frame
+                    // Steam refused it. Transient backpressure clears in a frame or two, but a
+                    // frame Steam will NEVER accept (e.g. one that exceeds its ~1MB reliable
+                    // ceiling) would retry forever and strand every prices/licenses/shelf/state
+                    // packet behind it. Drop it after ~30 frames; change-gated state reheals.
+                    if (++_stallRetries > 30)
+                    {
+                        CoopPlugin.Log.LogWarning($"steam: dropping stuck reliable frame (size {entry.Frame.Length}); lane reconverges on next heal");
+                        _stalled = null;
+                        _stallRetries = 0;
+                        continue;
+                    }
+                    _stalled = entry; // retry next frame
                     break;
                 }
+                _stallRetries = 0; // success: clear the refusal streak
                 budget -= entry.Frame.Length;
             }
 

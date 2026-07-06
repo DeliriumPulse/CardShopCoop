@@ -125,6 +125,15 @@ namespace CardShopCoop.Sync
             _rm = null;
         }
 
+        /// <summary>Force the next HostTick to broadcast the loose-box population immediately,
+        /// bypassing the unchanged-hash gate and the 1.5s cadence. Used when another system
+        /// (e.g. an empty-box dispense) spawns a box that must reach the guest promptly.</summary>
+        public void ForceBroadcastNextTick()
+        {
+            _lastHostHash = 0;
+            _timer = 1.5f;
+        }
+
         private RestockManager Rm()
         {
             if (_rm == null) _rm = UnityEngine.Object.FindObjectOfType<RestockManager>();
