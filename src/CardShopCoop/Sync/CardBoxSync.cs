@@ -119,6 +119,44 @@ namespace CardShopCoop.Sync
             _hostHeal = 999f; // beats the hash gate even if the real hash is 0
         }
 
+        /// <summary>Host: a peer disconnected - release any card box still marked
+        /// client-carried, or it stays in its carried state forever (the set-down
+        /// report is never coming; a rejoining guest starts with an empty carry set).
+        /// Reuses the module's own un-carry apply at the box's current pose, exactly
+        /// what a normal set-down report would have done. Releases everything (the set
+        /// isn't keyed by connection); a surviving guest still carrying re-asserts its
+        /// carry on its next ~0.5s report.</summary>
+        public void HostReleaseRemoteCarried()
+        {
+            if (_remoteCarried.Count == 0) return;
+            // NEVER touch LiveBoxes() (a fabricating CSingleton accessor) when no real
+            // RestockManager exists - a disconnect drained while the host is mid world-
+            // load would otherwise mint the fake-manager landmine. Rm() resolves via
+            // FindObjectOfType, which returns null without fabricating.
+            if (Rm() == null) { _remoteCarried.Clear(); return; }
+            var boxes = LiveBoxes();
+            int released = 0;
+            foreach (int i in _remoteCarried)
+            {
+                if (i < 0 || i >= boxes.Count || boxes[i] == null) continue;
+                var box = boxes[i];
+                ApplyToBox(box, new Entry
+                {
+                    Cards = null,
+                    Carried = false,
+                    Pos = box.transform.position,
+                    Yaw = box.transform.eulerAngles.y,
+                });
+                released++;
+            }
+            _remoteCarried.Clear();
+            if (released > 0)
+            {
+                CoopPlugin.Log.LogInfo($"CardBoxSync host: released {released} client-carried box(es) after a disconnect");
+                ForceResend();
+            }
+        }
+
         private RestockManager Rm()
         {
             if (_rm == null) _rm = UnityEngine.Object.FindObjectOfType<RestockManager>();

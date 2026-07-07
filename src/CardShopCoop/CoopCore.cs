@@ -105,6 +105,23 @@ namespace CardShopCoop
         // passed against its stale (0.5s-lagged) wallet mirror before the shared balance
         // goes negative. Reset once per frame before the message drain.
         private double _pendingReduceThisFrame = 0.0;
+        // Host: a guest purchase is TWO decoupled reliable messages, and they arrive
+        // PRODUCT-FIRST: the vanilla buy button spawns the product SYNCHRONOUSLY (our
+        // hooks forward it immediately) while its CEventPlayer_ReduceCoin is only QUEUED
+        // into CEventManager and forwarded on a later event drain - so the charge
+        // (EconContrib kind 2, which the host affordability-guards and can DECLINE)
+        // always TRAILS its product(s) on the in-order channel. A lookback at the product
+        // handler can therefore never see the decline (verified: deterministic ordering,
+        // not a race). Instead each product is HELD here until the sender's next kind-2
+        // charge resolves it: applied -> deliver every held product from that sender
+        // (one cart = ONE summed charge covering N line products, all of which arrived
+        // before it); declined -> cancel them all. Timeout fail-open (deliver) so a
+        // purchase can never hang on a charge that never comes (cost-0 items, modded
+        // flows). Known crumb: the separately-forwarded AddShopExp (kind 3) for a
+        // declined purchase still lands - a few phantom XP, no money/item impact.
+        private struct HeldPurchase { public InMsg Msg; public double At; }
+        private readonly List<HeldPurchase> _heldPurchases = new List<HeldPurchase>();
+        private bool _deliveringHeld; // true while re-dispatching a resolved product
 
         // one-time link confirmation logging
         private readonly HashSet<int> _gotStateFrom = new HashSet<int>();
@@ -165,6 +182,7 @@ namespace CardShopCoop
             _actBoxes, _actPopulation, _actNpcPuppets, _actRegisterMirror, _actNpcSweep,
             _actStateSend, _actNpcCollect, _actRegisterCollect, _actModules;
         private CustomerManager _cmSweep;
+        private CustomerManager _cmSpray; // host-side: real customer list for replayed guest deodorant sprays
         private bool _renamerHandled;
         private int _heldBoxFrame = -1;
         private object _heldBoxA, _heldBoxB, _heldBoxC;
@@ -744,6 +762,7 @@ namespace CardShopCoop
             PromptLine = "";
             _lightManager = null;
             _cmSweep = null;
+            _cmSpray = null;
             _inventory = null;
             _renamerHandled = false;
             _catalogSent = false;
@@ -755,6 +774,23 @@ namespace CardShopCoop
             {
                 // client backed out to the main menu -> leave the session
                 Shutdown("left the session");
+            }
+            // A game-level scene loading (not "Title") while a session is live and it was
+            // NOT the mod's own join reload means someone loaded a DIFFERENT world out from
+            // under the session: the guest hit pause -> Load Game -> its own save
+            // (SaveLoadGameSlotSelectScreen loads "Start" mid-session), or the host loaded
+            // another slot. The socket would otherwise stay open with the peer standing in a
+            // world we no longer share, and the other side is never told. Shut the session
+            // down cleanly, same path as the Title back-out above.
+            //   - scene.name != "Title": the Title branch already handled the clean exit.
+            //   - Role != None && _net != null: a session must actually be active (guards the
+            //     HOST's own INITIAL world load, which happens from TitleScreen BEFORE
+            //     StartHosting sets Role=Host - Role is still None there, so this can't fire).
+            //   - !ClientReloading: the guest's mod-driven join reload (BundleDone sets this,
+            //     and it also loads "Start") is the mod's OWN transition - never a leave.
+            else if (scene.name != "Title" && Role != CoopRole.None && _net != null && !ClientReloading)
+            {
+                Shutdown("left the session (world reloaded)");
             }
         }
 
@@ -1198,6 +1234,27 @@ namespace CardShopCoop
             Send(1, MsgType.EconContrib, bw => { bw.Write(kind); bw.Write(value); });
         }
 
+        /// <summary>Client: replay a handheld-deodorant hold-spray against the HOST'S real
+        /// customers. On the guest the sprayed customers are collider-less render puppets, so
+        /// the vanilla RaycastHoldSprayState loop (InteractionPlayerController ~1628-1631)
+        /// hits only inert local copies and the spray does nothing. We forward the spray
+        /// origin + range + potency so the host runs the exact same DeodorantSprayCheck against
+        /// its authoritative customers; the smelly-flag change then mirrors back to every guest
+        /// through NpcSync automatically. No-op unless we're the guest.
+        /// CALL CONTRACT: the GamePatches hold-spray hook (another file) invokes this once per
+        /// vanilla spray tick with the SAME arguments the vanilla body passes -
+        /// m_CurrentHoldSprayItem.transform.position, range 2.5f, potency 1.</summary>
+        public void ForwardSprayHit(Vector3 pos, float range, int potency)
+        {
+            if (Role != CoopRole.Client || _net == null) return;
+            Send(1, MsgType.SprayHit, bw =>
+            {
+                bw.Write(pos.x); bw.Write(pos.y); bw.Write(pos.z);
+                bw.Write(range);
+                bw.Write(potency);
+            });
+        }
+
         /// <summary>Both roles: mirror a collection change (pack pull, trash, sale) to the
         /// other side so there is one shared binder.</summary>
         public void ForwardCardDelta(CardData card, int amount, bool isAdd)
@@ -1610,6 +1667,8 @@ namespace CardShopCoop
             }
             _avatars.Clear();
             PeerNames.Clear();
+            _heldPurchases.Clear(); // held product messages die with the session
+            _deliveringHeld = false;
             _saveBuf = null;
             _saveExpected = -1;
             _pendingSave = null;
@@ -1669,6 +1728,57 @@ namespace CardShopCoop
         private void BroadcastTransient(MsgType type, Action<BinaryWriter> write)
         {
             _net?.BroadcastTransient(Msg.Build(type, write));
+        }
+
+        /// <summary>Host: the sender's trailing coin charge (EconContrib kind 2) just
+        /// resolved - deliver or cancel every product this sender has on hold. In-order
+        /// delivery guarantees that everything held for this sender right now belongs to
+        /// the cart THIS charge paid for (later carts' products arrive after this charge).
+        /// deliver=true re-dispatches each held message through the normal handler
+        /// (_deliveringHeld suppresses re-holding); deliver=false drops them with one
+        /// toast. Nothing was taken on a decline, so cancelling never refunds.</summary>
+        private void ResolveHeldPurchases(int connId, bool deliver)
+        {
+            if (_heldPurchases.Count == 0) return;
+            bool toasted = false;
+            for (int i = 0; i < _heldPurchases.Count; )
+            {
+                if (_heldPurchases[i].Msg.ConnId != connId) { i++; continue; }
+                var m = _heldPurchases[i].Msg;
+                _heldPurchases.RemoveAt(i);
+                if (deliver)
+                {
+                    _deliveringHeld = true;
+                    try { Dispatch(m); } finally { _deliveringHeld = false; }
+                }
+                else
+                {
+                    CoopPlugin.Log.LogInfo($"purchase ({m.Type}) from conn {connId} cancelled - its charge was declined (shared wallet short)");
+                    if (!toasted)
+                    {
+                        toasted = true;
+                        Send(connId, MsgType.Toast, bw => bw.Write("not enough money - the purchase was cancelled"));
+                    }
+                }
+            }
+        }
+
+        /// <summary>Host per-frame: fail-open valve for held purchases whose charge never
+        /// arrived (cost-0 items, a modded purchase path that skips ReduceCoin, or a guest
+        /// that disconnected mid-purchase). After 1.5s deliver them anyway - identical to
+        /// the pre-coupling behavior, so the worst case is the old behavior, never a hang.</summary>
+        private void PumpHeldPurchases()
+        {
+            if (_heldPurchases.Count == 0) return;
+            double now = Time.realtimeSinceStartupAsDouble;
+            while (_heldPurchases.Count > 0 && now - _heldPurchases[0].At > 1.5)
+            {
+                var m = _heldPurchases[0].Msg;
+                _heldPurchases.RemoveAt(0);
+                CoopPlugin.Log.LogInfo($"held purchase ({m.Type}) from conn {m.ConnId} saw no charge within 1.5s - delivering (fail-open)");
+                _deliveringHeld = true;
+                try { Dispatch(m); } finally { _deliveringHeld = false; }
+            }
         }
 
         /// <summary>True when a NATIVE game TMP input field currently owns keyboard focus.
@@ -1802,6 +1912,20 @@ namespace CardShopCoop
                 _avatars.Remove(left);
                 if (Role == CoopRole.Host)
                 {
+                    // release anything the departed guest was CARRYING: the set-down
+                    // request is never coming, and without this the boxes stay hidden /
+                    // worker-locked / carried-frozen on every peer until a full shutdown
+                    // (verified stranding: item boxes hidden + m_PreventWorkerTakeBox
+                    // pinned forever). Releasing all client-carried boxes is correct for
+                    // 2-player and self-heals with 3+ (a survivor still carrying one
+                    // re-asserts its carry on its next ~0.5s report).
+                    try { _boxes.HostReleaseRemoteCarried(); } catch { }
+                    try { _cardBoxes.HostReleaseRemoteCarried(); } catch { }
+                    try { _furnBoxes.HostReleaseRemoteCarried(); } catch { }
+                    // and DROP any product still held for the departed guest: its charge
+                    // is never coming, and the fail-open pump would otherwise deliver the
+                    // product chargeless 1.5s from now
+                    _heldPurchases.RemoveAll(h => h.Msg.ConnId == left);
                     BroadcastRoster();
                     StatusLine = _net.ConnectionCount == 0
                         ? "Hosting - waiting for a player..."
@@ -1822,6 +1946,7 @@ namespace CardShopCoop
             // (NpcState is chunked - every chunk carries different NPCs - and RelayState
             // multiplexes senders inside the payload, so neither may be coalesced.)
             _pendingReduceThisFrame = 0.0; // reset the per-frame guest-spend accumulator
+            PumpHeldPurchases(); // fail-open any held product whose charge never arrived
             _dispatchBuf.Clear();
             while (_net != null && _net.Incoming.TryDequeue(out var msg))
                 _dispatchBuf.Add(msg);
@@ -2861,6 +2986,15 @@ namespace CardShopCoop
                         string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : "player";
                         var eObj = (EObjectType)objType;
 
+                        // Charge/product coupling: the product arrives BEFORE its coin
+                        // charge (see _heldPurchases). Hold it; the sender's next kind-2
+                        // charge delivers or cancels it.
+                        if (!_deliveringHeld)
+                        {
+                            _heldPurchases.Add(new HeldPurchase { Msg = msg, At = Time.realtimeSinceStartupAsDouble });
+                            break;
+                        }
+
                         // The guest already paid: its CEventPlayer_ReduceCoin was forwarded
                         // and debited the shared wallet BEFORE this spawn. If the prefab
                         // isn't in the host's catalog (different mods / load order), the
@@ -2920,6 +3054,15 @@ namespace CardShopCoop
                         int count = br.ReadInt32();
                         float cost = br.ReadSingle();
                         string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : "player";
+                        // Charge/product coupling: the product arrives BEFORE its coin
+                        // charge (see _heldPurchases). Hold it; the sender's next kind-2
+                        // charge delivers or cancels it. A multi-line cart holds N of
+                        // these against its ONE summed charge - all resolve together.
+                        if (!_deliveringHeld)
+                        {
+                            _heldPurchases.Add(new HeldPurchase { Msg = msg, At = Time.realtimeSinceStartupAsDouble });
+                            break;
+                        }
                         int idx = ResolveRestockIndex(itemType, isBig, rdName, out bool sizeDiffers);
                         if (idx >= 0)
                         {
@@ -2993,6 +3136,15 @@ namespace CardShopCoop
                         int itemType = br.ReadInt32();
                         bool isBig = br.ReadBoolean();
                         string rdName = br.ReadString();
+                        // Charge/product coupling (host only): the unlock arrives BEFORE its
+                        // coin charge (see _heldPurchases). Hold it; the sender's next kind-2
+                        // charge delivers or cancels it. Host-gated so the host->clients echo
+                        // (Role==Client on the receiver) is untouched.
+                        if (Role == CoopRole.Host && !_deliveringHeld)
+                        {
+                            _heldPurchases.Add(new HeldPurchase { Msg = msg, At = Time.realtimeSinceStartupAsDouble });
+                            break;
+                        }
                         bool ok = ApplyLicenseUnlock(itemType, isBig, rdName);
                         if (Role == CoopRole.Host)
                         {
@@ -3421,14 +3573,49 @@ namespace CardShopCoop
                                 {
                                     Send(msg.ConnId, MsgType.Toast, w => w.Write("purchase declined - the shared wallet is short"));
                                     _lastCoinSent = double.MinValue; // force the guest's balance to correct next tick
+                                    // this charge's products arrived BEFORE it (in-order,
+                                    // product-first) and are on hold - cancel them so a
+                                    // declined charge never ships free product/XP
+                                    ResolveHeldPurchases(msg.ConnId, deliver: false);
                                     break;
                                 }
                                 _pendingReduceThisFrame += (double)v;
                                 CEventManager.QueueEvent(new CEventPlayer_ReduceCoin(v));
+                                // charge accepted: deliver every product held for this sender
+                                // (they all belong to the cart this charge paid for)
+                                ResolveHeldPurchases(msg.ConnId, deliver: true);
                                 break;
                             }
                             case 3: CEventManager.QueueEvent(new CEventPlayer_AddShopExp((int)v)); break;
                             case 4: CEventManager.QueueEvent(new CEventPlayer_AddFame((int)v)); break;
+                        }
+                    }
+                    break;
+                }
+                case MsgType.SprayHit:
+                {
+                    // Guest sprayed a smelly customer: replay the vanilla hold-spray hit
+                    // against the HOST's real customers so it actually lands. Iterate the
+                    // customer list and call DeodorantSprayCheck with the forwarded args
+                    // exactly the way RaycastHoldSprayState does (verified decompiled
+                    // InteractionPlayerController ~1628-1631 / Customer ~532). The resulting
+                    // smelly-flag change mirrors back to the guest through NpcSync.
+                    // NEVER CSingleton<CustomerManager>.Instance (fake-manager landmine) -
+                    // resolve + cache via FindObjectOfType, same as NpcSweepTick; the cache
+                    // clears in OnSceneLoaded.
+                    if (Role != CoopRole.Host || !InGameLevel()) break;
+                    using (var br = Msg.Reader(msg.Payload))
+                    {
+                        var pos = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
+                        float range = br.ReadSingle();
+                        int potency = br.ReadInt32();
+                        if (_cmSpray == null) _cmSpray = FindObjectOfType<CustomerManager>();
+                        if (_cmSpray != null)
+                        {
+                            var list = _cmSpray.GetCustomerList();
+                            for (int i = 0; i < list.Count; i++)
+                                if (list[i] != null)
+                                    list[i].DeodorantSprayCheck(pos, range, potency);
                         }
                     }
                     break;

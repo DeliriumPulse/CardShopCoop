@@ -5,6 +5,26 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.0.29
+**Preemptive fixes from a full audit of the game against the mod.** Instead of waiting for field reports, every game system was swept for 2-player coverage gaps (the full audit lives in `docs/audit-2026-07-07.md`: 134 systems confirmed covered, 10 gaps found — all fixed or safely blocked below). Adds one new network message, so 1.0.29 only connects to 1.0.29.
+
+**Duplication & money exploits (never reported — found by the audit)**
+- **Fixed: packs sitting in an auto pack opener duplicated on the host every time a guest joined.** The guest's world-load re-sent every stored pack as if a player had just inserted it. Same bug fixed for deodorant cans stored in the auto cleanser.
+- **Fixed: a guest could sell a boxed-up shelf the host placed and credit the shared wallet while the furniture survived** — an infinite money printer. Guest furniture *selling* is blocked (with a message) until a fully-validated version ships; host selling is untouched.
+- **Fixed: a purchase whose coin charge the host declined (shared wallet short) still delivered the product free** — restock orders, furniture, and licenses now cancel cleanly when the charge is declined.
+
+**Guest actions that silently did nothing (or worse)**
+- **Fixed: the guest's handheld deodorant spray never actually cleaned a smelly customer** (it only hit inert local copies). Sprays now forward to the host and land on the real customer.
+- **Fixed: a guest placing a decoration lost it** — the host's world wipes the guest's local copy and the inventory count was gone for good; placing one could even teleport a *different* decoration. Deco placement is blocked with a message for now.
+- **Fixed: pulling a shelf item into an empty box destroyed the item** (the host rejected the box's new contents while the shelf loss went through).
+
+**Robustness**
+- **Fixed: a host worker could take or drain the box a guest was carrying** out of their hands.
+- **Fixed: a guest loading their own save from the pause menu mid-session left a half-connected session** — the session now ends cleanly the moment either side loads a different world.
+- **Fixed: re-submitting an already-graded card for re-grading could delete a duplicate graded card** on every player who owned one (a stale assumption from 1.0.22 — the same wrong comment caused two other bugs this week; all three paths corrected).
+
+Both players must update — the launcher does it automatically.
+
 ## 1.0.28
 **Fixes for all 9 bugs from the latest two-player field test.** This build changes the network format (box sync), so 1.0.28 only connects to 1.0.28 — the join screen says so if versions differ.
 

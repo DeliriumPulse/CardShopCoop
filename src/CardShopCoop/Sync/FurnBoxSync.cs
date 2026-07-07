@@ -155,6 +155,30 @@ namespace CardShopCoop.Sync
             _hostHeal = 999f; // beats the hash gate even if the real hash is 0
         }
 
+        /// <summary>Host: a peer disconnected - release any furniture box still marked
+        /// client-carried, or it stays in its carried state forever (the set-down report
+        /// is never coming; a rejoining guest starts with an empty carry set). Reuses the
+        /// module's own un-carry apply at the box's current pose, exactly what a normal
+        /// set-down report would have done. Releases everything (the set isn't keyed by
+        /// connection); a surviving guest still carrying re-asserts on its next report.</summary>
+        public void HostReleaseRemoteCarried()
+        {
+            if (_remoteCarried.Count == 0) return;
+            int released = 0;
+            foreach (var box in _remoteCarried)
+            {
+                if (box == null) continue;
+                ApplyToBox(box, box.transform.position, box.transform.eulerAngles.y, carried: false);
+                released++;
+            }
+            _remoteCarried.Clear();
+            if (released > 0)
+            {
+                CoopPlugin.Log.LogInfo($"FurnBoxSync host: released {released} client-carried box(es) after a disconnect");
+                ForceResend();
+            }
+        }
+
         private RestockManager Rm()
         {
             if (_rm == null) _rm = UnityEngine.Object.FindObjectOfType<RestockManager>();

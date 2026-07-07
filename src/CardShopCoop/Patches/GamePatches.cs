@@ -85,6 +85,37 @@ namespace CardShopCoop.Patches
             Try(h, typeof(ShelfManager), "SpawnInteractableObjectInPackageBox",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(FurnitureOrderPrefix)));
 
+            // Furniture SELL is host-only for now (money-printer guard). On the guest,
+            // InteractionPlayerController.ConfirmSellFurniture credits the SHARED wallet via
+            // CEventPlayer_AddCoin(price/2) - which our DayEndBlockPrefix forwards to the host
+            // as a real coin gain - then destroys only the GUEST-side box. The host never sees
+            // that box (FurnBoxSync finds no match), so the real furniture survives while the
+            // wallet is credited = a repeatable printer. ConfirmSellFurniture only sees
+            // m_CurrentHoldingBoxShelf (whatever boxed furniture the guest is holding) and can't
+            // tell a host-placed shelf from a guest-bought-but-unplaced one, so we block ALL
+            // guest furniture sells; the toast explains. Host selling is untouched (Role check).
+            Try(h, typeof(InteractionPlayerController), "ConfirmSellFurniture",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(SellFurnitureBlockPrefix)));
+
+            // Deco-object PLACEMENT is host-only for now. On the guest,
+            // PlaceDecoUIScreen.StartPlaceDecoItem is a pure local action with no forward path:
+            // it decrements inventory via AddDecoItemToInventory(-1) and spawns into the guest's
+            // kind-5 m_DecoObjectList. The host's PopulationSync roster then destroys that orphan
+            // deco (inventory lost for good) and its settled ObjMoveRequest can teleport a
+            // DIFFERENT host deco sharing the same index. Block before the decrement; the toast
+            // explains. Host placement is untouched (Role check).
+            Try(h, typeof(PlaceDecoUIScreen), "StartPlaceDecoItem",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(PlaceDecoBlockPrefix)));
+
+            // Handheld deodorant spray: the guest's hold-spray loop only ever hits the
+            // LOCAL customer list - inert puppets on a client - so a guest could never
+            // clean a smelly customer. Intercept the per-customer check and forward one
+            // spray-tick op to the host, which replays it against its REAL customers
+            // (CoopCore's SprayHit handler); the NpcSync smelly-flag mirror echoes the
+            // cleaned state back automatically.
+            Try(h, typeof(Customer), "DeodorantSprayCheck",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(DeodorantSprayPrefix)));
+
             // A joiner's forwarded furniture spawn runs BoxUpObject -> OnPlacedMovedObject,
             // whose interactive-move teardown DisableMoveObjectPreviewMode dereferences
             // m_MoveObjectPreviewModel. With no live player-move preview (there isn't one
@@ -242,6 +273,83 @@ namespace CardShopCoop.Patches
                 CoopCore.Instance.RegisterLineTimer = 3f;
             }
             return false;
+        }
+
+        /// <summary>Client only: block the guest from selling any boxed furniture. The vanilla
+        /// ConfirmSellFurniture would fire CEventPlayer_AddCoin(price/2) into the SHARED wallet
+        /// (forwarded to the host as a real gain) and then destroy only the guest-side box, which
+        /// the host never mirrors - so the furniture survives while the wallet is paid = a
+        /// repeatable money printer. Returning false BEFORE the coin event stops the printer.
+        /// We can't distinguish a host-placed shelf from a guest-bought-unplaced one here (the
+        /// method only sees m_CurrentHoldingBoxShelf), so this blocks all guest furniture sells;
+        /// the toast tells the guest to ask the host. Host is unaffected (Role check). Same
+        /// block+toast idiom as RenamerBlockPrefix.</summary>
+        public static bool SellFurnitureBlockPrefix()
+        {
+            if (CoopCore.Role != CoopRole.Client) return true;
+            if (CoopCore.Instance != null)
+            {
+                CoopCore.Instance.RegisterLine = "selling furniture is host-only for now - ask the host";
+                CoopCore.Instance.RegisterLineTimer = 3f;
+            }
+            return false;
+        }
+
+        /// <summary>Client only: block the guest from placing deco objects. The vanilla
+        /// StartPlaceDecoItem is a pure local action with no forward path - it decrements deco
+        /// inventory (AddDecoItemToInventory(-1)) and spawns an orphan into the guest's kind-5
+        /// deco list that the host's PopulationSync roster then destroys (inventory lost), and
+        /// whose settled move-request can teleport a DIFFERENT host deco at the same index.
+        /// Returning false BEFORE the inventory decrement keeps the guest's deco intact. Host is
+        /// unaffected (Role check). Same block+toast idiom as RenamerBlockPrefix.</summary>
+        public static bool PlaceDecoBlockPrefix()
+        {
+            if (CoopCore.Role != CoopRole.Client) return true;
+            if (CoopCore.Instance != null)
+            {
+                CoopCore.Instance.RegisterLine = "deco placement is host-only for now";
+                CoopCore.Instance.RegisterLineTimer = 3f;
+            }
+            return false;
+        }
+
+        // ---- handheld deodorant spray (guest -> host forward) -----------------
+        // The vanilla hold-spray loop (InteractionPlayerController.RaycastHoldSprayState
+        // ~1612-1631) calls DeodorantSprayCheck once PER CUSTOMER per spray tick with the
+        // SAME position, so dedupe to one forward per frame. And it must only forward for
+        // the HANDHELD path: the guest's mirrored auto-cleanser calls this same method
+        // locally too, and forwarding those would double-spray on top of the host's own
+        // cleanser sim - so gate on the local player actually holding the spray with the
+        // trigger down (both fields verified in decompiled InteractionPlayerController:
+        // m_IsHoldingMouseDown ~1614, m_CurrentHoldSprayItem ~1621).
+        private static InteractionPlayerController _sprayIpc; // fake-null safe: re-resolved when null
+        private static int _sprayForwardFrame = -1;
+        private static readonly System.Reflection.FieldInfo FiHoldSprayItem =
+            AccessTools.Field(typeof(InteractionPlayerController), "m_CurrentHoldSprayItem");
+        private static readonly System.Reflection.FieldInfo FiHoldingMouseDown =
+            AccessTools.Field(typeof(InteractionPlayerController), "m_IsHoldingMouseDown");
+
+        /// <summary>Client only: puppets are inert, so the local spray does nothing anyway -
+        /// skip it and forward one op per spray tick to the host, whose real customers take
+        /// the hit. The cleaned state echoes back through the NpcSync smelly mirror.</summary>
+        public static bool DeodorantSprayPrefix(UnityEngine.Vector3 sprayPos, float range, int potency)
+        {
+            if (CoopCore.Role != CoopRole.Client) return true;
+            try
+            {
+                if (_sprayIpc == null) _sprayIpc = UnityEngine.Object.FindObjectOfType<InteractionPlayerController>();
+                var ipc = _sprayIpc;
+                bool handheld = ipc != null
+                    && FiHoldSprayItem?.GetValue(ipc) != null
+                    && FiHoldingMouseDown?.GetValue(ipc) is bool held && held;
+                if (handheld && UnityEngine.Time.frameCount != _sprayForwardFrame)
+                {
+                    _sprayForwardFrame = UnityEngine.Time.frameCount;
+                    CoopCore.Instance?.ForwardSprayHit(sprayPos, range, potency);
+                }
+            }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("spray forward: " + e.Message); }
+            return false; // local puppets stay untouched either way
         }
 
         public static bool ApplyingRemotePrice;

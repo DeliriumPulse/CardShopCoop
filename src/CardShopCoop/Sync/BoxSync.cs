@@ -54,10 +54,60 @@ namespace CardShopCoop.Sync
         // hands and broke its bring-boxes-inside loop (field report)
         private static readonly System.Reflection.FieldInfo FiBeingHold =
             AccessTools.Field(typeof(InteractableObject), "m_IsBeingHold");
+        // private on InteractablePackagingBox_Item (NOT InteractableObject): gates the
+        // worker restock candidate filters via CanWorkerTakeBox() (= !m_PreventWorkerTakeBox,
+        // decompiled InteractablePackagingBox_Item ~337-340). The worker filters
+        // (Worker.cs ~567/580/1023...) check only IsValidObject()+CanWorkerTakeBox(),
+        // never activeSelf, so a box a GUEST is carrying (hidden but not worker-locked)
+        // is still a valid restock candidate and a worker will drain/take it out of the
+        // guest's hands (field report). We flip this true while a box id is in
+        // _remoteCarried and clear it when the id leaves. NOT m_IsBeingHold: that field
+        // drives IsValidObject / hold state on other host paths and stomping it here
+        // would fight them.
+        private static readonly System.Reflection.FieldInfo FiPreventWorkerTake =
+            AccessTools.Field(typeof(InteractablePackagingBox_Item), "m_PreventWorkerTakeBox");
 
         private static bool IsBeingHeld(InteractablePackagingBox_Item box)
         {
             try { return FiBeingHold?.GetValue(box) is bool b && b; } catch { return false; }
+        }
+
+        /// <summary>Host: mark/unmark a box worker-untouchable while a GUEST carries it,
+        /// so the restocker's candidate filters (CanWorkerTakeBox) skip it. Direct field
+        /// write via the cached private FieldInfo; per-call try/catch so one bad box never
+        /// aborts the caller's loop.</summary>
+        private static void SetHostWorkerLock(InteractablePackagingBox_Item box, bool locked)
+        {
+            if (box == null) return;
+            try { FiPreventWorkerTake?.SetValue(box, locked); } catch { }
+        }
+
+        /// <summary>Host: a peer disconnected. A box still marked client-carried would stay
+        /// hidden AND worker-locked FOREVER - the set-down request is never coming, and a
+        /// rejoining guest starts with an empty carry state so it never sends one either.
+        /// Release every client-carried box: worker lock off, visible again, physics on; the
+        /// next snapshot then broadcasts Carried=false so every guest un-hides it too.
+        /// _remoteCarried isn't keyed by connection, so this releases everything - correct
+        /// for 2-player, and self-healing in 3-player (a SURVIVING guest still carrying a
+        /// box re-asserts its carry on its next ~0.5s report and it re-hides/locks).</summary>
+        public void HostReleaseRemoteCarried()
+        {
+            if (_remoteCarried.Count == 0) return;
+            int released = 0;
+            foreach (var id in _remoteCarried)
+            {
+                if (!_hostById.TryGetValue(id, out var box) || box == null) continue;
+                SetHostWorkerLock(box, false);
+                try { if (!box.gameObject.activeSelf) box.gameObject.SetActive(true); } catch { }
+                try { box.SetPhysicsEnabled(true); } catch { }
+                released++;
+            }
+            _remoteCarried.Clear();
+            if (released > 0)
+            {
+                CoopPlugin.Log.LogInfo($"BoxSync host: released {released} client-carried box(es) after a disconnect");
+                ForceBroadcastNextTick();
+            }
         }
 
         // client: host truth + id<->box maps (boxes spawned by our apply, or adopted
@@ -118,6 +168,13 @@ namespace CardShopCoop.Sync
             _carriedLastTick.Clear();
             _recentlyReleased.Clear();
             _locallyTouched.Clear();
+            // clear the worker-untouchable lock on every box we still hold marked as
+            // guest-carried BEFORE dropping the maps (B2): a session teardown must not
+            // strand a box worker-locked into the next session. Best-effort - dead/
+            // fake-null boxes just skip.
+            foreach (var id in _remoteCarried)
+                if (_hostById.TryGetValue(id, out var carried) && carried != null)
+                    SetHostWorkerLock(carried, false);
             _hostIds.Clear();
             _hostById.Clear();
             _nextId = 1;
@@ -224,6 +281,39 @@ namespace CardShopCoop.Sync
             // report phantom "drift" every tick and fight the game's arrangement
             if (a.Stored) return a.StoreShelf != b.StoreShelf || a.StoreComp != b.StoreComp;
             return (a.Pos - b.Pos).sqrMagnitude > 0.01f || Mathf.Abs(Mathf.DeltaAngle(a.Yaw, b.Yaw)) > 3f;
+        }
+
+        /// <summary>Seed an EMPTY box's compartment so it can actually hold the wanted
+        /// item type (B1). When a guest pulls the first item off a shelf into an empty
+        /// open box, the box adopts the shelf's type on the guest side; the host box is
+        /// still type None with an empty pos list, so PreSpawnItemUpdate/SpawnItem clamp
+        /// every count to 0 (both CLAMP to m_ItemPosList.Count, ShelfCompartment ~498/507)
+        /// and the gain evaporates. Initialize the type + pos list exactly the way
+        /// FillBoxWithItem does (decompiled InteractablePackagingBox_Item ~100-118:
+        /// SetItemType on the box, SetCompartmentItemType then CalculatePositionList on
+        /// the compartment) so a subsequent count can land. Only touches EMPTY boxes
+        /// (GetItemCount() <= 0): a box with real contents keeps its type, and an OPEN box
+        /// with spawned Item objects positioned against this same pos list is never rebuilt
+        /// under them. Returns true if it seeded (or the type already matched with a pos
+        /// list), false if it declined (empty/None want, or non-empty box of another type).</summary>
+        private static bool EnsureCompartmentType(InteractablePackagingBox_Item box, int wantType)
+        {
+            try
+            {
+                if (wantType == (int)EItemType.None) return false; // nothing to seed
+                var comp = box.m_ItemCompartment;
+                int curType = (int)comp.GetItemType();
+                bool hasPosList = comp.GetItemPosListCount() > 0;
+                if (curType == wantType && hasPosList) return true; // already usable
+                // only adopt into a genuinely EMPTY box - never restyle one holding items
+                if (comp.GetItemCount() > 0) return curType == wantType;
+                var et = (EItemType)wantType;
+                box.SetItemType(et);                    // mirror FillBoxWithItem's box-side type
+                comp.SetCompartmentItemType(et);
+                comp.CalculatePositionList();
+                return true;
+            }
+            catch { return false; }
         }
 
         /// <summary>Data-only count apply via the closed-box path (stored boxes are
@@ -496,7 +586,15 @@ namespace CardShopCoop.Sync
                     // a client holds it: mark carried AND not-stored, so a not-yet-processed
                     // m_IsStored=true on our side can't broadcast a Stored=true echo that
                     // re-pins the taker's report back to stored (the rack-take desync)
-                    if (_remoteCarried.Contains(e.Id)) { e.Carried = true; e.Stored = false; }
+                    if (_remoteCarried.Contains(e.Id))
+                    {
+                        e.Carried = true; e.Stored = false;
+                        // re-assert the worker lock every tick: a game path can clear
+                        // m_PreventWorkerTakeBox out from under us (e.g. SetOpenCloseBox
+                        // resets it false on close, decompiled ~370) while the guest still
+                        // carries the box, which would re-open it to worker theft (B2)
+                        SetHostWorkerLock(boxes[i], true);
+                    }
                     list.Add(e);
                 }
                 // skip identical snapshots (boxes sit still most of the time); a slow
@@ -531,15 +629,30 @@ namespace CardShopCoop.Sync
             {
                 var e = entries[i];
                 if (!_hostById.TryGetValue(e.Id, out var box) || box == null) continue;
-                // type sanity: a mangled or ancient request must not restyle a box
-                if ((int)box.m_ItemCompartment.GetItemType() != e.Type) continue;
+                // type sanity: a mangled or ancient request must not RESTYLE a box that
+                // already holds a different item. But an EMPTY host box (type None, or a
+                // stale different type with zero contents) legitimately adopts the request's
+                // type: the guest pulled an item off a shelf into an empty open box, and the
+                // box's compartment took on the shelf's type (decompiled
+                // RemoveItemFromShelf ~280-297 -> ShelfCompartment.CheckItemType ~242-247
+                // sets the type when m_ItemAmount<=0). Rejecting that dropped the box's gain
+                // while the shelf decrement synced through - the item was destroyed host-side
+                // and healed away on the guest (B1). Only reject when the host box is
+                // genuinely occupied with a CONFLICTING type. EItemType.None == -1.
+                int htype = (int)box.m_ItemCompartment.GetItemType();
+                if (htype != e.Type && htype != (int)EItemType.None
+                    && box.m_ItemCompartment.GetItemCount() > 0) continue;
                 if (IsLocallyCarried(box) || IsBeingHeld(box)) continue; // never stomp a box in the host's or a WORKER's hands
                 // just set down: a report the client built while we still carried it is
                 // stale by definition - the race that teleported boxes mid-restock
                 if (_hostRecentlyReleased.TryGetValue(e.Id, out double rel)
                     && Time.realtimeSinceStartupAsDouble - rel < 6.0) continue;
-                if (e.Carried) _remoteCarried.Add(e.Id);
-                else _remoteCarried.Remove(e.Id);
+                // enter/leave the client-carried set, and pair the worker-untouchable
+                // lock with it: while a guest carries a box no worker may drain or take
+                // it (B2). Set on the exact box the request resolved to; cleared the
+                // instant the guest sets it down (the else branch below).
+                if (e.Carried) { _remoteCarried.Add(e.Id); SetHostWorkerLock(box, true); }
+                else { _remoteCarried.Remove(e.Id); SetHostWorkerLock(box, false); }
                 ApplyToBox(box, e);
             }
             // fan the change out to everyone NOW - with 3+ players the other
@@ -1075,6 +1188,13 @@ namespace CardShopCoop.Sync
                 int cur = comp.GetItemCount();
                 if (cur != want.Count)
                 {
+                    // EMPTY box gaining its first item: adopt the wanted type + build the
+                    // pos list (B1). Without this, an empty box whose host compartment is
+                    // still type None (the guest pulled a shelf item into it) can't spawn
+                    // anything - SpawnItem/PreSpawnItemUpdate both clamp to the empty pos
+                    // list. EnsureCompartmentType only acts on genuinely empty compartments,
+                    // so an open box mid-display with real items is left untouched.
+                    if (want.Count > 0) EnsureCompartmentType(box, want.Type);
                     if (box.IsBoxOpened())
                     {
                         // atomic clear-and-rebuild: SpawnItem is a LOADER (sets the count

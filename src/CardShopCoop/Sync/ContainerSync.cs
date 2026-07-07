@@ -863,6 +863,18 @@ namespace CardShopCoop.Sync
         public static bool PackOpenerAddItemPrefix(InteractableAutoPackOpener __instance, Item item)
         {
             if (CoopCore.Role != CoopRole.Client || ApplyingRemote) return true;
+            // the guest's join world-load restores the host save via
+            // InteractableAutoPackOpener.LoadData, which calls AddItem once per stored
+            // pack (decompiled ~384). Those are NOT player inserts - forwarding each one
+            // makes the host spawn a NEW pack it already has, duplicating every pack that
+            // sat in an opener on every join/rejoin. Skip the op during the reload, same
+            // as the symmetric destroy guard (CardBoxSync/FurnBoxSync DestroyedPrefix).
+            // Still retire the item (as below) so it doesn't float - the host echoes truth.
+            if (CoopCore.ClientReloading)
+            {
+                try { ItemSpawnManager.DisableItem(item); } catch { }
+                return false;
+            }
             var self = Instance;
             if (self == null) return true;
             int idx = self.IndexOf(KindPackOpener, __instance);
@@ -954,6 +966,15 @@ namespace CardShopCoop.Sync
         public static bool CleanserAddItemPrefix(InteractableAutoCleanser __instance, Item item)
         {
             if (CoopCore.Role != CoopRole.Client || ApplyingRemote) return true;
+            // same join-LoadData dupe as PackOpenerAddItemPrefix: InteractableAutoCleanser
+            // .LoadData calls AddItem once per saved spray can (decompiled ~396). Forwarding
+            // each as OpCleanserRefill makes the host spawn extra deodorant cans on every
+            // join/rejoin. Skip the op during the reload; still retire the local item.
+            if (CoopCore.ClientReloading)
+            {
+                try { ItemSpawnManager.DisableItem(item); } catch { }
+                return false;
+            }
             var self = Instance;
             if (self == null) return true;
             int idx = self.IndexOf(KindCleanser, __instance);

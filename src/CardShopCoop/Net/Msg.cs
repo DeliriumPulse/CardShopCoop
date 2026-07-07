@@ -73,6 +73,7 @@ namespace CardShopCoop.Net
         FurnBoxOp = 66,        // client -> host: furniture-box carry/place/destroy ops
         FurnBoxState = 67,     // host -> client: furniture delivery box population
         GradedRemove = 68,     // both ways: a graded card left the shared album (RemoveGradedCard)
+        SprayHit = 69,         // client -> host: handheld deodorant hold-spray (pos+range+potency), replay against host customers
     }
 
     /// <summary>One received message, already reassembled from the wire.</summary>

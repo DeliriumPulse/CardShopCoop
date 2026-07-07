@@ -22,11 +22,16 @@ namespace CardShopCoop.Sync
     ///
     /// Binder accounting: cards leave the shared binder at SELECTION time (the binder's
     /// OnRightMouseButtonUp calls CPlayerData.ReduceCard, which the CardDelta mirror
-    /// already forwards), so the host must NOT reduce again on enroll. The one gap is
-    /// re-submitting an already-graded card: selection uses CPlayerData.RemoveGradedCard
-    /// (a direct list edit, not mirrored), so HostApplyOp repeats that removal by
-    /// identity host-side. Graded results return via RestockManager.SpawnPackageBoxCard -
-    /// a card box the host opens; the resulting AddCard calls mirror through CardDelta.
+    /// already forwards), so the host must NOT reduce again on enroll. A re-submitted
+    /// already-graded card is handled the same way: selection uses CPlayerData.RemoveGradedCard,
+    /// which IS mirrored - RemoveGradedCardPostfix -> ForwardGradedRemoval (GamePatches, since
+    /// 1.0.22) applies the removal on the host AND relays it to every guest. So by the time the
+    /// submit op reaches HostApplyOp, every peer's graded album has already dropped the submitted
+    /// card, and the enrolled submission set carries the card data forward through grading; the
+    /// host must NOT remove it again (a second RemoveGradedCard matches by identity and would
+    /// delete a duplicate copy on every peer that held one). Graded results return via
+    /// RestockManager.SpawnPackageBoxCard - a card box the host opens; the resulting AddCard
+    /// calls mirror through CardDelta.
     /// </summary>
     public class GradingSync
     {
@@ -309,26 +314,28 @@ namespace CardShopCoop.Sync
         /// m_CurrentGradeCardSubmitSet UI scratch buffer, which may hold the host's
         /// half-built submission. The binder is NOT reduced here: the client's selection
         /// already ReduceCard'd each card and the CardDelta mirror carried it over.</summary>
-        /// <summary>Both host reject paths: give a refused submission's cards back to the
-        /// right places. UNGRADED cards go through the host's AddCard - its postfix mirrors
-        /// the +1 to every peer, which is correct because the guest's selection-time
-        /// ReduceCard was mirrored to all. A GRADED (re-grade) card is different: its
-        /// selection-time RemoveGradedCard was a direct list edit NO mirror carried, so at
-        /// reject time only the SUBMITTING guest's album is short and the host's album
-        /// still holds the card. A host-side AddCard would (a) land it in the UNGRADED
-        /// array - a silent card-type conversion - and (b) duplicate it host-side. Instead
-        /// send a targeted graded re-add to the submitter alone: their ApplyCardDelta
-        /// routes a >10 encoded grade through GradingInterop.Remember + AddCard, which
-        /// Grading Overhaul steers back into the graded album.</summary>
+        /// <summary>Both host reject paths: give a refused submission's cards back. The
+        /// guest's SELECTION already took every card from every peer - an ungraded card via
+        /// the mirrored ReduceCard, and a GRADED card via RemoveGradedCardPostfix ->
+        /// ForwardGradedRemoval (the 1.0.22 mirror), which the host applied AND relayed, so
+        /// by reject time host + all guests are at -1. The restore therefore must reach
+        /// EVERYONE, and a single host-side AddCard does exactly that (AddCardPostfix
+        /// broadcasts the +1). The graded subtlety is WHICH album the add lands in: a bare
+        /// AddCard would file an encoded-grade card into the UNGRADED array. Register the
+        /// cert with Grading Overhaul first (GradingInterop.Remember, same as
+        /// ApplyCardDelta's add path) so GO's AddCard patch steers it back into the graded
+        /// album - on the host directly, and on every guest via the broadcast delta whose
+        /// receive path does its own Remember. Everyone nets back to zero; no targeted
+        /// send (that would double-credit the submitter on top of the broadcast).
+        /// senderConn stays plumbed for future targeted repairs.</summary>
         private static void ReturnRejectedCards(List<CardData> cards, int senderConn)
         {
             for (int i = 0; i < cards.Count; i++)
             {
                 if (cards[i] == null) continue;
-                if (cards[i].cardGrade > 0)
-                    CoopCore.Instance?.SendCardDeltaTo(senderConn, cards[i], 1, isAdd: true);
-                else
-                    CPlayerData.AddCard(cards[i], 1);
+                if (cards[i].cardGrade > 10 && Util.GradingInterop.Present)
+                    Util.GradingInterop.Remember(cards[i]);
+                CPlayerData.AddCard(cards[i], 1);
             }
         }
 
@@ -416,18 +423,16 @@ namespace CardShopCoop.Sync
                     return;
                 }
 
-                // A re-submitted GRADED card left the joiner's graded album through
-                // CPlayerData.RemoveGradedCard - a direct list edit no mirror carries.
-                // Repeat it here by identity so the host album doesn't keep a ghost copy
-                // that would duplicate once the re-graded card returns.
-                for (int i = 0; i < cards.Count; i++)
-                {
-                    if (cards[i].cardGrade > 0)
-                    {
-                        try { CPlayerData.RemoveGradedCard(cards[i], ignoreGradedCardIndex: true); }
-                        catch (Exception e) { CoopPlugin.Log.LogWarning("GradingSync degrade: " + e.Message); }
-                    }
-                }
+                // NOTE: a re-submitted GRADED card was ALREADY removed from every peer's graded
+                // album at selection time. The binder's selection calls CPlayerData.RemoveGradedCard,
+                // which since 1.0.22 is mirrored by RemoveGradedCardPostfix -> ForwardGradedRemoval
+                // (GamePatches ~320): the host applied that removal and relayed it to all guests. So
+                // by the time we get here host + all guests are already at -1 for this card. We must
+                // NOT remove it again - RemoveGradedCard matches by identity and would delete a
+                // SECOND identical copy wherever the album held a duplicate, and (running outside
+                // GamePatches.ApplyingRemoteCards) its postfix would re-broadcast another GradedRemove
+                // so every guest with a duplicate loses one too. The enrolled submission set below
+                // carries the card data forward through grading.
 
                 // the vanilla submit body (GradedCardSubmitSelectScreen.OnPressSubmitButton)
                 PriceChangeManager.AddTransaction(0f - total, ETransactionType.GradingFee, serviceLevel);
