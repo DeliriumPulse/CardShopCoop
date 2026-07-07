@@ -5,6 +5,33 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.0.28
+**Fixes for all 9 bugs from the latest two-player field test.** This build changes the network format (box sync), so 1.0.28 only connects to 1.0.28 — the join screen says so if versions differ.
+
+**Storage & deliveries (the big one)**
+- **Fixed: guest-ordered deliveries only showing on the host.** Root cause: the box sync only carried the first **250** boxes, and a well-stocked warehouse blows past that — new delivery boxes were exactly the ones past the cap. Worse, the guest *deleted* its local copies of boxes past the cap, permanently. The cap is now **1000** (the wire count grew from a byte to a ushort), and a capped snapshot can never delete boxes.
+- **Fixed: storage boxes floating in the air.** A box the guest's rack refused to store was left loose at rack-slot height with physics on. It now pins in place on the rack, matching the host's view.
+- **Fixed: items in storage boxes differing between players.** Stored-box contents could clamp to zero on the guest (adopted boxes had no item-position list); plus the rack rejections themselves now self-heal — a stale "ghost" occupant blocking the slot gets evicted — and every rejection logs full diagnostics (rack indices, occupants, where the host says they live).
+
+**Graded cards & grading (Grading Overhaul)**
+- **Fixed: a graded card's price change by the guest not reaching the host.** A patch-ordering race with Grading Overhaul's own price patch made the forward carry a decoded 1–10 grade, so the host filed the price under the wrong key. The forward now always carries the encoded grade.
+- **Fixed: the grading bill charging a different amount than the screen showed** (the $200,000 2-day bill that only took $12k). The host was recomputing the fee with the vanilla flat formula; it now charges the guest's actual on-screen total (sanity-checked).
+- Grading Overhaul's extra service tiers (beyond the vanilla 4) no longer get truncated to tier 3 on the wire — the enrolled tier, duration, and fee now match what the guest picked.
+- A rejected submission (slots full / wallet race) now returns a re-graded card to the **graded album** it came from instead of converting it into an ungraded copy.
+- Graded card names in trade offers show the real grade (e.g. "[grade 9]") instead of a ten-digit encoded number.
+
+**Trading counter**
+- **Fixed: the trading NPC walking away while the guest's trade screen was still up.** Two halves: the host now pauses that customer's patience timer while a guest has the screen open (per counter — two guests at two counters are both covered), and a trade screen that lost its binding to the counter (the source of silently-eaten Accept clicks and the "wrong card name" popup) now re-binds to the customer you're standing at — at their real asking price — instead of doing nothing.
+- Typing a haggle price no longer triggers the serve key (register serve while typing).
+
+**Binder & collection**
+- **Fixed: "total value of cards in binder differs between host and guest."** The binder's total-value text only updated when you opened it; it now refreshes live as cards arrive and leave while the binder is open. (Cards bought from NPCs by the guest were arriving all along — this stale total hid them.)
+- The guest no longer generates its own card market prices — it always uses the host's, so values can't drift.
+- 3+ player sessions: a card gained/lost by one guest now reaches the *other* guests too, and a delta the host refuses (registry mismatch) is never propagated.
+- Card removals that would drive a count negative are skipped loudly instead of silently corrupting the collection — and modded-expansion cards (EPL / CardForge packs) are handled safely there.
+
+Both players must update — the launcher does it automatically.
+
 ## 1.0.27
 **Graded cards now sync (Grading Overhaul).** ⚠️ Please test this one with a real graded card.
 
