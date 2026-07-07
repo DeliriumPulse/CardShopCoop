@@ -53,6 +53,14 @@ namespace CardShopCoop.Sync
             AccessTools.Field(typeof(GradedCardSubmitSelectScreen), "m_IsShowingCanvasGrpAlpha");
         private static readonly FieldInfo FiHidingAlpha =
             AccessTools.Field(typeof(GradedCardSubmitSelectScreen), "m_IsHidingCanvasGrpAlpha");
+        // The on-screen bill. Vanilla EvaluateTotalCost writes it as (10 + m_CostPerCard*n);
+        // Grading Overhaul's EvaluateTotalCost prefix REPLACES that and writes the real
+        // per-value fee (deliveryFee + sum(marketValue * tier.FeeMultiplier)) into this same
+        // private field by reflection (decompiled-grading Grading Overhaul.decompiled.cs :14338,
+        // _fiServiceTotalCost.SetValue at :14378). Whatever the guest SEES on the submit screen
+        // lives here, so reading it forwards GO's actual number instead of the vanilla-flat guess.
+        private static readonly FieldInfo FiServiceTotalCost =
+            AccessTools.Field(typeof(GradedCardSubmitSelectScreen), "m_ServiceTotalCost");
 
         private float _timer;
         private int _lastHash;
@@ -163,7 +171,27 @@ namespace CardShopCoop.Sync
             var inv = Inv();
             if (inv == null) return; // no live world = nothing vanilla could price either
             var svc = inv.m_MonsterData_SO.GetGradeCardServiceData(serviceLevel);
+            // Vanilla-flat fee: the number the ORIGINAL EvaluateTotalCost would show. This is
+            // the fallback whenever Grading Overhaul isn't driving the screen.
             float total = DeliveryFee + svc.m_CostPerCard * picked.Count;
+            // With Grading Overhaul present, the vanilla-flat formula above is the WRONG model:
+            // GO's EvaluateTotalCost prefix priced this submission per card market value and wrote
+            // the real bill into GradedCardSubmitSelectScreen.m_ServiceTotalCost - the exact number
+            // on the guest's screen right now. Forward THAT so the host charges what the guest saw,
+            // not a flat guess (root cause of the ~$12k charge for a ~$200k on-screen bill). Only
+            // trust it when GO is actually loaded AND the live screen field holds a sane, finite,
+            // positive value; otherwise keep the vanilla-flat total so GO-absent sessions are
+            // byte-for-byte unchanged.
+            if (Util.GradingInterop.Present && FiServiceTotalCost != null && screen != null)
+            {
+                try
+                {
+                    if (FiServiceTotalCost.GetValue(screen) is float onScreen
+                        && !float.IsNaN(onScreen) && !float.IsInfinity(onScreen) && onScreen > 0f)
+                        total = onScreen;
+                }
+                catch { } // any reflection hiccup falls through to the vanilla-flat total
+            }
             if (CPlayerData.m_CoinAmountDouble < (double)total)
             {
                 NotEnoughResourceTextPopup.ShowText(ENotEnoughResourceText.Money);
@@ -185,7 +213,19 @@ namespace CardShopCoop.Sync
             }
             inst.SendOp(bw =>
             {
-                bw.Write((byte)Mathf.Clamp(serviceLevel, 0, 3));
+                // Widened from 0..3 to 0..255: Grading Overhaul cycles up to
+                // ServiceTierControlCenter.GetTierCount(company) tiers, which can exceed 4
+                // (decompiled-grading Grading Overhaul.decompiled.cs :13952-13957 does
+                // m_ServiceLevel = (level+1) % GetTierCount, and GetTierCount at :2146 is
+                // company-defined). Clamping to 3 truncated GO's extra tiers, so the host
+                // enrolled the wrong duration/fee. A byte still bounds the wire; the receiver's
+                // matching widen keeps the true tier. Safe because vanilla GetGradeCardServiceData
+                // is an unchecked list index (decompiled MonsterData_ScriptableObject.cs :63-66,
+                // would throw on out-of-range) BUT GO's GetGradeCardServiceData prefix clamps any
+                // out-of-range serviceLevel to Count-1 before that index runs (decompiled-grading
+                // :13971-13993), and a high tier only ever exists in a GO session - so no stray
+                // value can reach vanilla's raw indexer.
+                bw.Write((byte)Mathf.Clamp(serviceLevel, 0, 255));
                 bw.Write((byte)Mathf.Min(picked.Count, MaxSlots));
                 for (int i = 0; i < picked.Count && i < MaxSlots; i++)
                     Msg.WriteCard(bw, picked[i]);
@@ -269,13 +309,44 @@ namespace CardShopCoop.Sync
         /// m_CurrentGradeCardSubmitSet UI scratch buffer, which may hold the host's
         /// half-built submission. The binder is NOT reduced here: the client's selection
         /// already ReduceCard'd each card and the CardDelta mirror carried it over.</summary>
-        public void HostApplyOp(BinaryReader br)
+        /// <summary>Both host reject paths: give a refused submission's cards back to the
+        /// right places. UNGRADED cards go through the host's AddCard - its postfix mirrors
+        /// the +1 to every peer, which is correct because the guest's selection-time
+        /// ReduceCard was mirrored to all. A GRADED (re-grade) card is different: its
+        /// selection-time RemoveGradedCard was a direct list edit NO mirror carried, so at
+        /// reject time only the SUBMITTING guest's album is short and the host's album
+        /// still holds the card. A host-side AddCard would (a) land it in the UNGRADED
+        /// array - a silent card-type conversion - and (b) duplicate it host-side. Instead
+        /// send a targeted graded re-add to the submitter alone: their ApplyCardDelta
+        /// routes a >10 encoded grade through GradingInterop.Remember + AddCard, which
+        /// Grading Overhaul steers back into the graded album.</summary>
+        private static void ReturnRejectedCards(List<CardData> cards, int senderConn)
         {
-            int serviceLevel = Mathf.Clamp(br.ReadByte(), 0, 3);
+            for (int i = 0; i < cards.Count; i++)
+            {
+                if (cards[i] == null) continue;
+                if (cards[i].cardGrade > 0)
+                    CoopCore.Instance?.SendCardDeltaTo(senderConn, cards[i], 1, isAdd: true);
+                else
+                    CPlayerData.AddCard(cards[i], 1);
+            }
+        }
+
+        public void HostApplyOp(BinaryReader br, int senderConn)
+        {
+            // Widened from 0..3 to 0..255 to match the sender: Grading Overhaul's extra service
+            // tiers (GetTierCount(company) can exceed 4) would otherwise be truncated here and the
+            // set enrolled with the wrong duration/fee. GO's own GetGradeCardServiceData prefix
+            // clamps any out-of-range level to Count-1 before vanilla's raw list indexer runs
+            // (decompiled-grading Grading Overhaul.decompiled.cs :13971-13993), so a stray high
+            // tier cannot crash vanilla in a GO session. In a GO-ABSENT session no legitimate
+            // guest can produce a tier > 3, and the flat-recompute path below guards its raw
+            // vanilla GetGradeCardServiceData call so a spoofed high tier can't throw there either.
+            int serviceLevel = Mathf.Clamp(br.ReadByte(), 0, 255);
             int n = Mathf.Min(br.ReadByte(), MaxSlots);
             var cards = new List<CardData>(n);
             for (int i = 0; i < n; i++) cards.Add(Msg.ReadCard(br));
-            float clientFee = br.ReadSingle(); // informational only
+            float clientFee = br.ReadSingle(); // GO present: the REAL bill the guest saw; GO absent: client's flat view
 
             if (CoopCore.Role != CoopRole.Host || cards.Count == 0) return;
 
@@ -288,10 +359,50 @@ namespace CardShopCoop.Sync
                     CoopPlugin.Log.LogWarning("GradingSync: no InventoryBase (world loading?) - submission dropped");
                     return;
                 }
-                var svc = inv.m_MonsterData_SO.GetGradeCardServiceData(serviceLevel);
-                float total = DeliveryFee + svc.m_CostPerCard * cards.Count;
-                if (Mathf.Abs(total - clientFee) > 0.01f)
-                    CoopPlugin.Log.LogWarning($"GradingSync: fee mismatch (client {clientFee}, host {total}) - using host value");
+                // Decide what to actually charge the host wallet.
+                //   GO present: the guest's screen was driven by Grading Overhaul's per-value
+                //     pricing model (deliveryFee + sum(marketValue * tier.FeeMultiplier)). We
+                //     CANNOT recompute that here - GO's EvaluateTotalCost reads the HOST player's
+                //     own UI scratch state (m_CurrentGradeCardSubmitSet, CurrentWebsiteCompany),
+                //     which reflects nothing about the guest's submission. So forward the real
+                //     bill the guest already saw and validated: clientFee. Sanity-gate it (finite,
+                //     non-negative, affordable) so a corrupt/hostile wire can't charge garbage.
+                //     Also NOT computing vanilla GetGradeCardServiceData here avoids that raw list
+                //     indexer throwing on one of GO's out-of-vanilla-range tiers.
+                //   GO absent: the guest ran the vanilla-flat model, so recompute it authoritatively
+                //     (unchanged legacy behavior) and warn on any mismatch.
+                float total;
+                if (Util.GradingInterop.Present)
+                {
+                    if (float.IsNaN(clientFee) || float.IsInfinity(clientFee) || clientFee < 0f)
+                    {
+                        CoopPlugin.Log.LogWarning($"GradingSync: rejecting non-finite/negative clientFee {clientFee} - submission dropped");
+                        ReturnRejectedCards(cards, senderConn);
+                        return;
+                    }
+                    total = clientFee;
+                    // Diagnostic: what would the old vanilla-flat recompute have charged? Log both
+                    // at Info when they disagree so a bad GO integration is easy to spot in the log.
+                    try
+                    {
+                        // clamp defensively - a GO tier can exceed vanilla's list bounds; GO's own
+                        // GetGradeCardServiceData prefix clamps for us, but guard for the diagnostic
+                        // read in case GO's patch ever fails to apply.
+                        int svcIdx = Mathf.Clamp(serviceLevel, 0, inv.m_MonsterData_SO.m_GradeCardServiceDataList.Count - 1);
+                        var svcDiag = inv.m_MonsterData_SO.GetGradeCardServiceData(svcIdx);
+                        float vanillaFlat = DeliveryFee + svcDiag.m_CostPerCard * cards.Count;
+                        if (Mathf.Abs(vanillaFlat - clientFee) > 0.01f)
+                            CoopPlugin.Log.LogInfo($"GradingSync: GO fee forwarded - charging guest's on-screen bill {clientFee} (vanilla-flat recompute would have been {vanillaFlat})");
+                    }
+                    catch { } // diagnostic only; never blocks the charge
+                }
+                else
+                {
+                    var svc = inv.m_MonsterData_SO.GetGradeCardServiceData(serviceLevel);
+                    total = DeliveryFee + svc.m_CostPerCard * cards.Count;
+                    if (Mathf.Abs(total - clientFee) > 0.01f)
+                        CoopPlugin.Log.LogWarning($"GradingSync: fee mismatch (client {clientFee}, host {total}) - using host value");
+                }
 
                 // full / broke (the client pre-checks against the mirror, so this is a
                 // tiny race window): give the cards BACK to the shared binder rather
@@ -301,7 +412,7 @@ namespace CardShopCoop.Sync
                     || CPlayerData.m_CoinAmountDouble < (double)total)
                 {
                     CoopPlugin.Log.LogWarning("GradingSync: submission rejected (slots/wallet), returning cards to binder");
-                    for (int i = 0; i < cards.Count; i++) CPlayerData.AddCard(cards[i], 1);
+                    ReturnRejectedCards(cards, senderConn);
                     return;
                 }
 

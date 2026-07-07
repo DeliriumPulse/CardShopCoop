@@ -61,6 +61,20 @@ namespace CardShopCoop.Patches
             Try(h, typeof(RestockManager), "Update",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(RestockUpdatePrefix)));
 
+            // The client must NOT roll its own card BASE market prices. RestockManager.Init
+            // calls GenerateCardMarketPrice per expansion, which for every card index whose
+            // GetCardMarketPrice is still 0 rolls a fresh base with the LOCAL Unity Random
+            // (RestockManager.cs GenerateCardMarketPrice ~237 guard then ~255-271 Random.Range
+            // -> SetCardGeneratedMarketPrice ~314). The host had that same index at 0 too, so
+            // both sides roll DIFFERENT bases that never heal - only pricePercentChangeList is
+            // synced, not the base - leaving guest and host binder totals silently diverged.
+            // GenerateCardMarketPrice does NOTHING but roll card bases, so blocking the whole
+            // method on the client is the narrowest safe cut: the join-time save transfer
+            // writes m_GenCardMarketPriceList directly (not through this method), so the guest
+            // still gets the host's authoritative bases.
+            Try(h, typeof(RestockManager), "GenerateCardMarketPrice",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(GenerateCardMarketPriceBlockPrefix)));
+
             // The shop already has a name (the host's); the joiner's copy must neither
             // prompt for one nor let it be changed.
             Try(h, typeof(ShopRenamer), "ShowRenameShopScreen",
@@ -189,6 +203,17 @@ namespace CardShopCoop.Patches
             try { FiOobTimer?.SetValue(__instance, 0f); } catch { }
         }
 
+        /// <summary>Client only: skip the local card-base-price roll entirely. On the host this
+        /// runs and defines the authoritative bases; on the guest, running it would roll a
+        /// DIFFERENT base (local Random) for every index the host also had at 0, and only the
+        /// percent-change list is synced afterwards - so the two binders drift apart forever.
+        /// Returning false leaves m_GenCardMarketPriceList as the join-time save transfer wrote
+        /// it (the host's real bases). Same Role-check idiom as ClientBlockPrefix.</summary>
+        public static bool GenerateCardMarketPriceBlockPrefix()
+        {
+            return CoopCore.Role != CoopRole.Client;
+        }
+
         /// <summary>Skip the move-preview teardown when there's no preview to tear down
         /// (a programmatically-spawned forwarded furniture order). The vanilla body
         /// dereferences m_MoveObjectPreviewModel unconditionally and NRE'd there,
@@ -224,7 +249,27 @@ namespace CardShopCoop.Patches
         public static void SetCardPricePostfix(CardData cardData, float priceSet)
         {
             if (ApplyingRemotePrice || CoopCore.Role == CoopRole.None) return;
-            try { CoopCore.Instance?.ForwardCardPrice(cardData, priceSet); }
+            try
+            {
+                // Same encoded-grade swap AddCardPostfix does, and for the same reason - but
+                // here it's also ORDERING-critical. Grading Overhaul's own SetCardPrice PREFIX
+                // transiently DECODES cardData.cardGrade in place (encoded 370009134 -> bare 9)
+                // and its POSTFIX restores it; our postfix can run in that window, so a naive
+                // forward would ship the bare 9 and the host would file the price under the
+                // wrong (ungraded) key - exactly why regular cards synced but graded ones didn't.
+                // GradingInterop.Encoded reads GO's registry (GetEncodedOrCurrent), which still
+                // returns the TRUE encoded value even while the field is transiently decoded, so
+                // reading it here is ordering-proof. Restore the game's live object afterwards.
+                int enc = Util.GradingInterop.Present ? Util.GradingInterop.Encoded(cardData) : cardData.cardGrade;
+                if (enc > 10 && cardData.cardGrade <= 10 && cardData.cardGrade != 0)
+                {
+                    int saved = cardData.cardGrade;
+                    cardData.cardGrade = enc;
+                    try { CoopCore.Instance?.ForwardCardPrice(cardData, priceSet); }
+                    finally { cardData.cardGrade = saved; } // never leave the game's object mutated
+                }
+                else CoopCore.Instance?.ForwardCardPrice(cardData, priceSet);
+            }
             catch (Exception e) { CoopPlugin.Log.LogWarning("SetCardPricePostfix forward failed: " + e.Message); }
         }
 

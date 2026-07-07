@@ -477,7 +477,10 @@ namespace CardShopCoop
 
         private static InteractionPlayerController _deltaIpc; // NEVER CSingleton<>.Instance (fake-manager landmine)
 
-        private static void ApplyCardDelta(bool isAdd, int amount, CardData card)
+        /// <summary>Returns true when the delta was actually applied - the host's relay to
+        /// OTHER guests keys off this, so a delta this side REFUSED (corrupt grade, would-go-
+        /// negative registry mismatch) is never propagated onward and can't spread divergence.</summary>
+        private static bool ApplyCardDelta(bool isAdd, int amount, CardData card)
         {
             // A cardGrade > 10 is NOT corruption when Grading Overhaul is installed: it's an
             // ENCODED grade (company + 1-10 grade + cert serial). The old hard 1-10 drop-guard
@@ -486,7 +489,7 @@ namespace CardShopCoop
             if (card.cardGrade != 0 && (card.cardGrade < 1 || card.cardGrade > 10) && !Util.GradingInterop.Present)
             {
                 CoopPlugin.Log.LogWarning($"card delta: dropping corrupt graded card {card.monsterType} (grade {card.cardGrade}) - not applied (Grading Overhaul absent)");
-                return;
+                return false;
             }
             Patches.GamePatches.ApplyingRemoteCards = true;
             try
@@ -507,16 +510,58 @@ namespace CardShopCoop
                     // them and wrongly decrement the ungraded array. Route through
                     // RemoveGradedCard (the graded-remove mirror normally arrives as
                     // MsgType.GradedRemove; this defends the CardDelta path too).
+                    // Count what actually came out: removing NOTHING (album never had it -
+                    // the graded analog of the registry mismatch below) must report
+                    // not-applied so the host relay doesn't propagate a remove we refused.
+                    int removed = 0;
                     for (int i = 0; i < amount && CPlayerData.HasGradedCardInAlbum(card); i++)
+                    {
                         CPlayerData.RemoveGradedCard(card, ignoreGradedCardIndex: true);
+                        removed++;
+                    }
+                    if (removed == 0)
+                    {
+                        CoopPlugin.Log.LogWarning($"graded remove: {card.monsterType} (grade {card.cardGrade}) not in this album - skipped (album mismatch?)");
+                        return false;
+                    }
                 }
-                else CPlayerData.ReduceCard(card, amount);
+                else
+                {
+                    // Negative-reduce guard: a remove that outruns what this side actually owns
+                    // silently underflows the collected-count array (ReduceCard just subtracts),
+                    // which is the slow "total value drifts" leak. GetCardAmount resolves the
+                    // owned count through the SAME GetCardSaveIndex + per-expansion collected list
+                    // that ReduceCard decrements, so it's the exact amount the apply would hit.
+                    // (Graded cards - cardGrade > 10 - never reach here; they route through
+                    // RemoveGradedCard above.)
+                    // MODDED-EXPANSION guard first: GetCardCollectedList returns NULL for an
+                    // expansionType outside the vanilla switch (unless EPL's interceptor is
+                    // woven in), and GetCardAmount would NRE on it. Vanilla ReduceCard treats
+                    // the same case as a silent no-op, so preserve exactly that old behavior
+                    // for out-of-vocabulary expansions instead of throwing.
+                    var collected = CPlayerData.GetCardCollectedList(card.expansionType, card.isDestiny);
+                    if (collected == null)
+                    {
+                        CPlayerData.ReduceCard(card, amount); // vanilla no-ops on unknown expansions
+                    }
+                    else
+                    {
+                        int owned = CPlayerData.GetCardAmount(card);
+                        if (owned < amount)
+                        {
+                            CoopPlugin.Log.LogWarning($"card delta would drive {card.monsterType} negative (have {owned}, remove {amount}) - skipped (card registry mismatch?)");
+                            return false;
+                        }
+                        CPlayerData.ReduceCard(card, amount);
+                    }
+                }
             }
             finally { Patches.GamePatches.ApplyingRemoteCards = false; }
             // "cards didn't show up in the binder" reports were undiagnosable from the
             // receiving side - applies were completely silent
             CoopPlugin.Log.LogInfo($"card delta applied: {(isAdd ? "+" : "-")}{amount} {card.monsterType}{(card.cardGrade > 0 ? $" (grade {card.cardGrade})" : card.isFoil ? " (foil)" : "")}");
             RefreshOpenBinder();
+            return true;
         }
 
         /// <summary>Apply a received card price. For an ENCODED (>10) graded grade, register the
@@ -540,6 +585,15 @@ namespace CardShopCoop
             HarmonyLib.AccessTools.Method(typeof(CollectionBinderFlipAnimCtrl), "OnSortingMethodUpdated");
         private static readonly System.Reflection.FieldInfo FiBinderIsBookOpen =
             HarmonyLib.AccessTools.Field(typeof(CollectionBinderFlipAnimCtrl), "m_IsBookOpen");
+        // Extra binder internals we read to recompute the OPEN album's total-value text after a
+        // card delta - the open path (CollectionBinderFlipAnimCtrl.Update ~807-830) branches on
+        // these to pick which SetTotalValue variant to call. All private, so AccessTools-cached.
+        private static readonly System.Reflection.FieldInfo FiBinderUI =
+            HarmonyLib.AccessTools.Field(typeof(CollectionBinderFlipAnimCtrl), "m_CollectionBinderUI");
+        private static readonly System.Reflection.FieldInfo FiBinderIsGradedAlbum =
+            HarmonyLib.AccessTools.Field(typeof(CollectionBinderFlipAnimCtrl), "m_IsGradedCardAlbum");
+        private static readonly System.Reflection.FieldInfo FiBinderExpansionType =
+            HarmonyLib.AccessTools.Field(typeof(CollectionBinderFlipAnimCtrl), "m_ExpansionType");
 
         /// <summary>Make an ALREADY-OPEN collection binder re-lay-out after a card change.
         /// SetCanUpdateSort alone only ARMS a gate the vanilla per-frame Update never
@@ -558,6 +612,49 @@ namespace CardShopCoop
                 bool isOpen = FiBinderIsBookOpen != null && (bool)FiBinderIsBookOpen.GetValue(ctrl);
                 if (isOpen && MiBinderResort != null)
                     MiBinderResort.Invoke(ctrl, new object[] { false }); // backToFirstPage:false
+
+                // OnSortingMethodUpdated re-lays out the cards but NEVER touches the total-value
+                // text - that write only happens in the binder OPEN path. So a traded/pulled card
+                // showed up on the page but the "total value" header stayed stale (the reported
+                // "total value differs"). While the book is open, mirror the exact SetTotalValue
+                // call the open path (CollectionBinderFlipAnimCtrl.Update ~807-830) would make for
+                // the CURRENTLY open album. Behind the isOpen guard so a delta with no binder up
+                // costs nothing.
+                if (isOpen && FiBinderUI != null)
+                {
+                    var ui = FiBinderUI.GetValue(ctrl) as CollectionBinderUI;
+                    if (ui != null)
+                    {
+                        bool isGraded = FiBinderIsGradedAlbum != null && (bool)FiBinderIsGradedAlbum.GetValue(ctrl);
+                        var expansion = FiBinderExpansionType != null
+                            ? (ECardExpansionType)FiBinderExpansionType.GetValue(ctrl)
+                            : ECardExpansionType.None;
+                        if (isGraded)
+                        {
+                            // graded album: sum GetCardMarketPrice over the graded inventory,
+                            // clamping amount>10 to 10 first - exactly the open path's loop (~810-819).
+                            float total = 0f;
+                            for (int i = 0; i < CPlayerData.m_GradedCardInventoryList.Count; i++)
+                            {
+                                if (CPlayerData.m_GradedCardInventoryList[i].amount > 10)
+                                    CPlayerData.m_GradedCardInventoryList[i].amount = 10;
+                                total += CPlayerData.GetCardMarketPrice(CPlayerData.GetGradedCardData(CPlayerData.m_GradedCardInventoryList[i]));
+                            }
+                            ui.SetTotalValue(total);
+                        }
+                        else if (expansion == ECardExpansionType.Ghost)
+                        {
+                            // Ghost/dimension album sums both the normal and dimension halves (~824).
+                            ui.SetTotalValue(CPlayerData.GetCardAlbumTotalValue(expansion, isDimensionCard: false)
+                                + CPlayerData.GetCardAlbumTotalValue(expansion, isDimensionCard: true));
+                        }
+                        else
+                        {
+                            // normal expansion album (~829).
+                            ui.SetTotalValue(CPlayerData.GetCardAlbumTotalValue(expansion, isDimensionCard: false));
+                        }
+                    }
+                }
             }
             catch (System.Exception e) { CoopPlugin.Log.LogWarning($"binder relayout after card change failed: {e.Message}"); }
         }
@@ -577,6 +674,20 @@ namespace CardShopCoop
                 finally { Patches.GamePatches.ApplyingRemotePrice = false; }
                 _pendingCardPrices.Clear();
             });
+        }
+
+        /// <summary>Host-side raw fan-out: forward a message a guest sent us on to the OTHER
+        /// guests, byte-for-byte. The collection is one shared inventory, so a card a 3rd+ player
+        /// gains/loses must reach every peer, not just the host. We re-wrap the ORIGINAL payload
+        /// bytes (not a re-serialized CardData) so an encoded graded grade - the >10 company/cert
+        /// packing - survives verbatim; re-serializing would risk lossy round-trips. Same shape as
+        /// the CardShelfRequest relay, generalized. No-op unless we're the host with >1 peer.</summary>
+        private void RelayRawToOthers(int senderConn, MsgType type, byte[] payload)
+        {
+            if (Role != CoopRole.Host || _net == null || _net.ConnectionCount <= 1) return;
+            var relay = Msg.Build(type, bw => { if (payload != null) bw.Write(payload); });
+            foreach (int cid in _net.ConnIds())
+                if (cid != senderConn) _net.Send(cid, relay);
         }
 
         private void RelayTagToOthers(int senderConn, byte kind, int extra = -1)
@@ -1100,6 +1211,21 @@ namespace CardShopCoop
             });
         }
 
+        /// <summary>Host: send a card delta to ONE peer instead of broadcasting - for when
+        /// only the sender's local state needs repair (e.g. a rejected re-grade submission,
+        /// where the submitting guest alone removed the graded card from its album and no
+        /// other peer's collection changed).</summary>
+        public void SendCardDeltaTo(int connId, CardData card, int amount, bool isAdd)
+        {
+            if (Role != CoopRole.Host || _net == null || card == null || amount <= 0) return;
+            Send(connId, MsgType.CardDelta, bw =>
+            {
+                bw.Write(isAdd);
+                bw.Write(amount);
+                Msg.WriteCard(bw, card);
+            });
+        }
+
         /// <summary>Both roles: mirror a GRADED-card removal (trade-in, donation, re-grade).
         /// Graded cards live in a separate album ReduceCard/CardDelta never touch, so this
         /// is its own message; the receiver applies RemoveGradedCard by identity.</summary>
@@ -1545,6 +1671,17 @@ namespace CardShopCoop
             _net?.BroadcastTransient(Msg.Build(type, write));
         }
 
+        /// <summary>True when a NATIVE game TMP input field currently owns keyboard focus.
+        /// UI.CoopUI.TextFieldFocused only tracks the mod's own IMGUI "coop_" controls, so it
+        /// can't see the game's TextMeshPro fields - e.g. the haggle-price box on the native
+        /// trade/sell-in screen. Without this, tapping the serve key while typing a price would
+        /// also fire a register serve. Null-safe: no EventSystem or nothing selected -> false.</summary>
+        private static bool NativeTextInputFocused()
+        {
+            var sel = UnityEngine.EventSystems.EventSystem.current?.currentSelectedGameObject;
+            return sel != null && sel.GetComponent<TMPro.TMP_InputField>() != null;
+        }
+
         // ------------------------------------------------ per-frame
 
         private void Update()
@@ -1580,7 +1717,8 @@ namespace CardShopCoop
             // tap V = one register action; HOLD V = auto-serve (~4 actions/sec)
             bool serveTap = Input.GetKeyDown(CoopPlugin.ServeKey.Value);
             if (Role == CoopRole.Client && _serveThrottle <= 0f && InGameLevel()
-                && (serveTap || Input.GetKey(CoopPlugin.ServeKey.Value)) && !UI.CoopUI.TextFieldFocused)
+                && (serveTap || Input.GetKey(CoopPlugin.ServeKey.Value)) && !UI.CoopUI.TextFieldFocused
+                && !NativeTextInputFocused())
             {
                 _serveThrottle = 0.25f;
                 Guarded("serve", () =>
@@ -2642,8 +2780,13 @@ namespace CardShopCoop
                             _pendingCardDeltas.Add(new PendingCard { IsAdd = isAdd, Amount = amount, Card = card });
                             break;
                         }
-                        ApplyCardDelta(isAdd, amount, card);
+                        if (!ApplyCardDelta(isAdd, amount, card))
+                            break; // refused here (corrupt/registry mismatch): never propagate it
                     }
+                    // shared collection: a card a guest gained/lost has to reach the OTHER guests
+                    // too, or their binder totals drift out of sync in 3+ player sessions. Forward
+                    // the raw bytes (encoded grades intact) to everyone except the sender.
+                    RelayRawToOthers(msg.ConnId, msg.Type, msg.Payload);
                     break;
                 }
                 case MsgType.GradedRemove:
@@ -2659,8 +2802,12 @@ namespace CardShopCoop
                             _pendingCardDeltas.Add(new PendingCard { IsAdd = false, Amount = 1, Card = card });
                             break;
                         }
-                        ApplyCardDelta(isAdd: false, amount: 1, card: card);
+                        if (!ApplyCardDelta(isAdd: false, amount: 1, card: card))
+                            break; // refused here: never propagate it
                     }
+                    // same shared-collection fan-out as CardDelta: relay the graded-remove to the
+                    // other guests byte-for-byte so the encoded grade in the payload is preserved.
+                    RelayRawToOthers(msg.ConnId, msg.Type, msg.Payload);
                     break;
                 }
                 case MsgType.NpcState:
@@ -3037,7 +3184,7 @@ namespace CardShopCoop
                 case MsgType.GradingOp:
                 {
                     if (Role != CoopRole.Host || !InGameLevel()) break;
-                    using (var br = Msg.Reader(msg.Payload)) _grading.HostApplyOp(br);
+                    using (var br = Msg.Reader(msg.Payload)) _grading.HostApplyOp(br, msg.ConnId);
                     break;
                 }
                 case MsgType.GradingState:

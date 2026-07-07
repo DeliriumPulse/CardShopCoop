@@ -123,6 +123,14 @@ namespace CardShopCoop.Sync
         private static readonly FieldInfo FiScrCardL = AccessTools.Field(typeof(CustomerTradeCardScreen), "m_CardData_L");
         private static readonly FieldInfo FiScrCardR = AccessTools.Field(typeof(CustomerTradeCardScreen), "m_CardData_R");
 
+        // ---- reflection: UIScreenBase privates (verified against decompiled/UIScreenBase.cs)
+        // used ONLY by the S2 hard-teardown path, which mirrors base.OnCloseScreen when the
+        // vanilla close chain threw before it (m_IsScreenOpen protected bool ~line 15,
+        // m_ScreenGroup public GameObject ~line 5). Cached on the screen's runtime type
+        // (CustomerTradeCardScreen), AccessTools walks the base hierarchy to find them.
+        private static readonly FieldInfo FiScrIsOpen = AccessTools.Field(typeof(CustomerTradeCardScreen), "m_IsScreenOpen");
+        private static readonly FieldInfo FiScrGroup = AccessTools.Field(typeof(CustomerTradeCardScreen), "m_ScreenGroup");
+
         private struct Offer
         {
             public byte CounterIdx;
@@ -167,8 +175,14 @@ namespace CardShopCoop.Sync
 
         // host: a joiner's screen is open for this counter (renewed every ~2s;
         // stale after 5s so a crash/disconnect never wedges the host's trading)
-        private int _guestClaimCounter = -1;
-        private double _guestClaimTime;
+        // counter idx -> last OpScreen heartbeat time. PER-COUNTER (was a single slot):
+        // with two guests holding screens at two different counters, the single slot
+        // flip-flopped on every ~2s heartbeat and whichever guest wasn't the most recent
+        // claimant lost both the host-click block AND the customer-timer pin - their
+        // customer walked at 60s mid-screen, the very bug the pin exists to stop.
+        // Claims expire by time (5s) everywhere they're read; the dict never exceeds
+        // the shop's counter count, so no sweep is needed.
+        private readonly Dictionary<int, double> _guestClaims = new Dictionary<int, double>();
 
         public void Reset()
         {
@@ -193,8 +207,7 @@ namespace CardShopCoop.Sync
             _playerTf = null;
             _hostBusy = false;
             _claimTimer = 0f;
-            _guestClaimCounter = -1;
-            _guestClaimTime = 0.0;
+            _guestClaims.Clear();
         }
 
         public void ForceResend()
@@ -238,22 +251,26 @@ namespace CardShopCoop.Sync
             if (CoopCore.Role == CoopRole.Host)
             {
                 var t = _live;
-                if (t != null && t._guestClaimCounter >= 0
-                    && Time.realtimeSinceStartupAsDouble - t._guestClaimTime < 5.0)
+                if (t != null && t._guestClaims.Count > 0)
                 {
                     try
                     {
                         var sm = t.Sm();
-                        var counter = sm != null && t._guestClaimCounter < sm.m_CashierCounterList.Count
-                            ? sm.m_CashierCounterList[t._guestClaimCounter] : null;
-                        if (counter != null && ReferenceEquals(FiTradeCounter?.GetValue(__instance), counter))
+                        double now = Time.realtimeSinceStartupAsDouble;
+                        foreach (var kv in t._guestClaims)
                         {
-                            if (CoopCore.Instance != null)
+                            if (now - kv.Value >= 5.0) continue; // stale claim
+                            var counter = sm != null && kv.Key >= 0 && kv.Key < sm.m_CashierCounterList.Count
+                                ? sm.m_CashierCounterList[kv.Key] : null;
+                            if (counter != null && ReferenceEquals(FiTradeCounter?.GetValue(__instance), counter))
                             {
-                                CoopCore.Instance.RegisterLine = "your partner is answering that customer";
-                                CoopCore.Instance.RegisterLineTimer = 3f;
+                                if (CoopCore.Instance != null)
+                                {
+                                    CoopCore.Instance.RegisterLine = "your partner is answering that customer";
+                                    CoopCore.Instance.RegisterLineTimer = 3f;
+                                }
+                                return false;
                             }
-                            return false;
                         }
                     }
                     catch { }
@@ -302,6 +319,22 @@ namespace CardShopCoop.Sync
             // a genuine $0 bid is never what an accept press means
             if (price <= 0f) price = -1f;
             CoopPlugin.Log.LogInfo($"TradeServe client: accept pressed on native screen (counter {idx}, price {price:F2})");
+            // S1: the screen can be ORPHANED - visually open while _pendingCounter == -1
+            // (the "offer vanished" close raced the CloseScreen chain and left the screen
+            // up, or a native close swallowed a throw). The old code silently dropped the
+            // accept whenever idx < 0 (the customer walked while we stared at a dead
+            // screen). Instead try to REBIND to whatever offer we're actually standing at
+            // before giving up, so a real press is never eaten.
+            if (idx < 0)
+            {
+                idx = t.RebindOrphanedScreen("accept");
+                // the orphaned screen was showing SOME OTHER customer's card and price -
+                // forwarding that stale figure to the rebound counter could force-accept
+                // the new offer at an amount the guest never saw for it (the host pins
+                // m_PriceSet to whatever we send). -1 = "accept at the asking price", so
+                // the rebound accept can only ever pay the rebound offer's own ask.
+                if (idx >= 0) price = -1f;
+            }
             if (idx >= 0)
                 t.SendOpFor(OpAccept, idx, price, "answering the customer...");
             try { __instance.CloseScreen(); }
@@ -315,10 +348,19 @@ namespace CardShopCoop.Sync
         {
             if (CoopCore.Role != CoopRole.Client) return true;
             var t = _live;
-            if (t != null && t._pendingCounter >= 0)
+            if (t != null)
             {
-                CoopPlugin.Log.LogInfo($"TradeServe client: decline pressed on native screen (counter {t._pendingCounter})");
-                t.SendOpFor(OpDecline, t._pendingCounter, 0f, "declining...");
+                // S1: same orphan rebind as the accept path - a decline press on a screen
+                // that lost its binding (idx < 0) must still resolve the customer the
+                // guest is standing at rather than being silently dropped. Vanilla still
+                // runs (return true) so the screen plays its sound and closes normally.
+                int idx = t._pendingCounter;
+                if (idx < 0) idx = t.RebindOrphanedScreen("decline");
+                if (idx >= 0)
+                {
+                    CoopPlugin.Log.LogInfo($"TradeServe client: decline pressed on native screen (counter {idx})");
+                    t.SendOpFor(OpDecline, idx, 0f, "declining...");
+                }
             }
             return true;
         }
@@ -340,25 +382,42 @@ namespace CardShopCoop.Sync
         public static bool ClientStopInteractPrefix(Customer __instance)
         {
             if (CoopCore.Role != CoopRole.Client) return true;
-            FiTradeData?.SetValue(__instance, null);
-            FiPausing?.SetValue(__instance, false);
+            // S3: the puppet-data clears used to run OUTSIDE the try below, so a throw in
+            // the UI-restore block could skip the "_pendingCounter = -1" at the tail and
+            // leave a half-closed screen wedged. Move them inside a single guarded block
+            // whose finally ALWAYS clears _pendingCounter.
             try
             {
-                var ipc = _live != null ? _live.Ipc() : null;
-                if (ipc != null)
-                {
-                    ipc.ExitWorkerInteractMode();
-                    ipc.StopAimLookAt();
-                    if (ipc.m_WalkerCtrl != null) ipc.m_WalkerCtrl.SetStopMovement(isStop: false);
-                    ipc.ExitUIMode();
-                }
-                GameUIScreen.ResetToolTipVisibility();
-                GameUIScreen.ResetEnterGoNextDayIndicatorVisible();
-                TutorialManager.SetGameUIVisible(isVisible: true);
+                FiTradeData?.SetValue(__instance, null);
+                FiPausing?.SetValue(__instance, false);
+                RestorePlayerFromUiMode();
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("TradeServe client: UI restore: " + e.Message); }
-            if (_live != null) _live._pendingCounter = -1;
+            finally
+            {
+                if (_live != null) _live._pendingCounter = -1;
+            }
             return false;
+        }
+
+        /// <summary>Client: the player-restore half of Customer.OnPressStopInteract
+        /// (Customer.cs:255-267) - exit worker/UI interaction mode, unfreeze the walker,
+        /// and restore the tooltip/next-day indicator/tutorial GameUI. Factored out (S2)
+        /// so the S2 hard-teardown path can reuse the exact same restore the normal
+        /// close chain runs. Caller wraps this in its own try/catch.</summary>
+        private static void RestorePlayerFromUiMode()
+        {
+            var ipc = _live != null ? _live.Ipc() : null;
+            if (ipc != null)
+            {
+                ipc.ExitWorkerInteractMode();
+                ipc.StopAimLookAt();
+                if (ipc.m_WalkerCtrl != null) ipc.m_WalkerCtrl.SetStopMovement(isStop: false);
+                ipc.ExitUIMode();
+            }
+            GameUIScreen.ResetToolTipVisibility();
+            GameUIScreen.ResetEnterGoNextDayIndicatorVisible();
+            TutorialManager.SetGameUIVisible(isVisible: true);
         }
 
         private static void Try(Harmony h, Type type, string method,
@@ -412,7 +471,16 @@ namespace CardShopCoop.Sync
             catch { }
             if (string.IsNullOrEmpty(name)) name = c.monsterType.ToString();
             if (c.isFoil) name += " (foil)";
-            if (c.cardGrade > 0) name += $" [grade {c.cardGrade}]";
+            // S5: with Grading Overhaul installed, cardGrade is an ENCODED int (e.g.
+            // 370009134) packing company+grade+cert - printing it raw showed the guest a
+            // ten-digit "grade". Decode to the real 1-10 for display. Actual() is identity
+            // for bare 1-10 (encoded <= 10 passes straight through), so ungraded/plain
+            // grades still render correctly whether or not GO is present.
+            if (c.cardGrade > 0)
+            {
+                int g = Util.GradingInterop.Present ? Util.GradingInterop.Actual(c.cardGrade) : c.cardGrade;
+                if (g > 0) name += $" [grade {g}]";
+            }
             return name;
         }
 
@@ -460,6 +528,21 @@ namespace CardShopCoop.Sync
                     if (counter == null) continue;
                     int idx = sm.m_CashierCounterList.IndexOf(counter);
                     if (idx < 0 || idx > 250) continue;
+
+                    // S4: pause THIS customer's patience while a guest holds the trade screen
+                    // for it. Vanilla only stops m_Timer from advancing when the HOST-local
+                    // m_IsPlayerTrading is true (Customer.Update WaitingToTradeCard branch,
+                    // decompiled/Customer.cs:3641-3644); a guest's screen sets no such flag,
+                    // so the timer kept climbing and the customer force-left at 60s
+                    // (Customer.cs:3645) mid-interaction. The guest heartbeats an OpScreen
+                    // claim for its open counter every ~2s (_guestClaims, per counter);
+                    // while that claim is FRESH (< 5s, same staleness the ClientTradeBlockPrefix
+                    // claim consumer uses), reset ONLY this customer's m_Timer to 0f each tick -
+                    // mirroring vanilla's m_IsPlayerTrading pause. If the guest crashes or
+                    // disconnects the claim goes stale, the reset stops, and the timer resumes.
+                    if (_guestClaims.TryGetValue(idx, out double claimT)
+                        && Time.realtimeSinceStartupAsDouble - claimT < 5.0)
+                        FiCustTimer?.SetValue(cust, 0f);
 
                     var data = FiTradeData?.GetValue(cust) as CustomerTradeData;
                     if (data == null) data = PreRoll(cm, cust);
@@ -649,8 +732,7 @@ namespace CardShopCoop.Sync
             {
                 // joiner's screen-open claim (renewed ~2s; expiry is time-based so no
                 // close message is ever needed). Not logged - it's a heartbeat.
-                _guestClaimCounter = idx;
-                _guestClaimTime = Time.realtimeSinceStartupAsDouble;
+                _guestClaims[idx] = Time.realtimeSinceStartupAsDouble;
                 return;
             }
             CoopPlugin.Log.LogInfo($"TradeServe host: received {(op == OpAccept ? "accept" : op == OpDecline ? "decline" : "op " + op)} @ counter {idx}, price {price:F2}");
@@ -664,7 +746,7 @@ namespace CardShopCoop.Sync
 
         private void HostApplyOpInner(byte op, int idx, float price)
         {
-            _guestClaimCounter = -1; // an answer means the joiner's screen is closing
+            _guestClaims.Remove(idx); // an answer means the joiner's screen at THIS counter is closing
             var cm = Cm();
             var sm = Sm();
             if (cm == null || sm == null || idx < 0 || idx >= sm.m_CashierCounterList.Count)
@@ -941,6 +1023,38 @@ namespace CardShopCoop.Sync
             }
         }
 
+        /// <summary>Client (S1): an accept/decline press landed on a screen with no bound
+        /// counter (_pendingCounter == -1) - the screen was ORPHANED (the vanish-close race
+        /// left it visually open, or a native close swallowed a throw before it could clear
+        /// the binding). Rather than silently drop the press, try to rebind to the live
+        /// offer at whatever counter the guest is actually standing at. Returns the rebound
+        /// counter index (also adopting it as _pendingCounter so the close path is consistent),
+        /// or -1 if nothing resolves - in which case the caller lets the vanilla CloseScreen
+        /// run so the dead screen goes away.</summary>
+        private int RebindOrphanedScreen(string action)
+        {
+            try
+            {
+                var body = PlayerBody();
+                if (body != null)
+                {
+                    int near = RegisterServe.FindNearestCounter(body.position, Reach, quiet: true);
+                    if (near >= 0 && _offers.TryGetValue(near, out var o) && o.Known)
+                    {
+                        _pendingCounter = near;
+                        CoopPlugin.Log.LogInfo($"TradeServe client: rebound orphaned trade screen to counter {near}");
+                        return near;
+                    }
+                }
+            }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("TradeServe client: rebind: " + e.Message); }
+            // no counter to bind and no resolvable offer - this is a genuinely dead screen;
+            // WARN (not Info) so the swallowed press is diagnosable, and let the caller's
+            // CloseScreen tear it down
+            CoopPlugin.Log.LogWarning($"TradeServe client: {action} press had no bound counter and no resolvable offer nearby - closing the dead screen");
+            return -1;
+        }
+
         /// <summary>Client: open the game's REAL CustomerTradeCardScreen filled with the
         /// host's offer. A deactivated puppet from CustomerManager's pool carries a
         /// CustomerTradeData built from the digest (SetCustomer with non-null data
@@ -1061,6 +1175,27 @@ namespace CardShopCoop.Sync
                 {
                     CoopPlugin.Log.LogInfo("TradeServe client: offer vanished while the screen was open - closing it");
                     try { screen.CloseScreen(); } catch { }
+                    // S2: CloseScreen -> OnCloseScreen -> m_CurrentCustomer.OnPressStopInteract
+                    // runs BEFORE base.OnCloseScreen (which is what actually hides the screen -
+                    // UIScreenBase.OnCloseScreen sets m_IsScreenOpen=false + m_ScreenGroup
+                    // inactive). If any link in that chain threw, the swallow-all catch above
+                    // ate it and the screen stayed VISIBLE while _pendingCounter got zeroed -
+                    // the ORPHANED screen at the root of this bug (every later accept/decline
+                    // hit the idx<0 guard and was dropped). Verify the close actually took;
+                    // if not, hard-tear-down by mirroring base.OnCloseScreen via reflection
+                    // and restoring the player ourselves.
+                    if (screen.IsScreenOpened())
+                    {
+                        CoopPlugin.Log.LogWarning("TradeServe client: vanilla close chain left the trade screen open - forcing hard teardown");
+                        try
+                        {
+                            FiScrIsOpen?.SetValue(screen, false);
+                            var group = FiScrGroup?.GetValue(screen) as GameObject;
+                            if (group != null) group.SetActive(false);
+                            RestorePlayerFromUiMode();
+                        }
+                        catch (Exception e) { CoopPlugin.Log.LogWarning("TradeServe client: hard teardown: " + e.Message); }
+                    }
                     _pendingCounter = -1;
                     if (CoopCore.Instance != null)
                     {
@@ -1072,6 +1207,13 @@ namespace CardShopCoop.Sync
             }
 
             if (!inGame || _offers.Count == 0 || _opThrottle > 0f || UI.CoopUI.TextFieldFocused) return;
+            // S6: TextFieldFocused only covers OUR IMGUI fields, and the screen-open
+            // early-return above only fires while WE hold the trade screen. Neither guards
+            // a NATIVE TMP input field owned by the game or another mod (e.g. someone typing
+            // in a price box with no coop screen open) - the serve/decline keys would leak
+            // in as keystrokes. Skip the keys while any native TMP_InputField holds focus.
+            var sel = UnityEngine.EventSystems.EventSystem.current?.currentSelectedGameObject;
+            if (sel != null && sel.GetComponent<TMPro.TMP_InputField>() != null) return;
             bool accept = Input.GetKeyDown(CoopPlugin.ServeKey.Value);
             bool decline = Input.GetKeyDown(DeclineKey);
             if (!accept && !decline) return;

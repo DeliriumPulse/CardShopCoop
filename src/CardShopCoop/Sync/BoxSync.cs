@@ -74,6 +74,13 @@ namespace CardShopCoop.Sync
         private readonly List<ushort> _removeScratch = new List<ushort>();          // scratch
         private readonly List<InteractablePackagingBox_Item> _orphanScratch =
             new List<InteractablePackagingBox_Item>();                              // scratch
+        // client: id -> host's latest entry for the snapshot currently being applied,
+        // so the store-retry ghost eviction (B2) can ask where the host claims a tracked
+        // occupant lives without threading hostList through the static ApplyToBox
+        private readonly Dictionary<ushort, Entry> _hostWhereScratch = new Dictionary<ushort, Entry>();
+        // rate limits for the 1000-box-cap warnings (host oversize / client sweep-skip)
+        private double _lastCapWarn;
+        private double _lastCapSkipLog;
 
         // host: id assignment + per-client state
         private readonly Dictionary<InteractablePackagingBox_Item, ushort> _hostIds =
@@ -129,6 +136,10 @@ namespace CardShopCoop.Sync
             _storeGaveUp.Clear();
             _sm = null;
             _lastResolveWarn = 0;
+            _hostWhereScratch.Clear();
+            // drop any closure over a prior session's id maps so the ghost-eviction probe
+            // can't fire against stale state before the next ClientApply re-wires it
+            HostLocationOf = _ => default(HostBoxWhere);
         }
 
         /// <summary>Force the next HostTick to broadcast the loose-box population immediately,
@@ -223,6 +234,27 @@ namespace CardShopCoop.Sync
             {
                 var comp = box.m_ItemCompartment;
                 if (comp.GetItemCount() == count) return;
+                // PreSpawnItemUpdate CLAMPS to m_ItemPosList.Count (ShelfCompartment.cs
+                // ~496-501). An adopted/orphan-paired box that never ran FillBoxWithItem
+                // has an EMPTY pos list, so every count clamps to 0 - the stored box's
+                // contents pin to zero and never converge with the host (contents
+                // divergence report). Initialize the pos list the way FillBoxWithItem
+                // does (InteractablePackagingBox_Item.cs ~100-118: SetCompartmentItemType
+                // then CalculatePositionList) so the count can actually apply. Guard to
+                // stored/closed boxes only: an OPEN box mid-display has real, spawned
+                // Item objects positioned against this same list, and rebuilding it under
+                // them would shuffle the visible stack.
+                bool storedOrClosed = true;
+                try { storedOrClosed = box.m_IsStored || !box.IsBoxOpened(); } catch { }
+                if (storedOrClosed && count > 0 && comp.GetItemPosListCount() <= 0)
+                {
+                    try
+                    {
+                        comp.SetCompartmentItemType(comp.GetItemType());
+                        comp.CalculatePositionList();
+                    }
+                    catch { }
+                }
                 comp.PreSpawnItemUpdate(count);
                 FiAmountToSpawn?.SetValue(box, count);
             }
@@ -254,6 +286,24 @@ namespace CardShopCoop.Sync
         private static readonly Dictionary<ushort, int> _storeFails = new Dictionary<ushort, int>();
         private static readonly HashSet<ushort> _storeGaveUp = new HashSet<ushort>();
 
+        /// <summary>What the host's CURRENT snapshot says about an occupant box we already
+        /// track. Wired per-apply by ClientApplyInner (closure over _idOf + the incoming
+        /// hostList) because ApplyToBox is static and can't see the instance maps. Used by
+        /// the store-retry ghost eviction (B2): a compartment occupant that WE track but
+        /// whom the host places somewhere ELSE (or not stored at all) is a stale ghost from
+        /// rack-index divergence, and evicting it frees the slot the real store needs.</summary>
+        public struct HostBoxWhere
+        {
+            public bool Tracked;   // this occupant is a box in our id maps (host knows it)
+            public ushort Id;      // its stable id (0 if untracked)
+            public bool Stored;    // host's latest: is it stored at all?
+            public int Shelf;      // host's latest StoreShelf (valid only if Stored)
+            public int Comp;       // host's latest StoreComp (valid only if Stored)
+        }
+        /// <summary>Default: nothing is tracked (host path / not wired) - eviction no-ops.</summary>
+        public static Func<InteractablePackagingBox_Item, HostBoxWhere> HostLocationOf =
+            _ => default(HostBoxWhere);
+
         private static ShelfCompartment ResolveWarehouseCompartment(int shelfIdx, int compIdx)
         {
             try
@@ -279,6 +329,87 @@ namespace CardShopCoop.Sync
             }
             catch { }
             return null;
+        }
+
+        /// <summary>B2: a stored-apply retry keeps getting rejected. Inspect the target
+        /// compartment's box occupants; if any is a box WE track whose CURRENT host snapshot
+        /// places it at a DIFFERENT shelf/comp (or not stored at all), it is a stale GHOST
+        /// left over from rack-index divergence occupying the slot. Evict it (the game's own
+        /// RemoveBox via UnhookIfStored) and retry the store in the same pass. Only evicts on
+        /// POSITIVE identification (tracked box + host disagrees about its location) - an
+        /// untracked box, or one the host agrees belongs here, is left alone and the caller
+        /// falls through to fail-counting. Always logs a diagnostic that proves-or-kills the
+        /// index-divergence theory: the resolved rack's GetIndex/GetWarehouseIndex, the
+        /// occupant ids found, and where the host claims each occupant lives.</summary>
+        private static bool TryEvictGhostAndRetryStore(
+            InteractablePackagingBox_Item box, ShelfCompartment rackComp, Entry want)
+        {
+            try
+            {
+                var occupants = rackComp.GetInteractablePackagingBoxList();
+                // rack address as the compartment itself reports it - if these diverge from
+                // want.StoreShelf/want.StoreComp the peers disagree on rack ordering
+                int rackWarehouseIdx = -1, rackCompIdx = -1;
+                try { rackWarehouseIdx = rackComp.GetWarehouseIndex(); } catch { }
+                try { rackCompIdx = rackComp.GetIndex(); } catch { }
+
+                var diag = new System.Text.StringBuilder();
+                diag.Append($"BoxSync store DIAG: box id {want.Id} rejected by rack want={want.StoreShelf}/{want.StoreComp} ")
+                    .Append($"resolved warehouseIdx={rackWarehouseIdx} compIdx={rackCompIdx} ")
+                    .Append($"occupants={(occupants == null ? 0 : occupants.Count)}: ");
+
+                bool evictedAny = false;
+                if (occupants != null)
+                {
+                    // snapshot the list: UnhookIfStored -> RemoveBox mutates it under us
+                    var snap = new List<InteractablePackagingBox_Item>(occupants);
+                    for (int i = 0; i < snap.Count; i++)
+                    {
+                        var occ = snap[i];
+                        if (occ == null) { diag.Append("[null] "); continue; }
+                        var where = HostLocationOf(occ);
+                        if (!where.Tracked)
+                        {
+                            diag.Append("[untracked] ");
+                            continue;
+                        }
+                        // where does the host say this occupant lives?
+                        string hostSays = where.Stored ? $"{where.Shelf}/{where.Comp}" : "not-stored";
+                        bool hostDisagrees = !where.Stored
+                            || where.Shelf != want.StoreShelf || where.Comp != want.StoreComp;
+                        diag.Append($"[id {where.Id} host={hostSays}{(hostDisagrees ? " GHOST" : "")}] ");
+                        // never evict the box we're trying to store, and never evict one the
+                        // host agrees belongs in THIS slot (that's a legitimately-full slot)
+                        if (hostDisagrees && !ReferenceEquals(occ, box))
+                        {
+                            // full take-recipe, not just RemoveBox: a stored box has physics
+                            // OFF and is parented to the slot, so bare unhook would leave the
+                            // evicted ghost a frozen kinematic husk at the old slot. Unhook +
+                            // unparent + physics on = a normal loose box its own next apply
+                            // pass repositions (or re-stores at the host's real slot).
+                            UnhookIfStored(occ); // game's RemoveBox + clears m_IsStored
+                            try { occ.transform.SetParent(null); } catch { }
+                            try { occ.SetPhysicsEnabled(true); } catch { }
+                            try { if (occ.m_MoveStateValidArea != null) occ.m_MoveStateValidArea.gameObject.SetActive(true); } catch { }
+                            try { occ.m_ItemCompartment.SetPriceTagVisibility(occ.gameObject.activeSelf); } catch { }
+                            evictedAny = true;
+                        }
+                    }
+                }
+                CoopPlugin.Log.LogWarning(diag.ToString());
+
+                if (!evictedAny) return false;
+                // slot freed: retry the store in this same pass (physics already off from the
+                // caller's attempt). DispenseItem returns void; caller re-checks box.m_IsStored.
+                try { box.DispenseItem(isPlayer: false, rackComp); }
+                catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync store evict-retry: " + e.Message); }
+                return true;
+            }
+            catch (Exception e)
+            {
+                CoopPlugin.Log.LogWarning("BoxSync store evict: " + e.Message);
+                return false;
+            }
         }
 
         // ---------------- host ----------------
@@ -342,8 +473,22 @@ namespace CardShopCoop.Sync
             try
             {
                 var boxes = LiveBoxes();
-                var list = new List<Entry>(Mathf.Min(boxes.Count, 250));
-                for (int i = 0; i < boxes.Count && list.Count < 250; i++)
+                // cap raised 250 -> 1000 (the wire count is now a ushort): a Day-100+ shop's
+                // warehouse holds well over 250 boxes, and the old byte-capped snapshot
+                // silently dropped everything past #250 - which is exactly where the game
+                // APPENDS new delivery boxes. Guests then (a) never saw fresh deliveries
+                // ("when guest orders items, the boxes only show on host") and (b) DESTROYED
+                // their mapped copies of every box past the cap via the absent-id sweep -
+                // permanent, compounding divergence ("items in boxes on storage shelf are
+                // not the same"). 1000 entries * ~27B = ~27KB per changed snapshot: trivial
+                // for the reliable channel.
+                if (boxes.Count > 1000 && Time.realtimeSinceStartupAsDouble - _lastCapWarn > 60.0)
+                {
+                    _lastCapWarn = Time.realtimeSinceStartupAsDouble;
+                    CoopPlugin.Log.LogWarning($"BoxSync host: {boxes.Count} live boxes exceed the 1000-box sync cap - boxes past the cap will not sync to guests");
+                }
+                var list = new List<Entry>(Mathf.Min(boxes.Count, 1000));
+                for (int i = 0; i < boxes.Count && list.Count < 1000; i++)
                 {
                     if (boxes[i] == null) continue;
                     var e = Snapshot(boxes[i]);
@@ -483,8 +628,33 @@ namespace CardShopCoop.Sync
         public void ClientApply(List<Entry> hostList)
         {
             ApplyingRemote = true;
+            // publish "where does the host say this tracked occupant lives" for the store-
+            // retry ghost eviction (B2). Rebuild the id->entry index for THIS snapshot, then
+            // hand ApplyToBox a closure over our id maps. Reset in finally so a stale closure
+            // never fires during the host's own apply path (HostApplyRequest).
+            _hostWhereScratch.Clear();
+            for (int i = 0; i < hostList.Count; i++) _hostWhereScratch[hostList[i].Id] = hostList[i];
+            HostLocationOf = occupant =>
+            {
+                var r = default(HostBoxWhere);
+                try
+                {
+                    if (occupant == null || !_idOf.TryGetValue(occupant, out ushort oid)) return r;
+                    r.Tracked = true;
+                    r.Id = oid;
+                    if (_hostWhereScratch.TryGetValue(oid, out var he))
+                    {
+                        r.Stored = he.Stored;
+                        r.Shelf = he.StoreShelf;
+                        r.Comp = he.StoreComp;
+                    }
+                    // not in this snapshot at all: host no longer lists it stored -> not stored
+                }
+                catch { }
+                return r;
+            };
             try { ClientApplyInner(hostList); }
-            finally { ApplyingRemote = false; }
+            finally { ApplyingRemote = false; HostLocationOf = _ => default(HostBoxWhere); }
         }
 
         private void ClientApplyInner(List<Entry> hostList)
@@ -554,6 +724,11 @@ namespace CardShopCoop.Sync
                 {
                     try
                     {
+                        // field diagnostic for the "guest orders show only on host" report:
+                        // EPL modded ids live in [200000,500000] and their spawn path was
+                        // suspected - log the attempt so success is as visible as failure
+                        if (want.Type >= 200000)
+                            CoopPlugin.Log.LogInfo($"BoxSync client: spawning modded-item box id {want.Id} type {want.Type} (EPL virtual id)");
                         box = RestockManager.SpawnPackageBoxItem((EItemType)want.Type, want.Count, want.IsBig);
                     }
                     catch (Exception e)
@@ -594,33 +769,47 @@ namespace CardShopCoop.Sync
 
             // remove local boxes whose id the host no longer lists: with stable ids
             // this is surgical - ONLY the genuinely-destroyed box dies, never an
-            // index-shifted neighbor (the "vanished out of my hands" bug)
-            _removeScratch.Clear();
-            foreach (var kv in _byId)
-                if (!_snapshotIds.Contains(kv.Key)) _removeScratch.Add(kv.Key);
-            for (int i = 0; i < _removeScratch.Count; i++)
+            // index-shifted neighbor (the "vanished out of my hands" bug).
+            // EXCEPT when the snapshot rode the cap: a truncated list proves nothing
+            // about absence (the box may simply be past the cap, not destroyed), and
+            // sweeping on it is exactly how guests permanently lost real warehouse
+            // boxes back when the cap was 250. Destroys just defer to the next
+            // un-capped snapshot.
+            bool truncated = hostList.Count >= 1000;
+            if (truncated && Time.realtimeSinceStartupAsDouble - _lastCapSkipLog > 60.0)
             {
-                ushort id = _removeScratch[i];
-                if (!_byId.TryGetValue(id, out var box)) continue;
-                if (box != null)
+                _lastCapSkipLog = Time.realtimeSinceStartupAsDouble;
+                CoopPlugin.Log.LogInfo("BoxSync client: snapshot rode the 1000-box cap - skipping the absent-box sweep (can't tell destroyed from truncated)");
+            }
+            if (!truncated)
+            {
+                _removeScratch.Clear();
+                foreach (var kv in _byId)
+                    if (!_snapshotIds.Contains(kv.Key)) _removeScratch.Add(kv.Key);
+                for (int i = 0; i < _removeScratch.Count; i++)
                 {
-                    if (IsLocallyCarried(box))
+                    ushort id = _removeScratch[i];
+                    if (!_byId.TryGetValue(id, out var box)) continue;
+                    if (box != null)
                     {
-                        CoopPlugin.Log.LogWarning($"host removed the box in your hands (id {id}, {(EItemType)(int)box.m_ItemCompartment.GetItemType()}) - it was consumed host-side");
-                        // CRITICAL: OnDestroyed does NOT exit hold-box mode, so destroying a
-                        // box the guest is holding strands the controller in HoldingBoxState
-                        // forever (soft-lock: can't interact with anything, not even the trash).
-                        // Release hold-box mode FIRST via the game's own exit.
-                        try { CoopCore.ForceExitHoldBox(box); } catch { }
+                        if (IsLocallyCarried(box))
+                        {
+                            CoopPlugin.Log.LogWarning($"host removed the box in your hands (id {id}, {(EItemType)(int)box.m_ItemCompartment.GetItemType()}) - it was consumed host-side");
+                            // CRITICAL: OnDestroyed does NOT exit hold-box mode, so destroying a
+                            // box the guest is holding strands the controller in HoldingBoxState
+                            // forever (soft-lock: can't interact with anything, not even the trash).
+                            // Release hold-box mode FIRST via the game's own exit.
+                            try { CoopCore.ForceExitHoldBox(box); } catch { }
+                        }
+                        _idOf.Remove(box);
+                        UnhookIfStored(box);
+                        try { box.OnDestroyed(); } catch { }
                     }
-                    _idOf.Remove(box);
-                    UnhookIfStored(box);
-                    try { box.OnDestroyed(); } catch { }
+                    _byId.Remove(id);
+                    _carriedLastTick.Remove(id);
+                    _locallyTouched.Remove(id);
+                    _recentlyReleased.Remove(id);
                 }
-                _byId.Remove(id);
-                _carriedLastTick.Remove(id);
-                _locallyTouched.Remove(id);
-                _recentlyReleased.Remove(id);
             }
 
             // remember the applied truth for local-change detection
@@ -754,8 +943,11 @@ namespace CardShopCoop.Sync
                     // give-up guard: a genuinely full/mismatched rack slot rejects the
                     // store on EVERY tick, and the old code retried forever (field log:
                     // "rejected box id 252 ... retrying" every 30s all session). Once we
-                    // give up, fall through to the loose apply below - visible and
-                    // grabbable beats eternal churn (a later snapshot retries on change)
+                    // give up we STOP dispensing - but instead of the old fall-through to a
+                    // loose pose (which rendered the box floating at the elevated rack-slot
+                    // world position want.Pos with physics on - the "storage boxes floating
+                    // in the air" report), we KINEMATICALLY PIN it at the host pose so it
+                    // reads as shelved (B1). A later snapshot retries the store on change.
                     if (!_storeGaveUp.Contains(want.Id))
                     {
                         if (!box.gameObject.activeSelf) box.gameObject.SetActive(true);
@@ -777,26 +969,71 @@ namespace CardShopCoop.Sync
                                 _storeFails.Remove(want.Id);
                                 return; // stored successfully; slot owns pose
                             }
-                            // DispenseItem returns void and eats failures: count and give up
-                            box.SetPhysicsEnabled(true); // don't leave a loose box frozen
+                            // DispenseItem returns void and eats failures. On the 2nd+ attempt,
+                            // before we count another fail, check whether the slot is blocked by
+                            // a GHOST occupant - a box WE track that the host places somewhere
+                            // else (or not stored) - and if so evict it and retry in THIS pass
+                            // (B2). This is also our field probe for the rack-index-divergence
+                            // theory: we log the resolved rack's indices, the occupant ids, and
+                            // where the host claims each occupant lives.
                             _storeFails.TryGetValue(want.Id, out int fails);
-                            _storeFails[want.Id] = ++fails;
-                            if (fails >= 4)
+                            if (fails >= 1 && TryEvictGhostAndRetryStore(box, rackComp, want))
                             {
-                                _storeGaveUp.Add(want.Id);
-                                CoopPlugin.Log.LogWarning($"BoxSync store: rack {want.StoreShelf}/{want.StoreComp} keeps rejecting box id {want.Id} (slot full or size/type mismatch) - leaving it loose");
+                                if (box.m_IsStored)
+                                {
+                                    _storeFails.Remove(want.Id);
+                                    return; // ghost gone, store succeeded; slot owns pose
+                                }
                             }
+                            box.SetPhysicsEnabled(true); // don't leave a loose box frozen mid-retry
+                            _storeFails[want.Id] = ++fails;
+                            if (fails < 4)
+                                return; // still trying; don't apply a loose pose mid-attempt
+                            _storeGaveUp.Add(want.Id);
+                            CoopPlugin.Log.LogWarning($"BoxSync store: rack {want.StoreShelf}/{want.StoreComp} keeps rejecting box id {want.Id} (slot full or size/type mismatch) - pinning it shelved at the host pose");
+                            // fall through to the B1 pin below (do NOT return here)
                         }
-                        return; // still trying (or no rack yet); don't apply a loose pose mid-attempt
+                        else
+                        {
+                            return; // no rack yet; don't apply a loose pose mid-attempt
+                        }
                     }
-                    // gave up: fall through and render it as a normal loose box
+                    // GAVE UP (this pass or a prior one): the give-up branch OWNS the final
+                    // physics/pose so the generic loose-apply further down can't fight it.
+                    // Kinematic pin at the host pose = sits AT the rack, matching the host,
+                    // instead of floating loose. SetPhysicsEnabled(false) => isKinematic +
+                    // collider off (InteractablePackagingBox.cs ~163-175). Once the host
+                    // takes it off the rack, want.Stored flips false and the else-branch
+                    // below re-enables physics so it behaves normally again.
+                    try
+                    {
+                        if (!box.gameObject.activeSelf)
+                        {
+                            box.gameObject.SetActive(true);
+                            try { box.m_ItemCompartment.SetPriceTagVisibility(true); } catch { }
+                        }
+                        box.SetPhysicsEnabled(false);
+                        box.transform.SetPositionAndRotation(want.Pos, Quaternion.Euler(0f, want.Yaw, 0f));
+                        ObjMoveSync.SyncTagGroup(box.transform); // box price tags ride in their own group
+                    }
+                    catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync store pin: " + e.Message); }
+                    return;
                 }
                 else
                 {
                     // host says NOT stored: clear any give-up state so a future store
                     // (rack slot freed up, box re-placed) is attempted fresh
-                    if (_storeGaveUp.Count > 0) _storeGaveUp.Remove(want.Id);
+                    bool wasPinned = _storeGaveUp.Count > 0 && _storeGaveUp.Remove(want.Id);
                     if (_storeFails.Count > 0) _storeFails.Remove(want.Id);
+                    // a give-up box was pinned KINEMATIC (physics off) at the rack pose. Now
+                    // the host has taken it off the rack, so it must behave as a normal loose
+                    // box again - re-enable physics here (the locallyStored take-recipe below
+                    // won't fire for it, because the pin never actually stored it: m_IsStored
+                    // is false). Without this the box stays an unclickable frozen ghost.
+                    if (wasPinned && !locallyStored)
+                    {
+                        try { box.SetPhysicsEnabled(true); } catch { }
+                    }
                 }
                 if (locallyStored)
                 {
@@ -896,8 +1133,12 @@ namespace CardShopCoop.Sync
 
         public static void WriteEntries(BinaryWriter bw, List<Entry> entries)
         {
-            bw.Write((byte)Mathf.Min(entries.Count, 250));
-            for (int i = 0; i < entries.Count && i < 250; i++)
+            // ushort count (was byte): the byte ceiling forced the old 250-box snapshot
+            // cap, which silently dropped late-list boxes - see the HostTick comment.
+            // WIRE CHANGE: peers must both be on this build (the version handshake
+            // already rejects mixed versions, so this is safe).
+            bw.Write((ushort)Mathf.Min(entries.Count, 1000));
+            for (int i = 0; i < entries.Count && i < 1000; i++)
             {
                 var e = entries[i];
                 bw.Write(e.Id);
@@ -913,7 +1154,7 @@ namespace CardShopCoop.Sync
 
         public static List<Entry> ReadEntries(BinaryReader br)
         {
-            int n = br.ReadByte();
+            int n = br.ReadUInt16(); // widened with WriteEntries (was a byte)
             var list = new List<Entry>(n);
             for (int i = 0; i < n; i++)
             {
