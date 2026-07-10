@@ -2003,15 +2003,23 @@ namespace CardShopCoop
             }
         }
 
-        /// <summary>True when a NATIVE game TMP input field currently owns keyboard focus.
+        /// <summary>True when a NATIVE game TMP input field is ACTIVELY BEING EDITED.
         /// UI.CoopUI.TextFieldFocused only tracks the mod's own IMGUI "coop_" controls, so it
         /// can't see the game's TextMeshPro fields - e.g. the haggle-price box on the native
         /// trade/sell-in screen. Without this, tapping the serve key while typing a price would
-        /// also fire a register serve. Null-safe: no EventSystem or nothing selected -> false.</summary>
-        private static bool NativeTextInputFocused()
+        /// also fire a register serve.
+        /// CRITICAL: must check isFocused (editing NOW), not mere EventSystem SELECTION -
+        /// Unity leaves currentSelectedGameObject pointing at the last-clicked UI element
+        /// FOREVER after its screen closes, so a selection-only check permanently ate the
+        /// serve key once the guest had touched any game text field (price screen, phone
+        /// app, grading site) - field report: "guest can't interact with npc".
+        /// Null-safe: no EventSystem / nothing selected / not editing -> false.</summary>
+        internal static bool NativeTextInputFocused()
         {
             var sel = UnityEngine.EventSystems.EventSystem.current?.currentSelectedGameObject;
-            return sel != null && sel.GetComponent<TMPro.TMP_InputField>() != null;
+            if (sel == null) return false;
+            var tmp = sel.GetComponent<TMPro.TMP_InputField>();
+            return tmp != null && tmp.isFocused;
         }
 
         // ------------------------------------------------ per-frame
@@ -2048,6 +2056,13 @@ namespace CardShopCoop
             }
             // tap V = one register action; HOLD V = auto-serve (~4 actions/sec)
             bool serveTap = Input.GetKeyDown(CoopPlugin.ServeKey.Value);
+            // focus suppression must be LOUD on a real tap: these guards silently ate every
+            // serve press when a stale focus stuck (the "guest can't interact with npc"
+            // report) - undiagnosable from the log until this line existed
+            if (serveTap && Role == CoopRole.Client
+                && (UI.CoopUI.TextFieldFocused || NativeTextInputFocused()))
+                CoopPlugin.Log.LogInfo("serve key ignored (a text field has focus - "
+                    + (UI.CoopUI.TextFieldFocused ? "co-op window" : "game input") + ")");
             if (Role == CoopRole.Client && _serveThrottle <= 0f && InGameLevel()
                 && (serveTap || Input.GetKey(CoopPlugin.ServeKey.Value)) && !UI.CoopUI.TextFieldFocused
                 && !NativeTextInputFocused())

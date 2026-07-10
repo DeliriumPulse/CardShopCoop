@@ -1206,17 +1206,29 @@ namespace CardShopCoop.Sync
                 return;
             }
 
-            if (!inGame || _offers.Count == 0 || _opThrottle > 0f || UI.CoopUI.TextFieldFocused) return;
+            if (!inGame || _offers.Count == 0 || _opThrottle > 0f) return;
+            bool accept = Input.GetKeyDown(CoopPlugin.ServeKey.Value);
+            bool decline = Input.GetKeyDown(DeclineKey);
+            if (!accept && !decline) return;
             // S6: TextFieldFocused only covers OUR IMGUI fields, and the screen-open
             // early-return above only fires while WE hold the trade screen. Neither guards
             // a NATIVE TMP input field owned by the game or another mod (e.g. someone typing
             // in a price box with no coop screen open) - the serve/decline keys would leak
-            // in as keystrokes. Skip the keys while any native TMP_InputField holds focus.
-            var sel = UnityEngine.EventSystems.EventSystem.current?.currentSelectedGameObject;
-            if (sel != null && sel.GetComponent<TMPro.TMP_InputField>() != null) return;
-            bool accept = Input.GetKeyDown(CoopPlugin.ServeKey.Value);
-            bool decline = Input.GetKeyDown(DeclineKey);
-            if (!accept && !decline) return;
+            // in as keystrokes. Skip the keys while a field is ACTIVELY EDITED - and say so
+            // in the log: these guards used to eat presses silently (mere EventSystem
+            // SELECTION persists forever after a screen closes, which killed the serve key
+            // outright - "guest can't interact with npc" field report). Checked AFTER the
+            // keydown so the suppression only logs on a real press.
+            if (UI.CoopUI.TextFieldFocused)
+            {
+                CoopPlugin.Log.LogInfo("TradeServe client: serve/decline key ignored (co-op window text field focused)");
+                return;
+            }
+            if (CoopCore.NativeTextInputFocused())
+            {
+                CoopPlugin.Log.LogInfo("TradeServe client: serve/decline key ignored (game text field being edited)");
+                return;
+            }
 
             var body = PlayerBody();
             if (body == null)

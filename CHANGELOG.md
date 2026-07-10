@@ -5,6 +5,9 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.0.32
+**Hotfix: the guest's serve key going permanently dead ("guest can't interact with npc" - thanks Coke).** A safety guard added in 1.0.29 (don't fire the serve key while typing in a text box) checked whether a game text field was *selected* rather than *actively being edited* - and Unity keeps the last-clicked UI element selected forever, so touching any price box / phone app / website input silently killed the serve key for the rest of the session. It now only suppresses while you are genuinely typing, the co-op window can no longer leave a stale focus behind when closed, and a suppressed press is logged instead of silent - so if a key ever dies again, the log says exactly why. Both players must update - the launcher does it automatically.
+
 ## 1.0.31
 **New in-game look.** The co-op window (F2) got a full visual overhaul - a proper themed panel matching the game's cozy style (rounded corners, title bar, HOST/JOIN section cards, colored status chips, styled buttons and fields), and the on-screen prompts (serve hints, host clock, errors) are now readable dark pills instead of floating text. No gameplay or sync changes. Both players must update - the launcher does it automatically.
 

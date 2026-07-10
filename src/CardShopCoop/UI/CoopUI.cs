@@ -64,6 +64,11 @@ namespace CardShopCoop.UI
             // ---- HUD overlays (outside the window) ----
             if (!Visible)
             {
+                // a hidden window cannot have a focused coop_ field, but IMGUI keeps the
+                // last focus NAME alive after the window stops drawing - without this
+                // reset, closing the window right after typing left TextFieldFocused
+                // stuck TRUE and silently ate the serve key for the rest of the session
+                TextFieldFocused = false;
                 // little always-on hint (bottom-left)
                 if (_hintText == null || _hintKeySeen != CoopPlugin.UiToggleKey.Value)
                 {
