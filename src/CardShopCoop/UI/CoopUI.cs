@@ -9,13 +9,14 @@ using UnityEngine;
 
 namespace CardShopCoop.UI
 {
-    /// <summary>Small IMGUI window: host / join / status. Toggled with F11.</summary>
+    /// <summary>Small IMGUI window: host / join / status. Toggled with the UI key.
+    /// Presentation is driven by <see cref="CoopTheme"/> (cozy card-shop paper + teal).</summary>
     public class CoopUI
     {
         public bool Visible = true;
         public static bool TextFieldFocused;
 
-        private Rect _win = new Rect(24f, 96f, 380f, 10f);
+        private Rect _win = new Rect(24f, 96f, 400f, 10f);
         private string _ipField;
         private string _nameField;
         private string _lanIps;
@@ -33,17 +34,17 @@ namespace CardShopCoop.UI
         private CSteamID _pwPromptLobby = CSteamID.Nil;
         private const int PageSize = 6;
 
-        // OnGUI runs 2+ times per frame; GUIStyle construction and string interpolation
-        // there is steady per-frame garbage, so styles are built once (lazily — GUI.skin
-        // is only valid inside OnGUI) and display strings only when their source changes
-        private GUIStyle _warnStyle, _centerStyle, _bigStyle, _redStyle, _wrapStyle;
+        // OnGUI runs 2+ times per frame; GUIStyle construction and string interpolation there
+        // is steady per-frame garbage. Styles/textures live in CoopTheme (built once, cached);
+        // the HUD display strings - and the GUIContent wrappers the pills measure - are rebuilt
+        // only when their source line changes.
         private KeyCode _hintKeySeen;
-        private string _hintText;
-        private string _errorSeen, _errorText;
+        private string _hintText; private GUIContent _hintGc;
+        private string _errorSeen, _errorText; private GUIContent _errorGc;
         private string _enumRestoreMsg; // outcome line under the enum-lend notice
-        private string _hostTimeSeen, _hostTimeText;
-        private string _promptSeen, _promptText;
-        private string _registerSeen, _registerText;
+        private string _hostTimeSeen, _hostTimeText; private GUIContent _hostTimeGc;
+        private string _promptSeen, _promptText; private GUIContent _promptGc;
+        private string _registerSeen, _registerText; private GUIContent _registerGc;
 
         /// <summary>Lower = more likely the real home-LAN address.</summary>
         private static int IpRank(string ip)
@@ -56,58 +57,60 @@ namespace CardShopCoop.UI
 
         public void Draw(CoopCore core, ICoopTransport net)
         {
+            CoopTheme.EnsureBuilt();
             if (_ipField == null) _ipField = CoopPlugin.LastJoinIP.Value;
             if (_nameField == null) _nameField = CoopPlugin.PlayerName.Value;
 
-            // little always-on hint + client link status
+            // ---- HUD overlays (outside the window) ----
             if (!Visible)
             {
+                // little always-on hint (bottom-left)
                 if (_hintText == null || _hintKeySeen != CoopPlugin.UiToggleKey.Value)
                 {
                     _hintKeySeen = CoopPlugin.UiToggleKey.Value;
                     _hintText = $"<size=11><color=#9fd3ff>CardShopCoop: {_hintKeySeen} for co-op</color></size>";
+                    _hintGc = new GUIContent(_hintText);
                 }
-                GUI.Label(new Rect(8f, Screen.height - 22f, 400f, 20f), _hintText);
+                Vector2 hintSize = CoopTheme.PillSize(CoopTheme.HudPill, _hintGc, 440f);
+                GUI.Label(new Rect(8f, Screen.height - hintSize.y - 6f, hintSize.x, hintSize.y), _hintGc, CoopTheme.HudPill);
+
                 if (core.ErrorLine.Length > 0)
                 {
-                    if (_warnStyle == null)
-                        _warnStyle = new GUIStyle(GUI.skin.label) { richText = true, fontStyle = FontStyle.Bold };
                     if (core.ErrorLine != _errorSeen)
                     {
                         _errorSeen = core.ErrorLine;
                         _errorText = $"<size=13><color=#ff5a4a>CO-OP: {core.ErrorLine}</color></size>";
+                        _errorGc = new GUIContent(_errorText);
                     }
-                    GUI.Label(new Rect(8f, Screen.height - 46f, 900f, 22f), _errorText, _warnStyle);
+                    Vector2 errSize = CoopTheme.PillSize(CoopTheme.HudPill, _errorGc, 660f);
+                    GUI.Label(new Rect(8f, Screen.height - hintSize.y - 6f - errSize.y - 6f, errSize.x, errSize.y),
+                        _errorGc, CoopTheme.HudPill);
                 }
             }
             if (CoopCore.Role == CoopRole.Client && core.HostTimeLine.Length > 0)
             {
-                if (_centerStyle == null)
-                    _centerStyle = new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, richText = true };
                 if (core.HostTimeLine != _hostTimeSeen)
                 {
                     _hostTimeSeen = core.HostTimeLine;
                     _hostTimeText = $"<color=#ffd54a>{core.HostTimeLine} - co-op</color>";
+                    _hostTimeGc = new GUIContent(_hostTimeText);
                 }
-                GUI.Label(new Rect(Screen.width / 2f - 150f, 4f, 300f, 20f), _hostTimeText, _centerStyle);
+                Vector2 sz = CoopTheme.PillSize(CoopTheme.HudPill, _hostTimeGc, 440f);
+                GUI.Label(new Rect((Screen.width - sz.x) / 2f, 4f, sz.x, sz.y), _hostTimeGc, CoopTheme.HudPill);
             }
             if (core.RegisterLine.Length > 0 || core.PromptLine.Length > 0)
             {
-                if (_bigStyle == null)
-                    _bigStyle = new GUIStyle(GUI.skin.label)
-                    {
-                        alignment = TextAnchor.UpperCenter, richText = true, fontStyle = FontStyle.Bold,
-                        wordWrap = true // refund/catalog toasts run long; clipped text reads as a bug
-                    };
                 if (core.PromptLine.Length > 0)
                 {
                     if (core.PromptLine != _promptSeen)
                     {
                         _promptSeen = core.PromptLine;
                         _promptText = $"<size=17><color=#7ecbff>{core.PromptLine}</color></size>";
+                        _promptGc = new GUIContent(_promptText);
                     }
-                    GUI.Label(new Rect(Screen.width / 2f - 300f, Screen.height * 0.58f, 600f, 30f),
-                        _promptText, _bigStyle);
+                    Vector2 sz = CoopTheme.PillSize(CoopTheme.HudPillBig, _promptGc, 640f);
+                    GUI.Label(new Rect((Screen.width - sz.x) / 2f, Screen.height * 0.58f, sz.x, sz.y),
+                        _promptGc, CoopTheme.HudPillBig);
                 }
                 if (core.RegisterLine.Length > 0)
                 {
@@ -115,27 +118,34 @@ namespace CardShopCoop.UI
                     {
                         _registerSeen = core.RegisterLine;
                         _registerText = $"<size=18><color=#8ef58a>{core.RegisterLine}</color></size>";
+                        _registerGc = new GUIContent(_registerText);
                     }
-                    GUI.Label(new Rect(Screen.width / 2f - 350f, Screen.height * 0.63f, 700f, 90f),
-                        _registerText, _bigStyle);
+                    Vector2 sz = CoopTheme.PillSize(CoopTheme.HudPillBig, _registerGc, 740f);
+                    GUI.Label(new Rect((Screen.width - sz.x) / 2f, Screen.height * 0.63f, sz.x, sz.y),
+                        _registerGc, CoopTheme.HudPillBig);
                 }
             }
             if (!Visible) return;
 
-            _win = GUILayout.Window(867530, _win, id => WindowFn(core, net), "CardShopCoop " + CoopPlugin.Version);
+            CoopTheme.DrawWindowShadow(_win); // soft drop shadow behind the window (screen space)
+            _win = GUILayout.Window(867530, _win, id => WindowFn(core, net), "", CoopTheme.Window);
         }
 
         private void WindowFn(CoopCore core, ICoopTransport net)
         {
-            GUILayout.Label(core.StatusLine);
+            CoopTheme.EnsureBuilt();
+            CoopTheme.DrawWindowChrome(new Rect(0f, 0f, _win.width, _win.height),
+                "CARD SHOP CO-OP", "v" + CoopPlugin.Version);
+
+            DrawStatusRow(core, net);
+
             if (core.ErrorLine.Length > 0)
             {
-                if (_redStyle == null)
-                {
-                    _redStyle = new GUIStyle(GUI.skin.label) { wordWrap = true };
-                    _redStyle.normal.textColor = new Color(1f, 0.45f, 0.4f);
-                }
-                GUILayout.Label(core.ErrorLine, _redStyle);
+                GUILayout.BeginHorizontal();
+                CoopTheme.Chip("PROBLEM", CoopTheme.ChipDanger);
+                GUILayout.FlexibleSpace();
+                GUILayout.EndHorizontal();
+                GUILayout.Label(core.ErrorLine, CoopTheme.LabelDanger);
             }
 
             // Custom-card database on loan: a mismatched-enum join replaced the machine-global
@@ -146,17 +156,16 @@ namespace CardShopCoop.UI
             string lend = CoopCore.EnumLendState();
             if (lend != null)
             {
-                if (_redStyle == null)
-                {
-                    _redStyle = new GUIStyle(GUI.skin.label) { wordWrap = true };
-                    _redStyle.normal.textColor = new Color(1f, 0.45f, 0.4f);
-                }
-                GUILayout.Label(lend, _redStyle);
-                if (_enumRestoreMsg != null) GUILayout.Label(_enumRestoreMsg, _redStyle);
+                GUILayout.BeginHorizontal();
+                CoopTheme.Chip("CARD DATABASE", CoopTheme.ChipWarn);
+                GUILayout.FlexibleSpace();
+                GUILayout.EndHorizontal();
+                GUILayout.Label(lend, CoopTheme.LabelWarn);
+                if (_enumRestoreMsg != null) GUILayout.Label(_enumRestoreMsg, CoopTheme.LabelWarn);
                 // restoring mid-session would break the CURRENT co-op world's custom cards;
                 // only offer it when not connected
                 if (CoopCore.Role == CoopRole.None
-                    && GUILayout.Button("Restore MY card database (for solo saves - restart after)"))
+                    && GUILayout.Button("Restore MY card database (for solo saves - restart after)", CoopTheme.ButtonDanger))
                 {
                     Util.ModParity.RestoreEnumBackup(out _enumRestoreMsg);
                 }
@@ -165,127 +174,9 @@ namespace CardShopCoop.UI
 
             switch (CoopCore.Role)
             {
-                case CoopRole.None:
-                {
-                    if (_browserOpen) { DrawBrowser(core); break; }
-
-                    GUILayout.BeginHorizontal();
-                    GUILayout.Label("Your name:", GUILayout.Width(72f));
-                    GUI.SetNextControlName("coop_name");
-                    string newName = GUILayout.TextField(_nameField, 16);
-                    if (newName != _nameField)
-                    {
-                        _nameField = newName;
-                        if (newName.Trim().Length > 0) CoopPlugin.PlayerName.Value = newName.Trim();
-                    }
-                    GUILayout.EndHorizontal();
-
-                    GUILayout.Space(6f);
-                    GUILayout.Label("<b>Host</b> (load your shop first):");
-                    _publicLobby = GUILayout.Toggle(_publicLobby, " public lobby (shows in the browser)");
-                    if (_publicLobby)
-                    {
-                        GUILayout.BeginHorizontal();
-                        GUILayout.Label("Lobby name:", GUILayout.Width(80f));
-                        GUI.SetNextControlName("coop_lobbyname");
-                        _lobbyNameField = GUILayout.TextField(_lobbyNameField, 28);
-                        GUILayout.EndHorizontal();
-                        GUILayout.BeginHorizontal();
-                        GUILayout.Label("Password:", GUILayout.Width(80f));
-                        GUI.SetNextControlName("coop_hostpw");
-                        _hostPwField = GUILayout.TextField(_hostPwField, 20);
-                        GUILayout.Label("<size=10>(blank = open)</size>", GUILayout.Width(80f));
-                        GUILayout.EndHorizontal();
-                    }
-                    GUILayout.BeginHorizontal();
-                    if (GUILayout.Button("Host via Steam"))
-                        core.StartHostingSteam(_publicLobby, _lobbyNameField, _publicLobby ? _hostPwField : "");
-                    if (GUILayout.Button("Host via LAN", GUILayout.Width(110f)))
-                        core.StartHosting();
-                    GUILayout.EndHorizontal();
-
-                    GUILayout.Space(6f);
-                    GUILayout.Label("<b>Join</b> (stay on the main menu):");
-                    if (GUILayout.Button("Browse public lobbies"))
-                    {
-                        _browserOpen = true;
-                        _page = 0;
-                        _pwPromptLobby = CSteamID.Nil;
-                        core.Lobby.RefreshList();
-                    }
-                    GUILayout.Label("<size=11>Steam friends: just accept the host's invite.</size>");
-
-                    // wrong-password retry for invites into protected lobbies
-                    if (core.ErrorLine == "wrong password" && core.LastFailedLobby != CSteamID.Nil)
-                    {
-                        GUILayout.BeginHorizontal();
-                        GUILayout.Label("Password:", GUILayout.Width(80f));
-                        GUI.SetNextControlName("coop_joinpw");
-                        _joinPwField = GUILayout.TextField(_joinPwField, 20);
-                        if (GUILayout.Button("Retry", GUILayout.Width(60f)))
-                            core.JoinSteam(core.LastFailedLobby, _joinPwField);
-                        GUILayout.EndHorizontal();
-                    }
-
-                    GUILayout.BeginHorizontal();
-                    GUI.SetNextControlName("coop_ip");
-                    _ipField = GUILayout.TextField(_ipField, 24);
-                    if (GUILayout.Button("Join LAN", GUILayout.Width(80f)))
-                        core.Join(_ipField);
-                    GUILayout.EndHorizontal();
-                    GUILayout.Label($"<size=11>LAN port {CoopPlugin.Port.Value} - all players need this mod + the same mods.</size>");
-                    break;
-                }
-                case CoopRole.Host:
-                {
-                    if (core.IsSteamSession)
-                    {
-                        GUILayout.Label("Hosting through Steam - no IPs needed.");
-                        if (GUILayout.Button("Invite friend  (Steam overlay)"))
-                            core.OpenSteamInvite();
-                        int scount = net?.ConnectionCount ?? 0;
-                        GUILayout.Label(scount == 0 ? "Waiting for your invite to be accepted..." : PlayersLine(core));
-                        if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")")) core.SendEmote();
-                        if (GUILayout.Button("Stop hosting")) core.Disconnect();
-                        break;
-                    }
-                    if (_lanIps == null)
-                    {
-                        var ips = LocalIPv4s();
-                        // home-router addresses first; virtual/VPN adapters are unreachable
-                        ips.Sort((a, b) => IpRank(a).CompareTo(IpRank(b)));
-                        _lanIps = ips.Count > 0 ? ips[0] : "(no LAN address found)";
-                        _lanIpsOther = ips.Count > 1 ? string.Join("  ", ips.GetRange(1, ips.Count - 1)) : "";
-                    }
-                    GUILayout.Label("Give this to the other PC:");
-                    if (!_revealIp)
-                    {
-                        if (GUILayout.Button("click to show IP  (hidden for streams)"))
-                            _revealIp = true;
-                    }
-                    else
-                    {
-                        GUILayout.Label($"<b><size=16>{_lanIps}</size></b>  (port {CoopPlugin.Port.Value})");
-                        if (_lanIpsOther.Length > 0)
-                            GUILayout.Label($"<size=10>(other adapters, usually wrong: {_lanIpsOther})</size>");
-                    }
-                    int count = net?.ConnectionCount ?? 0;
-                    GUILayout.Label(count == 0 ? "Waiting for a player..." : PlayersLine(core));
-                    if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")")) core.SendEmote();
-                    if (GUILayout.Button("Stop hosting")) core.Disconnect();
-                    break;
-                }
-                case CoopRole.Client:
-                {
-                    GUILayout.Label(PlayersLine(core));
-                    if (_wrapStyle == null)
-                        _wrapStyle = new GUIStyle(GUI.skin.label) { wordWrap = true, richText = true };
-                    GUILayout.Label($"<size=11>You're playing in the host's shop. At the register, click the customer's items to scan them, then click to take payment and give change ({CoopPlugin.ServeKey.Value} also works). Your own saves are protected.</size>",
-                        _wrapStyle);
-                    if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")")) core.SendEmote();
-                    if (GUILayout.Button("Leave session")) core.Disconnect();
-                    break;
-                }
+                case CoopRole.None: DrawNone(core); break;
+                case CoopRole.Host: DrawHost(core, net); break;
+                case CoopRole.Client: DrawClient(core); break;
             }
 
             string focused = GUI.GetNameOfFocusedControl();
@@ -294,14 +185,191 @@ namespace CardShopCoop.UI
             GUI.DragWindow(new Rect(0f, 0f, 10000f, 20f));
         }
 
+        /// <summary>Status chip (colored by state) + the raw StatusLine kept verbatim beside it
+        /// (people paste that line into bug reports).</summary>
+        private void DrawStatusRow(CoopCore core, ICoopTransport net)
+        {
+            ClassifyStatus(core, net, out GUIStyle chip, out string chipText);
+            GUILayout.BeginHorizontal();
+            if (chip != null)
+            {
+                CoopTheme.Chip(chipText, chip);
+                GUILayout.Space(6f);
+                GUILayout.Label(core.StatusLine, CoopTheme.LabelDim);
+            }
+            else
+            {
+                GUILayout.Label(core.StatusLine, CoopTheme.Label);
+            }
+            GUILayout.FlexibleSpace();
+            GUILayout.EndHorizontal();
+        }
+
+        /// <summary>success when hosting-with-players or connected, info when waiting/connecting,
+        /// plain (null chip) otherwise.</summary>
+        private static void ClassifyStatus(CoopCore core, ICoopTransport net, out GUIStyle chip, out string text)
+        {
+            chip = null; text = null;
+            string s = core.StatusLine ?? "";
+            switch (CoopCore.Role)
+            {
+                case CoopRole.Host:
+                    if ((net?.ConnectionCount ?? 0) > 0) { chip = CoopTheme.ChipSuccess; text = "HOSTING"; }
+                    else { chip = CoopTheme.ChipInfo; text = "WAITING"; }
+                    break;
+                case CoopRole.Client:
+                    if (Has(s, "download") || Has(s, "loading") || Has(s, "requesting")
+                        || Has(s, "received") || Has(s, "Joining") || Has(s, "Connecting"))
+                    { chip = CoopTheme.ChipInfo; text = "CONNECTING"; }
+                    else { chip = CoopTheme.ChipSuccess; text = "CONNECTED"; }
+                    break;
+                default: // None
+                    if (Has(s, "Joining") || Has(s, "Creating") || Has(s, "Connecting"))
+                    { chip = CoopTheme.ChipInfo; text = "CONNECTING"; }
+                    break;
+            }
+        }
+
+        private static bool Has(string hay, string needle)
+            => hay.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0;
+
+        private void DrawNone(CoopCore core)
+        {
+            if (_browserOpen) { DrawBrowser(core); return; }
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Your name:", CoopTheme.Label, GUILayout.Width(72f));
+            GUI.SetNextControlName("coop_name");
+            string newName = GUILayout.TextField(_nameField, 16, CoopTheme.TextField);
+            if (newName != _nameField)
+            {
+                _nameField = newName;
+                if (newName.Trim().Length > 0) CoopPlugin.PlayerName.Value = newName.Trim();
+            }
+            GUILayout.EndHorizontal();
+
+            GUILayout.Space(4f);
+
+            // HOST section
+            GUILayout.BeginVertical(CoopTheme.SectionBox);
+            GUILayout.Label("HOST YOUR SHOP", CoopTheme.SectionHeader);
+            GUILayout.Label("Load your shop first.", CoopTheme.LabelDim);
+            _publicLobby = GUILayout.Toggle(_publicLobby, " public lobby (shows in the browser)", CoopTheme.Toggle);
+            if (_publicLobby)
+            {
+                GUILayout.BeginHorizontal();
+                GUILayout.Label("Lobby name:", CoopTheme.Label, GUILayout.Width(80f));
+                GUI.SetNextControlName("coop_lobbyname");
+                _lobbyNameField = GUILayout.TextField(_lobbyNameField, 28, CoopTheme.TextField);
+                GUILayout.EndHorizontal();
+                GUILayout.BeginHorizontal();
+                GUILayout.Label("Password:", CoopTheme.Label, GUILayout.Width(80f));
+                GUI.SetNextControlName("coop_hostpw");
+                _hostPwField = GUILayout.TextField(_hostPwField, 20, CoopTheme.TextField);
+                GUILayout.Label("<size=10>(blank = open)</size>", CoopTheme.LabelDim, GUILayout.Width(80f));
+                GUILayout.EndHorizontal();
+            }
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("Host via Steam", CoopTheme.ButtonPrimary))
+                core.StartHostingSteam(_publicLobby, _lobbyNameField, _publicLobby ? _hostPwField : "");
+            if (GUILayout.Button("Host via LAN", CoopTheme.ButtonSecondary, GUILayout.Width(110f)))
+                core.StartHosting();
+            GUILayout.EndHorizontal();
+            GUILayout.EndVertical();
+
+            CoopTheme.Divider();
+
+            // JOIN section
+            GUILayout.BeginVertical(CoopTheme.SectionBox);
+            GUILayout.Label("JOIN A FRIEND", CoopTheme.SectionHeader);
+            GUILayout.Label("Stay on the main menu.", CoopTheme.LabelDim);
+            if (GUILayout.Button("Browse public lobbies", CoopTheme.ButtonPrimary))
+            {
+                _browserOpen = true;
+                _page = 0;
+                _pwPromptLobby = CSteamID.Nil;
+                core.Lobby.RefreshList();
+            }
+            GUILayout.Label("<size=11>Steam friends: just accept the host's invite.</size>", CoopTheme.LabelDim);
+
+            // wrong-password retry for invites into protected lobbies
+            if (core.ErrorLine == "wrong password" && core.LastFailedLobby != CSteamID.Nil)
+            {
+                GUILayout.BeginHorizontal();
+                GUILayout.Label("Password:", CoopTheme.Label, GUILayout.Width(80f));
+                GUI.SetNextControlName("coop_joinpw");
+                _joinPwField = GUILayout.TextField(_joinPwField, 20, CoopTheme.TextField);
+                if (GUILayout.Button("Retry", CoopTheme.ButtonPrimary, GUILayout.Width(64f)))
+                    core.JoinSteam(core.LastFailedLobby, _joinPwField);
+                GUILayout.EndHorizontal();
+            }
+
+            GUILayout.BeginHorizontal();
+            GUI.SetNextControlName("coop_ip");
+            _ipField = GUILayout.TextField(_ipField, 24, CoopTheme.TextField);
+            if (GUILayout.Button("Join LAN", CoopTheme.ButtonPrimary, GUILayout.Width(84f)))
+                core.Join(_ipField);
+            GUILayout.EndHorizontal();
+            GUILayout.Label($"<size=11>LAN port {CoopPlugin.Port.Value} - all players need this mod + the same mods.</size>", CoopTheme.LabelDim);
+            GUILayout.EndVertical();
+        }
+
+        private void DrawHost(CoopCore core, ICoopTransport net)
+        {
+            if (core.IsSteamSession)
+            {
+                GUILayout.Label("Hosting through Steam - no IPs needed.", CoopTheme.Label);
+                if (GUILayout.Button("Invite friend  (Steam overlay)", CoopTheme.ButtonPrimary))
+                    core.OpenSteamInvite();
+                int scount = net?.ConnectionCount ?? 0;
+                GUILayout.Label(scount == 0 ? "Waiting for your invite to be accepted..." : PlayersLine(core), CoopTheme.Label);
+                if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")", CoopTheme.ButtonSecondary)) core.SendEmote();
+                if (GUILayout.Button("Stop hosting", CoopTheme.ButtonDanger)) core.Disconnect();
+                return;
+            }
+            if (_lanIps == null)
+            {
+                var ips = LocalIPv4s();
+                // home-router addresses first; virtual/VPN adapters are unreachable
+                ips.Sort((a, b) => IpRank(a).CompareTo(IpRank(b)));
+                _lanIps = ips.Count > 0 ? ips[0] : "(no LAN address found)";
+                _lanIpsOther = ips.Count > 1 ? string.Join("  ", ips.GetRange(1, ips.Count - 1)) : "";
+            }
+            GUILayout.Label("Give this to the other PC:", CoopTheme.Label);
+            if (!_revealIp)
+            {
+                if (GUILayout.Button("click to show IP  (hidden for streams)", CoopTheme.ButtonSecondary))
+                    _revealIp = true;
+            }
+            else
+            {
+                GUILayout.Label($"<b><size=16>{_lanIps}</size></b>  (port {CoopPlugin.Port.Value})", CoopTheme.Label);
+                if (_lanIpsOther.Length > 0)
+                    GUILayout.Label($"<size=10>(other adapters, usually wrong: {_lanIpsOther})</size>", CoopTheme.LabelDim);
+            }
+            int count = net?.ConnectionCount ?? 0;
+            GUILayout.Label(count == 0 ? "Waiting for a player..." : PlayersLine(core), CoopTheme.Label);
+            if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")", CoopTheme.ButtonSecondary)) core.SendEmote();
+            if (GUILayout.Button("Stop hosting", CoopTheme.ButtonDanger)) core.Disconnect();
+        }
+
+        private void DrawClient(CoopCore core)
+        {
+            GUILayout.Label(PlayersLine(core), CoopTheme.Label);
+            GUILayout.Label($"<size=11>You're playing in the host's shop. At the register, click the customer's items to scan them, then click to take payment and give change ({CoopPlugin.ServeKey.Value} also works). Your own saves are protected.</size>",
+                CoopTheme.LabelWrap);
+            if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")", CoopTheme.ButtonSecondary)) core.SendEmote();
+            if (GUILayout.Button("Leave session", CoopTheme.ButtonDanger)) core.Disconnect();
+        }
+
         private void DrawBrowser(CoopCore core)
         {
             GUILayout.BeginHorizontal();
-            GUILayout.Label("<b>Public lobbies</b>");
+            GUILayout.Label("PUBLIC LOBBIES", CoopTheme.SectionHeader);
             GUILayout.FlexibleSpace();
-            if (GUILayout.Button(core.Lobby.ListRefreshing ? "..." : "Refresh", GUILayout.Width(70f)))
+            if (GUILayout.Button(core.Lobby.ListRefreshing ? "..." : "Refresh", CoopTheme.ButtonPrimary, GUILayout.Width(72f)))
                 core.Lobby.RefreshList();
-            if (GUILayout.Button("Back", GUILayout.Width(50f)))
+            if (GUILayout.Button("Back", CoopTheme.ButtonSecondary, GUILayout.Width(54f)))
             {
                 _browserOpen = false;
                 _pwPromptLobby = CSteamID.Nil;
@@ -309,9 +377,9 @@ namespace CardShopCoop.UI
             GUILayout.EndHorizontal();
 
             GUILayout.BeginHorizontal();
-            GUILayout.Label("Search:", GUILayout.Width(52f));
+            GUILayout.Label("Search:", CoopTheme.Label, GUILayout.Width(52f));
             GUI.SetNextControlName("coop_search");
-            string s = GUILayout.TextField(_searchField, 24);
+            string s = GUILayout.TextField(_searchField, 24, CoopTheme.TextField);
             if (s != _searchField) { _searchField = s; _page = 0; }
             GUILayout.EndHorizontal();
 
@@ -326,18 +394,20 @@ namespace CardShopCoop.UI
 
             if (filtered.Count == 0)
             {
-                GUILayout.Label(core.Lobby.ListRefreshing ? "Searching..." : "No lobbies found - hit Refresh, or host one!");
+                GUILayout.Label(core.Lobby.ListRefreshing ? "Searching..." : "No lobbies found - hit Refresh, or host one!", CoopTheme.LabelDim);
             }
             for (int i = _page * PageSize; i < filtered.Count && i < (_page + 1) * PageSize; i++)
             {
                 var row = filtered[i];
                 bool verOk = row.Ver == CoopPlugin.Version;
-                GUILayout.BeginHorizontal();
-                string label = $"{(row.HasPw ? "[pw] " : "")}{row.Name}  ({row.Players}/{row.Max})"
-                             + (verOk ? "" : $"  <size=10>v{row.Ver}</size>");
-                GUILayout.Label(label, GUILayout.ExpandWidth(true));
+                GUILayout.BeginHorizontal(((i & 1) == 0) ? CoopTheme.RowEven : CoopTheme.RowOdd);
+                GUILayout.Label((row.HasPw ? "[pw] " : "") + row.Name, CoopTheme.LabelBold, GUILayout.ExpandWidth(false));
+                GUILayout.FlexibleSpace();
+                string right = $"{row.Players}/{row.Max}" + (verOk ? "" : $"  <size=10>v{row.Ver}</size>");
+                GUILayout.Label(right, CoopTheme.LabelDim, GUILayout.ExpandWidth(false));
+                GUILayout.Space(6f);
                 GUI.enabled = verOk;
-                if (GUILayout.Button("Join", GUILayout.Width(50f)))
+                if (GUILayout.Button("Join", CoopTheme.ButtonPrimary, GUILayout.Width(56f)))
                 {
                     if (row.HasPw) { _pwPromptLobby = row.Id; _joinPwField = ""; }
                     else { core.JoinSteam(row.Id, ""); _browserOpen = false; }
@@ -348,10 +418,10 @@ namespace CardShopCoop.UI
                 if (_pwPromptLobby == row.Id)
                 {
                     GUILayout.BeginHorizontal();
-                    GUILayout.Label("Password:", GUILayout.Width(70f));
+                    GUILayout.Label("Password:", CoopTheme.Label, GUILayout.Width(70f));
                     GUI.SetNextControlName("coop_joinpw");
-                    _joinPwField = GUILayout.TextField(_joinPwField, 20);
-                    if (GUILayout.Button("Go", GUILayout.Width(40f)))
+                    _joinPwField = GUILayout.TextField(_joinPwField, 20, CoopTheme.TextField);
+                    if (GUILayout.Button("Go", CoopTheme.ButtonPrimary, GUILayout.Width(44f)))
                     {
                         core.JoinSteam(row.Id, _joinPwField);
                         _browserOpen = false;
@@ -363,11 +433,12 @@ namespace CardShopCoop.UI
 
             GUILayout.BeginHorizontal();
             GUI.enabled = _page > 0;
-            if (GUILayout.Button("< Prev", GUILayout.Width(60f))) _page--;
+            if (GUILayout.Button("< Prev", CoopTheme.ButtonSecondary, GUILayout.Width(64f))) _page--;
             GUI.enabled = _page < pages - 1;
-            if (GUILayout.Button("Next >", GUILayout.Width(60f))) _page++;
+            if (GUILayout.Button("Next >", CoopTheme.ButtonSecondary, GUILayout.Width(64f))) _page++;
             GUI.enabled = true;
-            GUILayout.Label($"<size=11>page {_page + 1}/{pages} - {filtered.Count} lobbies</size>");
+            GUILayout.FlexibleSpace();
+            GUILayout.Label($"<size=11>page {_page + 1}/{pages} - {filtered.Count} lobbies</size>", CoopTheme.LabelDim);
             GUILayout.EndHorizontal();
         }
 
