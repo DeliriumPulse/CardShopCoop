@@ -27,6 +27,14 @@ namespace CardShopCoop
         /// safely back at the title (no session AND out of any game level) - see Update.</summary>
         public static bool GuestBorrowedWorld;
 
+        /// <summary>FIX E4 (opt-in, default OFF): lets the HOST work its own register with
+        /// the mod's serve key, the same way a guest does. The host IS the register
+        /// authority, so it calls RegisterServe.Serve directly - no ServeRequest round-trip.
+        /// Config plumbing lives in CoopPlugin (not editable from here); wiring a
+        /// ConfigEntry to flip this is a documented follow-up. Left false so nothing changes
+        /// for the host's normal (mouse-click) register interaction until opted in.</summary>
+        public static bool HostServeKeyEnabled = false;
+
         public string StatusLine = "Not connected";
         public string ErrorLine = "";
         public string HostTimeLine = "";
@@ -105,23 +113,50 @@ namespace CardShopCoop
         // passed against its stale (0.5s-lagged) wallet mirror before the shared balance
         // goes negative. Reset once per frame before the message drain.
         private double _pendingReduceThisFrame = 0.0;
-        // Host: a guest purchase is TWO decoupled reliable messages, and they arrive
-        // PRODUCT-FIRST: the vanilla buy button spawns the product SYNCHRONOUSLY (our
-        // hooks forward it immediately) while its CEventPlayer_ReduceCoin is only QUEUED
-        // into CEventManager and forwarded on a later event drain - so the charge
-        // (EconContrib kind 2, which the host affordability-guards and can DECLINE)
-        // always TRAILS its product(s) on the in-order channel. A lookback at the product
-        // handler can therefore never see the decline (verified: deterministic ordering,
-        // not a race). Instead each product is HELD here until the sender's next kind-2
-        // charge resolves it: applied -> deliver every held product from that sender
-        // (one cart = ONE summed charge covering N line products, all of which arrived
-        // before it); declined -> cancel them all. Timeout fail-open (deliver) so a
-        // purchase can never hang on a charge that never comes (cost-0 items, modded
-        // flows). Known crumb: the separately-forwarded AddShopExp (kind 3) for a
-        // declined purchase still lands - a few phantom XP, no money/item impact.
+        // Host: a guest purchase is TWO decoupled reliable messages - the coin CHARGE
+        // (EconContrib kind 2, which the host affordability-guards and can DECLINE) and
+        // the product(s). Corrected model (1.0.29 regression fix): purchases are
+        // CHARGE-FIRST, not product-first. The coin forward is a PREFIX on
+        // CEventManager.QueueEvent (GamePatches DayEndBlockPrefix -> ForwardContribution
+        // (2,...) sends SYNCHRONOUSLY at queue time), and every vanilla checkout body
+        // queues its ReduceCoin BEFORE spawning the product - so on the in-order channel
+        // the kind-2 charge normally arrives BEFORE its product line(s). The host records
+        // that charge's verdict (accept/decline) as a short-lived TOKEN keyed by connId
+        // (_chargeVerdicts, TTL 3s); each following product for that cart reads the SAME
+        // token and is delivered or dropped without ever being held. One cart = ONE
+        // charge covering N line products, so the token is NOT consumed per product - it
+        // persists until the next charge overwrites it (per-cart correctness on the
+        // in-order channel) or its TTL lapses.
+        //
+        // _heldPurchases is now the RARE-PATH safety valve: a product that somehow lands
+        // BEFORE its charge (a straggler ordering) has no fresh verdict yet, so it is
+        // held until the sender's next kind-2 resolves it - applied -> deliver every held
+        // product from that sender, declined -> cancel them all - or the fail-open pump
+        // delivers it after 1.5s if no charge ever comes (cost-0 items, a modded flow
+        // that skips ReduceCoin, a guest that vanished mid-purchase). Worst case is the
+        // old pre-coupling behavior, never a hang. Known crumb: the separately-forwarded
+        // AddShopExp (kind 3) for a declined purchase still lands - a few phantom XP, no
+        // money/item impact.
         private struct HeldPurchase { public InMsg Msg; public double At; }
         private readonly List<HeldPurchase> _heldPurchases = new List<HeldPurchase>();
         private bool _deliveringHeld; // true while re-dispatching a resolved product
+        // The host's verdict on each sender's most-recent coin charge. Accepted -> the
+        // cart's products fall through and process normally; declined -> they are dropped
+        // (with a throttled toast). Fresh for VerdictTtl seconds; a newer charge from the
+        // same sender overwrites it. Dropped on disconnect and cleared in Shutdown.
+        // TTL is deliberately SHORT: the vanilla charge-first path reads the token
+        // within the same drain (~0ms), so 1s is generous there - while a genuinely
+        // product-first straggler (modded purchase flows) arriving later than 1s falls
+        // through to the HELD path and waits for its OWN charge, instead of misreading
+        // the PREVIOUS cart's verdict (a 3s window let a straggler ship free on a stale
+        // ACCEPT, or vanish on a stale DECLINE). Cart-id stamping would make this
+        // structurally airtight; the 1s window makes it unreachable in practice.
+        private struct ChargeVerdict { public bool Accepted; public double At; }
+        private readonly Dictionary<int, ChargeVerdict> _chargeVerdicts = new Dictionary<int, ChargeVerdict>();
+        private const double VerdictTtl = 1.0;
+        // last decline-toast time per conn: a rejected multi-line cart is N dropped
+        // products but should show at most ONE "not enough money" toast per second
+        private readonly Dictionary<int, double> _lastDeclineToast = new Dictionary<int, double>();
 
         // one-time link confirmation logging
         private readonly HashSet<int> _gotStateFrom = new HashSet<int>();
@@ -165,6 +200,8 @@ namespace CardShopCoop
         private float _cardPriceHealTimer = -2.1f; // periodic displayed-card price rebroadcast
         private int _lastCardPriceHash;            // change-gate for the card-price heal
         private float _cardPriceHealBeat;          // forces a card-price resend every 30s
+        private int _lastStockResyncHash;          // change-gate for the 12s item-STOCK full heal
+        private float _stockResyncHeal;            // forces a stock resend every 36s regardless
         private readonly List<KeyValuePair<CardData, float>> _cardPriceBuf = new List<KeyValuePair<CardData, float>>();
         private float _licenseSyncTimer = -3.7f;
         private double _lastLicenseBuyTime = -999.0;
@@ -184,6 +221,15 @@ namespace CardShopCoop
         private CustomerManager _cmSweep;
         private CustomerManager _cmSpray; // host-side: real customer list for replayed guest deodorant sprays
         private bool _renamerHandled;
+        // FIX E2: the 3D shop-name sign (ShopRenamer.m_ShopName). The client disables the
+        // renamer trigger on join, which also unhooks the one-shot OnGameDataFinishLoaded
+        // listener that repaints this sign - so a ShopName that arrives mid-join can leave
+        // the sign showing the guest's own default. We cache the TMP before disabling and
+        // write it directly. It lives on a SEPARATE GameObject from the renamer (verified:
+        // the game deactivates the renamer in OnGameDataFinishLoaded AFTER setting this
+        // sign, and it still shows), so writing .text after the disable renders fine.
+        private TMPro.TMP_Text _shopSign;
+        private string _lastShopNameApplied; // re-applied once when ClientReloading clears
         private int _heldBoxFrame = -1;
         private object _heldBoxA, _heldBoxB, _heldBoxC;
 
@@ -390,6 +436,34 @@ namespace CardShopCoop
             };
 
             CEventManager.AddListener<CEventPlayer_OnOpenCardPack>(OnLocalPackOpened);
+
+            // FIX A-hook: warn ONCE per game session if the on-disk custom-card registry is
+            // still a HOST-synced copy from a previous co-op join (marker-file detected by
+            // ModParity). Solo modded saves expect the user's OWN registry, so they may not
+            // load until it's restored. The restore + a restart clears it. Wiring the UI
+            // button (co-op window) is a documented follow-up - see EnumLendState().
+            try
+            {
+                if (Util.ModParity.HostEnumInstalled())
+                    CoopPlugin.Log.LogWarning("CardShopCoop: your custom-card database is currently the HOST's synced copy from a co-op session. Your OWN solo modded saves may not load until you restore it (restore via the co-op window) and RESTART the game.");
+            }
+            catch { }
+        }
+
+        /// <summary>FIX A-hook: exposed for the co-op UI (CoopUI, owned elsewhere). Returns a
+        /// one-line notice when the on-disk enum registry is a host-synced copy - so the UI
+        /// can show it and offer a restore button - or null when the registry is the user's
+        /// own. The restore itself is Util.ModParity.RestoreEnumBackup(out msg). Hooking a
+        /// button to this is a documented follow-up.</summary>
+        public static string EnumLendState()
+        {
+            try
+            {
+                return Util.ModParity.HostEnumInstalled()
+                    ? "custom-card database is the HOST's copy (co-op sync) - solo modded saves may not load; restore via the co-op window"
+                    : null;
+            }
+            catch { return null; }
         }
 
         public string HostPassword = "";        // required from joiners when non-empty
@@ -441,7 +515,113 @@ namespace CardShopCoop
                 bw.Write(Util.ModParity.PluginHash());
                 bw.Write(Util.ModParity.EnumHash());
                 bw.Write(Util.ModParity.CardsHash());
+                // FIX E3: append the actual plugin + custom-card lists so a rejecting host
+                // can NAME what differs (a hash alone can't). Append-only after cardsHash;
+                // safe because the wire is version-gated (1.0.30 only talks to 1.0.30, and
+                // the host reads these only after the version check passes). Cap 256 each.
+                WriteCappedList(bw, Util.ModParity.PluginList());
+                WriteCappedList(bw, Util.ModParity.CardsList());
             });
+        }
+
+        /// <summary>FIX E3 wire helper: [int count (<=256)] then that many strings.</summary>
+        private static void WriteCappedList(BinaryWriter bw, List<string> list)
+        {
+            int n = list == null ? 0 : Math.Min(list.Count, 256);
+            bw.Write(n);
+            for (int i = 0; i < n; i++) bw.Write(list[i] ?? "");
+        }
+
+        /// <summary>FIX E3 wire helper: mirror of WriteCappedList, hardened against a bad
+        /// count so a malformed Hello can't over-read (the surrounding try/catch still
+        /// guards a truncated payload).</summary>
+        private static List<string> ReadCappedList(BinaryReader br)
+        {
+            var list = new List<string>();
+            try
+            {
+                int n = br.ReadInt32();
+                if (n < 0) n = 0;
+                if (n > 256) n = 256;
+                for (int i = 0; i < n; i++) list.Add(br.ReadString());
+            }
+            catch { }
+            return list;
+        }
+
+        /// <summary>FIX E3: build a precise reject reason by diffing the joiner's list
+        /// against the host's. Entries are "key=value" ("guid=version" for plugins,
+        /// "MonsterType=ID" for cards). Reports what the joiner is MISSING (host has, they
+        /// don't), what they have EXTRA (they have, host doesn't), and same-key value
+        /// mismatches. Returns null when the lists are absent or actually agree (hash
+        /// differed on something unlisted) so the caller uses its generic wording. Compact,
+        /// capped so a big mod set can't produce a wall of text.</summary>
+        private static string DescribeModDiff(List<string> theirs, List<string> ours,
+            string head, string diffLabel)
+        {
+            if (theirs == null || theirs.Count == 0 || ours == null || ours.Count == 0)
+                return null;
+
+            var theirMap = DiffMap(theirs);
+            var ourMap = DiffMap(ours);
+
+            var missing = new List<string>(); // host has, joiner lacks
+            var extra = new List<string>();   // joiner has, host lacks
+            var valDiff = new List<string>();  // same key, different value
+            foreach (var kv in ourMap)
+                if (!theirMap.ContainsKey(kv.Key)) missing.Add(kv.Key);
+            foreach (var kv in theirMap)
+            {
+                if (!ourMap.TryGetValue(kv.Key, out var ourVal)) extra.Add(kv.Key);
+                else if (ourVal != kv.Value) valDiff.Add($"{kv.Key} (host {ourVal} vs yours {kv.Value})");
+            }
+            if (missing.Count == 0 && extra.Count == 0 && valDiff.Count == 0)
+                return null; // lists agree - the hash differed elsewhere; use generic wording
+
+            missing.Sort(StringComparer.Ordinal);
+            extra.Sort(StringComparer.Ordinal);
+            valDiff.Sort(StringComparer.Ordinal);
+
+            var parts = new List<string>();
+            if (missing.Count > 0) parts.Add("you are missing: " + JoinCapped(missing));
+            if (extra.Count > 0) parts.Add("you have extra: " + JoinCapped(extra));
+            if (valDiff.Count > 0) parts.Add(diffLabel + ": " + JoinCapped(valDiff));
+            string full = head + string.Join(" | ", parts);
+            // hard cap so a pathological diff can't overflow the reject line / UI
+            if (full.Length > 700) full = full.Substring(0, 697) + "...";
+            return full;
+        }
+
+        /// <summary>Split "key=value" entries on the FIRST '=' (values may contain '=');
+        /// entries without '=' key on the whole string.</summary>
+        private static Dictionary<string, string> DiffMap(List<string> entries)
+        {
+            var m = new Dictionary<string, string>();
+            foreach (var e in entries)
+            {
+                if (string.IsNullOrEmpty(e)) continue;
+                int eq = e.IndexOf('=');
+                string k = eq > 0 ? e.Substring(0, eq) : e;
+                string v = eq > 0 ? e.Substring(eq + 1) : "";
+                m[k] = v; // last wins on a dup key - harmless for a diagnostic
+            }
+            return m;
+        }
+
+        /// <summary>Comma-join with a per-clause char budget; overflow becomes "(+N more)".</summary>
+        private static string JoinCapped(List<string> items)
+        {
+            var sb = new System.Text.StringBuilder();
+            int shown = 0;
+            for (int i = 0; i < items.Count; i++)
+            {
+                string next = (shown > 0 ? ", " : "") + items[i];
+                if (shown > 0 && sb.Length + next.Length > 220) break;
+                sb.Append(next);
+                shown++;
+            }
+            if (shown < items.Count) sb.Append($" (+{items.Count - shown} more)");
+            return sb.ToString();
         }
 
         // Bye must actually reach the peer before the connection dies; on Steam, sends
@@ -937,8 +1117,17 @@ namespace CardShopCoop
                 var renamer = FindObjectOfType<ShopRenamer>();
                 if (renamer != null && renamer.gameObject.activeSelf)
                 {
+                    // FIX E2: cache the 3D sign TMP BEFORE disabling - once the renamer
+                    // GameObject is inactive, FindObjectOfType can't reach it again.
+                    try { _shopSign = renamer.m_ShopName; } catch { }
                     renamer.gameObject.SetActive(false);
                     CoopPlugin.Log.LogInfo("disabled shop-renamer trigger (host names the shop)");
+                    // a ShopName may have already arrived while the renamer was still live
+                    // (its listener overwrote the sign with the local default) - re-stamp
+                    if (_shopSign != null && !string.IsNullOrEmpty(_lastShopNameApplied))
+                    {
+                        try { _shopSign.text = _lastShopNameApplied; } catch { }
+                    }
                 }
             }
             if (_cmSweep == null) _cmSweep = FindObjectOfType<CustomerManager>();
@@ -1669,6 +1858,8 @@ namespace CardShopCoop
             PeerNames.Clear();
             _heldPurchases.Clear(); // held product messages die with the session
             _deliveringHeld = false;
+            _chargeVerdicts.Clear();
+            _lastDeclineToast.Clear();
             _saveBuf = null;
             _saveExpected = -1;
             _pendingSave = null;
@@ -1757,10 +1948,41 @@ namespace CardShopCoop
                     if (!toasted)
                     {
                         toasted = true;
+                        // share the per-conn decline-toast throttle with GateProduct so a
+                        // straggler cancel here + this cart's later dropped lines don't
+                        // stack two "not enough money" toasts in the same second
+                        _lastDeclineToast[connId] = Time.realtimeSinceStartupAsDouble;
                         Send(connId, MsgType.Toast, bw => bw.Write("not enough money - the purchase was cancelled"));
                     }
                 }
             }
+        }
+
+        private enum PurchaseGate { Process, Drop, Hold }
+
+        /// <summary>Host: decide what to do with an incoming product message given the
+        /// charge-first model. Re-dispatch of an already-resolved hold -> Process. A FRESH
+        /// verdict from this cart's charge -> Process (accepted) or Drop (declined, with a
+        /// throttled cancel toast). No fresh verdict -> hold the product (rare product-
+        /// first straggler; the fail-open pump backs it). The verdict token is READ, not
+        /// consumed: N line products of one cart all read the single charge's verdict.</summary>
+        private PurchaseGate GateProduct(InMsg msg)
+        {
+            if (_deliveringHeld) return PurchaseGate.Process; // re-dispatch of a resolved hold
+            double now = Time.realtimeSinceStartupAsDouble;
+            if (_chargeVerdicts.TryGetValue(msg.ConnId, out var vd) && now - vd.At < VerdictTtl)
+            {
+                if (vd.Accepted) return PurchaseGate.Process;
+                CoopPlugin.Log.LogInfo($"purchase ({msg.Type}) from conn {msg.ConnId} dropped - its charge was declined (shared wallet short)");
+                if (!_lastDeclineToast.TryGetValue(msg.ConnId, out var lastT) || now - lastT >= 1.0)
+                {
+                    _lastDeclineToast[msg.ConnId] = now;
+                    Send(msg.ConnId, MsgType.Toast, bw => bw.Write("not enough money - the purchase was cancelled"));
+                }
+                return PurchaseGate.Drop;
+            }
+            _heldPurchases.Add(new HeldPurchase { Msg = msg, At = now });
+            return PurchaseGate.Hold;
         }
 
         /// <summary>Host per-frame: fail-open valve for held purchases whose charge never
@@ -1854,6 +2076,38 @@ namespace CardShopCoop
                 });
             }
 
+            // FIX E4 (opt-in): the HOST can also man its own register with the serve key.
+            // It is the authority, so it calls Serve DIRECTLY (no ServeRequest), discards
+            // the scan echo (its own vanilla checkout UI already reflects the scan), and
+            // surfaces the status on RegisterLine. OFF by default (HostServeKeyEnabled).
+            if (Role == CoopRole.Host && HostServeKeyEnabled && _serveThrottle <= 0f && InGameLevel()
+                && (serveTap || Input.GetKey(CoopPlugin.ServeKey.Value)) && !UI.CoopUI.TextFieldFocused
+                && !NativeTextInputFocused())
+            {
+                _serveThrottle = 0.25f;
+                Guarded("host-serve", () =>
+                {
+                    var tf = ResolvePlayer();
+                    int idx = tf != null ? Sync.RegisterServe.FindNearestCounter(tf.position, CoopPlugin.ServeReach.Value, quiet: !serveTap) : -1;
+                    if (idx >= 0 && _trades.HasOffer(idx)) return; // trade offer owns this counter
+                    if (idx < 0)
+                    {
+                        if (serveTap)
+                        {
+                            RegisterLine = "walk up to the register first";
+                            RegisterLineTimer = 2f;
+                        }
+                        return;
+                    }
+                    string status = Sync.RegisterServe.Serve(idx, CoopPlugin.PlayerName.Value, out _);
+                    if (!string.IsNullOrEmpty(status))
+                    {
+                        RegisterLine = status;
+                        RegisterLineTimer = 8f;
+                    }
+                });
+            }
+
             // natural register: clicking a mirrored cart item scans it; clicking during the
             // payment/change phases advances the sale - works like the normal till.
             if (Role == CoopRole.Client && _serveThrottle <= 0f && InGameLevel()
@@ -1924,8 +2178,10 @@ namespace CardShopCoop
                     try { _furnBoxes.HostReleaseRemoteCarried(); } catch { }
                     // and DROP any product still held for the departed guest: its charge
                     // is never coming, and the fail-open pump would otherwise deliver the
-                    // product chargeless 1.5s from now
+                    // product chargeless 1.5s from now. Its charge verdict goes too.
                     _heldPurchases.RemoveAll(h => h.Msg.ConnId == left);
+                    _chargeVerdicts.Remove(left);
+                    _lastDeclineToast.Remove(left);
                     BroadcastRoster();
                     StatusLine = _net.ConnectionCount == 0
                         ? "Hosting - waiting for a player..."
@@ -1982,7 +2238,16 @@ namespace CardShopCoop
             if (ClientReloading && _reloadGrace > 0f && InGameLevel())
             {
                 _reloadGrace -= dt;
-                if (_reloadGrace <= 0f) ClientReloading = false;
+                if (_reloadGrace <= 0f)
+                {
+                    ClientReloading = false;
+                    // FIX E2: a shop name that arrived mid-load may have been painted onto
+                    // a sign the reload then rebuilt - re-stamp it now that things settled.
+                    if (_shopSign != null && !string.IsNullOrEmpty(_lastShopNameApplied))
+                    {
+                        try { _shopSign.text = _lastShopNameApplied; } catch { }
+                    }
+                }
             }
             Guarded("avatars", _actAvatars);
             _syncActive = Role != CoopRole.None && _net.ConnectionCount > 0 && InGameLevel();
@@ -2306,6 +2571,38 @@ namespace CardShopCoop
                     }
                 }
                 catch (Exception e) { CoopPlugin.Log.LogWarning("card resync: " + e.Message); }
+
+                // ITEM-STOCK full-truth heal on the same 12s beat: item stock previously had
+                // NO periodic resync (only host local diffs), so a client that silently
+                // adopted a slightly-wrong baseline at join (WorldSync's first-sighting
+                // adoption - the mid-day-join wipe fix) stayed wrong until the host touched
+                // that compartment. A full-state broadcast IS just a ShelfDelta carrying
+                // every compartment (the client handler routes it through ApplyRemote), so
+                // no new wire type. Change-gated on the payload bytes + a 36s forced heal.
+                try
+                {
+                    byte[] payload = null;
+                    using (var ms = new MemoryStream())
+                    using (var bw = new BinaryWriter(ms))
+                    {
+                        _world.BuildFullState(bw);
+                        payload = ms.ToArray();
+                    }
+                    if (payload != null && payload.Length > 4) // empty entry list writes just a count
+                    {
+                        int h = 17;
+                        for (int i = 0; i < payload.Length; i++) h = h * 31 + payload[i];
+                        _stockResyncHeal += 12f;
+                        if (h != _lastStockResyncHash || _stockResyncHeal >= 36f)
+                        {
+                            _lastStockResyncHash = h;
+                            _stockResyncHeal = 0f;
+                            var bytes = payload;
+                            Broadcast(MsgType.ShelfDelta, bw2 => bw2.Write(bytes));
+                        }
+                    }
+                }
+                catch (Exception e) { CoopPlugin.Log.LogWarning("stock resync: " + e.Message); }
             }
 
             // card PRICE heal: card prices sync only via a single MsgType.CardPriceSet
@@ -2447,6 +2744,11 @@ namespace CardShopCoop
                         string pluginHash = br.ReadString();
                         string enumHash = br.ReadString();
                         string cardsHash = br.ReadString();
+                        // FIX E3: these follow cardsHash (append-only wire). Same-version
+                        // peers always send them; older/absent -> empty list -> generic
+                        // wording below.
+                        var theirPlugins = ReadCappedList(br);
+                        var theirCards = ReadCappedList(br);
                         if (HostPassword.Length > 0 && password != HostPassword)
                         {
                             RejectConn(msg.ConnId, "wrong password");
@@ -2454,7 +2756,12 @@ namespace CardShopCoop
                         }
                         if (pluginHash != Util.ModParity.PluginHash())
                         {
-                            RejectConn(msg.ConnId, "your mod set differs from the host's - both players need identical mods (same versions)");
+                            // FIX E3: name the differing mods when we can; fall back to the
+                            // old generic wording if the lists are absent/agree.
+                            string detail = DescribeModDiff(theirPlugins, Util.ModParity.PluginList(),
+                                "mod set differs - ", "version differs");
+                            RejectConn(msg.ConnId, detail
+                                ?? "your mod set differs from the host's - both players need identical mods (same versions)");
                             break;
                         }
                         string hostEnum = Util.ModParity.EnumHash();
@@ -2482,7 +2789,14 @@ namespace CardShopCoop
                         // loose files we can't auto-sync, so it's a clear hard stop.
                         if (cardsHash != Util.ModParity.CardsHash())
                         {
-                            RejectConn(msg.ConnId, "your custom cards differ from the host's - both players need the same custom cards installed (identical files + IDs), then restart. Share the exact card package (e.g. from CardForge).");
+                            // FIX E3: name the differing custom cards when we can. Entries
+                            // are "MonsterType=ID", so a same-name different-ID is an ID
+                            // clash (the exact desync). Generic fallback keeps the actionable
+                            // "share the CardForge package" guidance.
+                            string detail = DescribeModDiff(theirCards, Util.ModParity.CardsList(),
+                                "custom cards differ - ", "ID differs");
+                            RejectConn(msg.ConnId, detail
+                                ?? "your custom cards differ from the host's - both players need the same custom cards installed (identical files + IDs), then restart. Share the exact card package (e.g. from CardForge).");
                             break;
                         }
 
@@ -2986,14 +3300,10 @@ namespace CardShopCoop
                         string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : "player";
                         var eObj = (EObjectType)objType;
 
-                        // Charge/product coupling: the product arrives BEFORE its coin
-                        // charge (see _heldPurchases). Hold it; the sender's next kind-2
-                        // charge delivers or cancels it.
-                        if (!_deliveringHeld)
-                        {
-                            _heldPurchases.Add(new HeldPurchase { Msg = msg, At = Time.realtimeSinceStartupAsDouble });
-                            break;
-                        }
+                        // Charge/product coupling (charge-first): honor this cart's charge
+                        // verdict if it already landed (accept -> process, decline -> drop
+                        // with toast); otherwise hold as a rare product-first straggler.
+                        if (GateProduct(msg) != PurchaseGate.Process) break;
 
                         // The guest already paid: its CEventPlayer_ReduceCoin was forwarded
                         // and debited the shared wallet BEFORE this spawn. If the prefab
@@ -3054,15 +3364,11 @@ namespace CardShopCoop
                         int count = br.ReadInt32();
                         float cost = br.ReadSingle();
                         string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : "player";
-                        // Charge/product coupling: the product arrives BEFORE its coin
-                        // charge (see _heldPurchases). Hold it; the sender's next kind-2
-                        // charge delivers or cancels it. A multi-line cart holds N of
-                        // these against its ONE summed charge - all resolve together.
-                        if (!_deliveringHeld)
-                        {
-                            _heldPurchases.Add(new HeldPurchase { Msg = msg, At = Time.realtimeSinceStartupAsDouble });
-                            break;
-                        }
+                        // Charge/product coupling (charge-first): a multi-line cart's N
+                        // OrderRequests all read the ONE summed charge's verdict - accept ->
+                        // process each, decline -> drop each (one throttled toast). No fresh
+                        // verdict -> hold as a rare product-first straggler.
+                        if (GateProduct(msg) != PurchaseGate.Process) break;
                         int idx = ResolveRestockIndex(itemType, isBig, rdName, out bool sizeDiffers);
                         if (idx >= 0)
                         {
@@ -3136,15 +3442,11 @@ namespace CardShopCoop
                         int itemType = br.ReadInt32();
                         bool isBig = br.ReadBoolean();
                         string rdName = br.ReadString();
-                        // Charge/product coupling (host only): the unlock arrives BEFORE its
-                        // coin charge (see _heldPurchases). Hold it; the sender's next kind-2
-                        // charge delivers or cancels it. Host-gated so the host->clients echo
-                        // (Role==Client on the receiver) is untouched.
-                        if (Role == CoopRole.Host && !_deliveringHeld)
-                        {
-                            _heldPurchases.Add(new HeldPurchase { Msg = msg, At = Time.realtimeSinceStartupAsDouble });
-                            break;
-                        }
+                        // Charge/product coupling (host only, charge-first): honor this
+                        // cart's charge verdict (accept -> process, decline -> drop with
+                        // toast) or hold a rare product-first straggler. Host-gated so the
+                        // host->clients echo (Role==Client on the receiver) is untouched.
+                        if (Role == CoopRole.Host && GateProduct(msg) != PurchaseGate.Process) break;
                         bool ok = ApplyLicenseUnlock(itemType, isBig, rdName);
                         if (Role == CoopRole.Host)
                         {
@@ -3416,10 +3718,18 @@ namespace CardShopCoop
                     using (var br = Msg.Reader(msg.Payload))
                     {
                         string name = br.ReadString();
-                        if (name.Length > 0 && CPlayerData.GetPlayerName() != name)
+                        if (name.Length > 0)
                         {
-                            CPlayerData.PlayerName = name;
-                            CoopPlugin.Log.LogInfo("shop name synced: " + name);
+                            if (CPlayerData.GetPlayerName() != name)
+                            {
+                                CPlayerData.PlayerName = name;
+                                CoopPlugin.Log.LogInfo("shop name synced: " + name);
+                            }
+                            // FIX E2: refresh the 3D sign directly (the one-shot repaint
+                            // listener can be missed during the join reload) and stash the
+                            // name so it can be re-applied once the reload settles.
+                            _lastShopNameApplied = name;
+                            if (_shopSign != null) { try { _shopSign.text = name; } catch { } }
                         }
                     }
                     break;
@@ -3573,17 +3883,23 @@ namespace CardShopCoop
                                 {
                                     Send(msg.ConnId, MsgType.Toast, w => w.Write("purchase declined - the shared wallet is short"));
                                     _lastCoinSent = double.MinValue; // force the guest's balance to correct next tick
-                                    // this charge's products arrived BEFORE it (in-order,
-                                    // product-first) and are on hold - cancel them so a
-                                    // declined charge never ships free product/XP
+                                    // charge-first: record a DECLINE token so this cart's
+                                    // following product line(s) drop as they arrive. Also
+                                    // cancel any rare product-first straggler already held
+                                    // for this sender, so a declined charge never ships
+                                    // free product/XP either way.
                                     ResolveHeldPurchases(msg.ConnId, deliver: false);
+                                    _chargeVerdicts[msg.ConnId] = new ChargeVerdict { Accepted = false, At = Time.realtimeSinceStartupAsDouble };
                                     break;
                                 }
                                 _pendingReduceThisFrame += (double)v;
                                 CEventManager.QueueEvent(new CEventPlayer_ReduceCoin(v));
-                                // charge accepted: deliver every product held for this sender
-                                // (they all belong to the cart this charge paid for)
+                                // charge accepted: record an ACCEPT token for this cart's
+                                // following product line(s), and deliver any rare product-
+                                // first straggler already held for this sender (all belong
+                                // to the cart this charge paid for)
                                 ResolveHeldPurchases(msg.ConnId, deliver: true);
+                                _chargeVerdicts[msg.ConnId] = new ChargeVerdict { Accepted = true, At = Time.realtimeSinceStartupAsDouble };
                                 break;
                             }
                             case 3: CEventManager.QueueEvent(new CEventPlayer_AddShopExp((int)v)); break;
@@ -3657,8 +3973,15 @@ namespace CardShopCoop
                 // game-state reads must stay on the main thread; the gzip below moves to
                 // the worker (compressing a multi-MB save used to freeze the host's frame
                 // at every join)
-                hostSlot = CSingleton<CGameManager>.Instance.m_CurrentSaveLoadSlotSelectedIndex;
+                // the base save is snapshotted to the THROWAWAY slot (SaveTransfer.HostSnapshotSlot)
+                // and the sidecar-mod files must come from that SAME slot: SaveGameData(6) fires
+                // the sidecar mods' own save hooks (they key off the active slot), so slot 6
+                // holds the FRESH per-save mod data matching the just-written world - while the
+                // host's real slot may be an hour stale. Mismatched halves shipped stale card
+                // prices/shop config to the joiner. The same slot digit rides the wire so the
+                // client's rename (slot 6 -> its coop slot) stays symmetric.
                 rawSave = SaveTransfer.BuildHostPayload();
+                hostSlot = SaveTransfer.HostSnapshotSlot;
                 try { rawBundle = SidecarTransfer.BuildBundle(hostSlot); }
                 catch (Exception e)
                 {

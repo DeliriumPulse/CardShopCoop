@@ -5,6 +5,36 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.0.30
+**Fixes for the full 1.0.29 field-report batch — thank you Bytelocker, SerDakota, dereck, Kamun, Elvundil, Latch, and everyone in the Discord.** Wire format changed again, so 1.0.30 only connects to 1.0.30. Both players must update — the launcher does it automatically.
+
+**Your solo saves (the big one)**
+- **Fixed: solo modded saves showing "data lost" after playing co-op.** Joining a host with a different custom-card database syncs the host's registry over yours (with a backup) — and there was no way back, so your own modded saves couldn't load anymore. The co-op window now shows a clear warning whenever your registry is the host's copy, with a one-click **"Restore MY card database"** button (restart afterwards). Nothing is ever lost — every sync keeps backups.
+- The host's real save slot is no longer overwritten by the join-time snapshot (it saves to a scratch slot now), so a mid-session problem can never be baked into your only copy.
+
+**Joining (fixed a serious wipe)**
+- **Fixed: a guest joining mid-day could WIPE everyone's shelf stock** — the fresh guest "reported" every shelf as changed-from-empty and the host applied it. This was also behind "our third player joined and we lost all our stock" and "the shelves were erased after we restarted." Joining is now safe at any time of day, and item stock heals itself every 12 seconds like card displays already did.
+- The "mod set differs" rejection now tells you **exactly which mods differ** — missing, extra, and version mismatches by name (same for custom-card differences).
+
+**1.0.29 regressions (Latch was right)**
+- **Fixed: guest purchases were delayed ~1.5 seconds** and a purchase the shared wallet couldn't afford still went through. The purchase/charge pairing was rebuilt properly.
+- **Fixed: boxes freezing solid in the warehouse** ("clogging up our shelving") — a guest-side fix was wrongly running on the host and pinning real boxes in place.
+
+**Boxes & items**
+- **Fixed: opened boxes refilling endlessly** ("unlimited items") — the guest was echoing stale box contents back at the host while it dispensed.
+- **Fixed: boxes a guest trashed silently surviving on the host** and "respawning the next day" — an over-eager anti-grief cap was eating legitimate cleanup sprees; it now allows them and logs when it ever declines one.
+- **Fixed: boxes the host moves snapping back** to the delivery area or the guest's old placement.
+- Boxes can no longer be placed (or reappear) **under the floor**; anything released below the map is lifted back up.
+- Staff can no longer take or drain a box out of a guest's hands (carried over from 1.0.29, now with the disconnect cleanup verified).
+
+**Guests**
+- **Fixed: clicking near the register soft-locking a guest** into cash-counter mode with no way out (the cause of "they can't interact with anything until they leave"). Guests serve with the serve key (V by default) — the game now says so instead of trapping you.
+- **Fixed: the shop name not updating the first time a friend joins.**
+- 3-player: furniture can no longer be teleported/vanished by a stale index from another player (moves now verify the object's identity), and fresh joiners no longer re-report every object's position.
+
+**New option**
+- `HostServeKey` (off by default): lets the HOST use the quick-serve key at the register too, same as joiners.
+
 ## 1.0.29
 **Preemptive fixes from a full audit of the game against the mod.** Instead of waiting for field reports, every game system was swept for 2-player coverage gaps (the full audit lives in `docs/audit-2026-07-07.md`: 134 systems confirmed covered, 10 gaps found — all fixed or safely blocked below). Adds one new network message, so 1.0.29 only connects to 1.0.29.
 

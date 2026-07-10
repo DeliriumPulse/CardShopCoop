@@ -40,6 +40,7 @@ namespace CardShopCoop.UI
         private KeyCode _hintKeySeen;
         private string _hintText;
         private string _errorSeen, _errorText;
+        private string _enumRestoreMsg; // outcome line under the enum-lend notice
         private string _hostTimeSeen, _hostTimeText;
         private string _promptSeen, _promptText;
         private string _registerSeen, _registerText;
@@ -135,6 +136,31 @@ namespace CardShopCoop.UI
                     _redStyle.normal.textColor = new Color(1f, 0.45f, 0.4f);
                 }
                 GUILayout.Label(core.ErrorLine, _redStyle);
+            }
+
+            // Custom-card database on loan: a mismatched-enum join replaced the machine-global
+            // registry with the HOST's copy (with a backup). Until it is restored, the player's
+            // own modded SOLO saves fail to load ("data lost") - the exact field report this
+            // notice exists for. Show the warning + one-click restore whenever the marker says
+            // the on-disk registry is the host's.
+            string lend = CoopCore.EnumLendState();
+            if (lend != null)
+            {
+                if (_redStyle == null)
+                {
+                    _redStyle = new GUIStyle(GUI.skin.label) { wordWrap = true };
+                    _redStyle.normal.textColor = new Color(1f, 0.45f, 0.4f);
+                }
+                GUILayout.Label(lend, _redStyle);
+                if (_enumRestoreMsg != null) GUILayout.Label(_enumRestoreMsg, _redStyle);
+                // restoring mid-session would break the CURRENT co-op world's custom cards;
+                // only offer it when not connected
+                if (CoopCore.Role == CoopRole.None
+                    && GUILayout.Button("Restore MY card database (for solo saves - restart after)"))
+                {
+                    Util.ModParity.RestoreEnumBackup(out _enumRestoreMsg);
+                }
+                GUILayout.Space(4f);
             }
 
             switch (CoopCore.Role)

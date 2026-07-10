@@ -18,9 +18,20 @@ namespace CardShopCoop.Sync
         public struct Entry
         {
             public int Key;      // kind<<24 | index
+            public int Type;     // identity: (int)m_ObjectType, or (int)m_DecoObjectType for
+                                 // kind-5 decos (whose m_ObjectType is None) - same accessor
+                                 // PopulationSync serializes. Carried so the receiver can
+                                 // REJECT an entry whose (kind,index) now resolves to a
+                                 // DIFFERENT object (a stale index from a fresh/lagging peer
+                                 // that never moves the wrong furniture). NoType = couldn't read.
             public Vector3 Pos;
             public Quaternion Rot;
         }
+
+        // identity we can't read (the list element isn't an InteractableObject) - the guard
+        // treats NoType on either side as "can't verify" and lets the apply through, so a
+        // non-IO object is never spuriously rejected. Real EObjectType values are never this.
+        private const int NoType = int.MinValue;
 
         private struct Pose
         {
@@ -41,8 +52,24 @@ namespace CardShopCoop.Sync
         private readonly Dictionary<int, Pose> _candidate = new Dictionary<int, Pose>(); // settle window
         private ShelfManager _sm;
         private float _timer;
+        private float _lastRejectLog = -999f; // throttle the identity-reject spam to ~1/5s
 
         public Action<List<Entry>> OnLocalChanges;
+
+        // Client role: a fresh joiner must ADOPT every object's loaded pose as its silent
+        // baseline instead of re-reporting it (see Walk). Read straight off the static role
+        // the way the other Sync engines read CoopCore.ClientReloading - no per-tick wiring
+        // to inject, and the host (role != Client) simply never adopts.
+        private static bool IsClientRole => CoopCore.Role == CoopRole.Client;
+
+        // The object's identity for the wire: decorations (kind 5) carry m_ObjectType == None,
+        // so their real identity is m_DecoObjectType - exactly PopulationSync's split.
+        private static int TypeIdOf(Component obj, int kind)
+        {
+            var io = obj as InteractableObject;
+            if (io == null) return NoType;
+            return (kind == 5) ? (int)io.m_DecoObjectType : (int)io.m_ObjectType;
+        }
 
         public void Reset()
         {
@@ -102,9 +129,22 @@ namespace CardShopCoop.Sync
                 var p = obj.transform.position;
                 var r = obj.transform.rotation;
 
-                if (_sent.TryGetValue(key, out var sent) && sent.Same(p, r))
+                bool knownSent = _sent.TryGetValue(key, out var sent);
+                if (knownSent && sent.Same(p, r))
                 {
                     _candidate.Remove(key);
+                    continue;
+                }
+                // FRESH-JOINER ADOPTION (client only): the first time we see an object after
+                // Reset, its pose is the loaded/host pose - NOT a move this joiner made. Walk
+                // re-reporting every settled object's pose to the host was D-c (the joiner's
+                // stale index teleporting the host's fresh furniture). So on the client, an
+                // object unknown to both _sent and _candidate is adopted straight into the
+                // sent-baseline with no ObjMoveRequest. Only genuine subsequent movement (a
+                // pose that later diverges from this baseline) flows through the settle gate.
+                if (!knownSent && IsClientRole && !_candidate.ContainsKey(key))
+                {
+                    _sent[key] = new Pose { P = p, R = r, Valid = true };
                     continue;
                 }
                 // settle gate: only report once the pose repeats across two ticks
@@ -114,7 +154,7 @@ namespace CardShopCoop.Sync
                     _candidate.Remove(key);
                     if (changes == null) changes = new List<Entry>();
                     if (changes.Count >= 64) return;
-                    changes.Add(new Entry { Key = key, Pos = p, Rot = r });
+                    changes.Add(new Entry { Key = key, Type = TypeIdOf(obj, kind), Pos = p, Rot = r });
                 }
                 else
                 {
@@ -141,9 +181,27 @@ namespace CardShopCoop.Sync
             {
                 try
                 {
-                    var t = Resolve(sm, e.Key);
-                    if (t == null) continue;
-                    var io = t.GetComponent<InteractableObject>();
+                    var comp = Resolve(sm, e.Key);
+                    if (comp == null) continue;
+                    // IDENTITY GUARD: the (kind,index) may resolve to a DIFFERENT object than
+                    // the sender meant (a stale index from a fresh/lagging peer, or a
+                    // population that shifted under us before repair catches up). Applying it
+                    // would teleport the wrong furniture - D-c. Reject unless the carried type
+                    // matches. NoType on either side = can't read identity, so let it through
+                    // (never a false reject); real types differing = hard skip, no baseline touch.
+                    int actualType = TypeIdOf(comp, e.Key >> 24);
+                    if (actualType != NoType && e.Type != NoType && actualType != e.Type)
+                    {
+                        if (Time.realtimeSinceStartup - _lastRejectLog > 5f)
+                        {
+                            _lastRejectLog = Time.realtimeSinceStartup;
+                            CoopPlugin.Log.LogInfo($"ObjMoveSync: skipped stale move {e.Key:X} " +
+                                $"(wire type {e.Type} != resolved {actualType})");
+                        }
+                        continue;
+                    }
+                    var t = comp.transform;
+                    var io = comp as InteractableObject ?? t.GetComponent<InteractableObject>();
                     if (dropIfHostMoving && io != null && io.GetIsMovingObject())
                     {
                         // the game's move machinery owns this transform right now; writing a
@@ -186,13 +244,15 @@ namespace CardShopCoop.Sync
                 grp.SetPositionAndRotation(objTransform.position, objTransform.rotation);
         }
 
-        private static Transform Resolve(ShelfManager sm, int key)
+        // Returns the placed object as a Component (was: its Transform) so ApplyRemote can
+        // read the object's identity for the guard. Callers take .transform off it.
+        private static Component Resolve(ShelfManager sm, int key)
         {
             int kind = key >> 24;
             int idx = key & 0xFFFF;
             var list = PopulationSync.GetList(sm, kind);
             if (list == null || idx >= list.Count) return null;
-            return (list[idx] as Component)?.transform;
+            return list[idx] as Component;
         }
 
         // ---- wire ----
@@ -203,6 +263,7 @@ namespace CardShopCoop.Sync
             foreach (var e in entries)
             {
                 bw.Write(e.Key);
+                bw.Write(e.Type); // identity guard - append-only, safe on the 1.0.30-only wire
                 bw.Write(e.Pos.x); bw.Write(e.Pos.y); bw.Write(e.Pos.z);
                 bw.Write(e.Rot.x); bw.Write(e.Rot.y); bw.Write(e.Rot.z); bw.Write(e.Rot.w);
             }
@@ -217,6 +278,7 @@ namespace CardShopCoop.Sync
                 list.Add(new Entry
                 {
                     Key = br.ReadInt32(),
+                    Type = br.ReadInt32(), // matches WriteEntries order (both peers 1.0.30)
                     Pos = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle()),
                     Rot = new Quaternion(br.ReadSingle(), br.ReadSingle(), br.ReadSingle(), br.ReadSingle()),
                 });

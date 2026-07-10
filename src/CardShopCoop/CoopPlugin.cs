@@ -11,7 +11,7 @@ namespace CardShopCoop
     {
         public const string Guid = "com.zwhit.cardshopcoop";
         public const string Name = "CardShopCoop";
-        public const string Version = "1.0.29";
+        public const string Version = "1.0.30";
 
         public static ManualLogSource Log;
 
@@ -26,6 +26,7 @@ namespace CardShopCoop
         public static ConfigEntry<int> ClientWorldSlot;
         public static ConfigEntry<bool> AutoSyncCardDatabase;
         public static ConfigEntry<float> ServeReach;
+        public static ConfigEntry<bool> HostServeKey;
 
         private void Awake()
         {
@@ -59,6 +60,9 @@ namespace CardShopCoop
                 "When your modded-card ID registry (EPL enum_values.json) differs from the host's, automatically install the host's copy (yours is backed up beside it) so you only need to restart and rejoin. Set false to handle the file yourself.");
             ServeReach = Config.Bind("Player", "ServeReach", 1.6f,
                 "How close (meters, to the counter's center) a JOINER must stand to serve the register or a trade customer. The counter itself is ~1m wide, so values below ~1.2 make it unreachable.");
+            HostServeKey = Config.Bind("Keys", "HostServeKey", false,
+                "Let the HOST also use the serve key to run the register (quick-serve, bypassing the minigame) - the same shortcut joiners get. ADDITIVE to the game's normal mouse serving; off by default.");
+            CoopCore.HostServeKeyEnabled = HostServeKey.Value;
 
             var harmony = new Harmony(Guid);
             Patches.GamePatches.ApplyAll(harmony);

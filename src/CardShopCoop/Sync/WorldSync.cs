@@ -124,8 +124,25 @@ namespace CardShopCoop.Sync
             if (comp == null) return;
             int type = (int)comp.GetItemType();
             int count = comp.GetItemCount();
-            if (_last.TryGetValue(key, out var st) && st.Type == type && st.Count == count)
+            if (_last.TryGetValue(key, out var st))
+            {
+                if (st.Type == type && st.Count == count) return; // unchanged since last snapshot
+            }
+            else if (CoopCore.Role == CoopRole.Client)
+            {
+                // FIRST SIGHTING on a joiner: adopt the host's live value SILENTLY instead of
+                // reporting it as a change from an empty baseline. After Reset clears _last (a
+                // join or scene load), the client's first walk sees every compartment as "new";
+                // reporting those (often stale, or still-loading and therefore empty) reads back
+                // to the host made the HOST apply them and wipe live stock for every peer - the
+                // mid-day-join stock-wipe bug. A joiner must only report transitions it witnessed
+                // against a KNOWN baseline. Mirrors CardShelfSync.Walk's client silent-adoption;
+                // any slightly-wrong adopted value is repainted by the host's periodic full resync
+                // (ApplyFullState below). Adoption is deliberately NOT subject to the 512 cap - it
+                // emits nothing, it only records what we already see.
+                _last[key] = new CompState { Type = type, Count = count };
                 return;
+            }
             if (changes == null) changes = new List<Entry>();
             if (changes.Count >= 512) return; // leave un-recorded; picked up next tick
             _last[key] = new CompState { Type = type, Count = count };
@@ -270,6 +287,81 @@ namespace CardShopCoop.Sync
             for (int i = 0; i < n; i++)
                 list.Add(new Entry { Key = br.ReadInt32(), Type = br.ReadInt32(), Count = br.ReadUInt16() });
             return list;
+        }
+
+        // ---- full-state heal (FIX D-latent) ----
+
+        /// <summary>
+        /// Host: serialize the COMPLETE item shelf-stock state - every compartment the delta
+        /// walk visits (item shelves kind 0, card+item combi shelves kind 3, tournament prize
+        /// shelves kind 14; warehouse racks kind 1 are excluded here exactly as in the delta
+        /// walk, since their "count" is a stored-box tally, not loose items) - into the SAME
+        /// Entry format the delta path uses (WriteEntries), so a full-state payload is
+        /// byte-identical in shape to a ShelfDelta and rides the existing message type.
+        ///
+        /// WIRING CONTRACT (CoopCore owns this - not this file): the host should broadcast
+        /// BuildFullState on a ~12s CHANGE-GATED cadence over MsgType.ShelfDelta (hash the
+        /// entries, resend only on change, with a longer forced heal for a dropped packet),
+        /// symmetric to the card-display full resync that reuses MsgType.CardShelfDelta on the
+        /// same 12s beat (see CoopCore's _cardResyncTimer block). Item stock previously had NO
+        /// periodic full-truth heal, so a client that adopted a slightly-wrong baseline at join
+        /// (see Visit's silent adoption) stayed wrong until the host happened to mutate that
+        /// compartment again; this closes that gap. The receiving client routes a ShelfDelta
+        /// through ApplyRemote already, so no separate full-state flag byte is required - a
+        /// full-state broadcast IS just a ShelfDelta carrying every compartment.
+        /// </summary>
+        public void BuildFullState(BinaryWriter bw)
+        {
+            var all = new List<Entry>();
+            try
+            {
+                var sm = ResolveShelfManager();
+                if (sm != null)
+                {
+                    for (int i = 0; i < sm.m_ShelfList.Count; i++)
+                        CollectComps(all, sm.m_ShelfList[i]?.GetItemCompartmentList(), 0, i);
+                    for (int i = 0; i < sm.m_CardItemCombiShelfList.Count; i++)
+                        CollectComps(all, sm.m_CardItemCombiShelfList[i]?.GetItemCompartmentList(), 3, i);
+                    for (int i = 0; i < sm.m_TournamentPrizeShelfList.Count; i++)
+                        CollectComps(all, sm.m_TournamentPrizeShelfList[i]?.GetItemCompartmentList(), 14, i);
+                }
+            }
+            catch (Exception e)
+            {
+                CoopPlugin.Log.LogWarning("WorldSync full-state build: " + e.Message);
+            }
+            WriteEntries(bw, all);
+        }
+
+        private static void CollectComps(List<Entry> into, List<ShelfCompartment> comps, int kind, int shelfIdx)
+        {
+            if (comps == null) return;
+            for (int j = 0; j < comps.Count; j++)
+            {
+                var comp = comps[j];
+                if (comp == null) continue;
+                into.Add(new Entry
+                {
+                    Key = Key(kind, shelfIdx, j),
+                    Type = (int)comp.GetItemType(),
+                    Count = comp.GetItemCount(),
+                });
+            }
+        }
+
+        /// <summary>
+        /// Client: apply a full-state heal ABSOLUTELY. Each present entry drives its compartment
+        /// to exactly (type, count) through the same ApplyRemote/ApplyCompartment clear-and-rebuild
+        /// the delta path uses, and refreshes _last so the local baseline re-converges on host
+        /// truth. The keyed Entry format can't encode "every other compartment is already fine",
+        /// so - like CardShelfSync's full resync - this is a PARTIAL heal: compartments ABSENT from
+        /// the payload keep whatever they have. In practice the host emits every live compartment,
+        /// so an absent key only means an index the host doesn't have either. Reuses ReadEntries,
+        /// so it decodes an identical wire shape to a ShelfDelta.
+        /// </summary>
+        public void ApplyFullState(BinaryReader br)
+        {
+            ApplyRemote(ReadEntries(br));
         }
     }
 }

@@ -107,6 +107,17 @@ namespace CardShopCoop.Patches
             Try(h, typeof(PlaceDecoUIScreen), "StartPlaceDecoItem",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(PlaceDecoBlockPrefix)));
 
+            // The vanilla cashier-register click is fully live on the guest: clicking near a
+            // counter runs InteractableCashierCounter.OnMouseButtonUp -> OnEnterCashCounterMode,
+            // which SetStopMovement(true) + SetCurrentGameState(CashCounterState) - a soft-lock
+            // with no working exit for the guest (their serve flow is the ServeKey, never the
+            // vanilla register). Block the left-click entry on the client; the toast points them
+            // at the ServeKey. Right-click (OnRightMouseButtonUp -> OpenCashierSettingScreen) is a
+            // settings screen, NOT this movement-stopping mode, so it's intentionally left alone.
+            // Host untouched (Role check).
+            Try(h, typeof(InteractableCashierCounter), "OnMouseButtonUp",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(CashierCounterClickBlockPrefix)));
+
             // Handheld deodorant spray: the guest's hold-spray loop only ever hits the
             // LOCAL customer list - inert puppets on a client - so a guest could never
             // clean a smelly customer. Intercept the per-customer check and forward one
@@ -308,6 +319,23 @@ namespace CardShopCoop.Patches
             if (CoopCore.Instance != null)
             {
                 CoopCore.Instance.RegisterLine = "deco placement is host-only for now";
+                CoopCore.Instance.RegisterLineTimer = 3f;
+            }
+            return false;
+        }
+
+        /// <summary>Client only: block the vanilla register click. On the guest,
+        /// InteractableCashierCounter.OnMouseButtonUp -> OnEnterCashCounterMode stops the player's
+        /// movement and switches to CashCounterState with no working exit (the guest's serve flow
+        /// is the ServeKey, not the vanilla register) - a soft-lock. Returning false before that
+        /// call keeps the guest free; the toast tells them how to actually serve. Host is
+        /// unaffected (Role check). Same block+toast idiom as RenamerBlockPrefix.</summary>
+        public static bool CashierCounterClickBlockPrefix()
+        {
+            if (CoopCore.Role != CoopRole.Client) return true;
+            if (CoopCore.Instance != null)
+            {
+                CoopCore.Instance.RegisterLine = $"press {CoopPlugin.ServeKey.Value} at the counter to serve customers";
                 CoopCore.Instance.RegisterLineTimer = 3f;
             }
             return false;

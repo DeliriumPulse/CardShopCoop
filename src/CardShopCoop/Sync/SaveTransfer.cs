@@ -18,20 +18,53 @@ namespace CardShopCoop.Sync
         /// <summary>Slot the co-op world lives in on the client (config: ClientWorldSlot).</summary>
         public static int CoopSlot => CoopPlugin.ClientWorldSlot?.Value ?? 7;
 
+        /// <summary>Throwaway slot the HOST snapshots its live world into at every join
+        /// (mirror of the client's coop slot 7 convention). We must NOT force-save over the
+        /// host's REAL slot: SaveGameData writes the on-disk file immediately, so snapshotting
+        /// into the live slot baked whatever the world looked like at that instant - including
+        /// a transient mid-join shelf-stock wipe (see WorldSync FIX D-a) - permanently into the
+        /// host's real save. Slot 6 is outside the vanilla range (0 = autosave, 1-3 = manual),
+        /// the in-game save UI never shows it, and the host never LOADS it, so it's safe to
+        /// clobber on every join.</summary>
+        public const int HostSnapshotSlot = 6;
+
         public static string SlotPath(int slot)
         {
             return Application.persistentDataPath + "/savedGames_Release" + slot + ".json";
         }
 
-        /// <summary>Host: flush the live game into its current slot and return the save bytes.</summary>
+        /// <summary>Host: flush the live game into the THROWAWAY snapshot slot (never the host's
+        /// real slot) and return the save bytes. CGameManager.SaveGameData derives the file path
+        /// from the slot ARG (verified in the decompiled source - slot 6 writes
+        /// savedGames_Release6.json), but it also overwrites m_CurrentSaveLoadSlotSelectedIndex as
+        /// a side effect; that field feeds the game's load/quit paths, so we capture and RESTORE
+        /// it in a finally to keep the host's notion of "current slot" from drifting to 6.</summary>
         public static byte[] BuildHostPayload()
         {
             var gm = CSingleton<CGameManager>.Instance;
-            int slot = gm.m_CurrentSaveLoadSlotSelectedIndex;
-            gm.SaveGameData(slot); // synchronous: writes savedGames_Release{slot}.json
-            string path = SlotPath(slot);
+            string path = SlotPath(HostSnapshotSlot);
+            // delete the PREVIOUS join's snapshot first: SaveGameData silently bails on any of
+            // its guards (loading error, mid scene-transition, day-report screen...), and a
+            // stale slot-6 file from an earlier join would then pass the File.Exists check and
+            // ship an OLD world to the joiner. A skip must be LOUD (the throw below), never stale.
+            try { if (File.Exists(path)) File.Delete(path); } catch { }
+            try
+            {
+                string gd = Application.persistentDataPath + "/savedGames_Release" + HostSnapshotSlot + ".gd";
+                if (File.Exists(gd)) File.Delete(gd);
+            }
+            catch { }
+            int prevSlot = gm.m_CurrentSaveLoadSlotSelectedIndex;
+            try
+            {
+                gm.SaveGameData(HostSnapshotSlot); // synchronous: writes savedGames_Release6.json
+            }
+            finally
+            {
+                gm.m_CurrentSaveLoadSlotSelectedIndex = prevSlot; // undo SaveGameData's side effect
+            }
             if (!File.Exists(path))
-                throw new FileNotFoundException("Host save file missing after save", path);
+                throw new FileNotFoundException("Host snapshot save file missing after save", path);
             return File.ReadAllBytes(path);
         }
 

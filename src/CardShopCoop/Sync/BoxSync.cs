@@ -98,6 +98,19 @@ namespace CardShopCoop.Sync
             {
                 if (!_hostById.TryGetValue(id, out var box) || box == null) continue;
                 SetHostWorkerLock(box, false);
+                // C-e: a box that was carried can be parked under the floor (hide spot / a
+                // pose that slipped below the map). Re-showing it there drops it through the
+                // world unrecoverable, so lift any under-floor box back to a sane pose
+                // (keep x/z, y=0.5) BEFORE it becomes visible again.
+                try
+                {
+                    if (box.transform.position.y < -2f)
+                    {
+                        var p = box.transform.position;
+                        box.transform.position = new Vector3(p.x, 0.5f, p.z);
+                    }
+                }
+                catch { }
                 try { if (!box.gameObject.activeSelf) box.gameObject.SetActive(true); } catch { }
                 try { box.SetPhysicsEnabled(true); } catch { }
                 released++;
@@ -191,6 +204,7 @@ namespace CardShopCoop.Sync
             // a prior session's "gave up storing" and never get placed on the rack
             _storeFails.Clear();
             _storeGaveUp.Clear();
+            _underMapLogged.Clear(); // C-e: don't carry an under-map warning suppression across sessions
             _sm = null;
             _lastResolveWarn = 0;
             _hostWhereScratch.Clear();
@@ -642,7 +656,14 @@ namespace CardShopCoop.Sync
                 int htype = (int)box.m_ItemCompartment.GetItemType();
                 if (htype != e.Type && htype != (int)EItemType.None
                     && box.m_ItemCompartment.GetItemCount() > 0) continue;
-                if (IsLocallyCarried(box) || IsBeingHeld(box)) continue; // never stomp a box in the host's or a WORKER's hands
+                // never stomp a box in the host's or a WORKER's hands - AND (C-d) never a box
+                // the HOST is currently moving/dragging in move-mode. GetIsMovingObject() is
+                // the ObjMoveSync-style guard (InteractablePackagingBox_Item inherits it from
+                // InteractableObject); the guest's report carries a stale pose that would snap
+                // the box back out from under the host's drag. Skipping the whole request drops
+                // its pose/store fields (which the hostAuthoritative apply below would ignore
+                // anyway) plus its content, which a mid-move host box owns just like held ones.
+                if (IsLocallyCarried(box) || IsBeingHeld(box) || box.GetIsMovingObject()) continue;
                 // just set down: a report the client built while we still carried it is
                 // stale by definition - the race that teleported boxes mid-restock
                 if (_hostRecentlyReleased.TryGetValue(e.Id, out double rel)
@@ -653,7 +674,32 @@ namespace CardShopCoop.Sync
                 // instant the guest sets it down (the else branch below).
                 if (e.Carried) { _remoteCarried.Add(e.Id); SetHostWorkerLock(box, true); }
                 else { _remoteCarried.Remove(e.Id); SetHostWorkerLock(box, false); }
-                ApplyToBox(box, e);
+                // C-c belt+braces (HOST side): skip CONTENT (count/open) when the host box is
+                // OPEN, NOT client-carried, AND already holds items - a NON-empty open box on
+                // the host is being dispensed from by the host/workers and its contents are
+                // host-authoritative. The guest's ClientTick used to echo EVERY box's lagging
+                // mirror count every cycle, and applying that stale count to a box the host was
+                // actively draining refilled it endlessly ("boxes get unlimited items"). A box
+                // the guest carries is theirs, so let its content through. DEVIATION from the
+                // literal spec (which skipped ALL open non-carried boxes): an EMPTY open box
+                // (count 0) is exempt, because that is the guest pulling the FIRST item into an
+                // open box (B1) - a legitimate gain the host must accept or the item is
+                // destroyed host-side and healed away on the guest. A refill source is always
+                // non-empty, so the count>0 carve-out keeps the refill fix intact while
+                // preserving B1. C-a: hostAuthoritative=true also drops pose/store regardless.
+                bool hostOpen = false; int hostCount = 0;
+                try { hostOpen = box.IsBoxOpened(); } catch { }
+                try { hostCount = box.m_ItemCompartment.GetItemCount(); } catch { }
+                // ...and a count INCREASE is exempt too: a guest reclaiming ANOTHER item into
+                // an already-non-empty open box (RemoveItemFromShelf supports multiples) is a
+                // legitimate gain the host must accept - the refill BUG was the guest's stale
+                // echo of untouched boxes, which the touched-only report gating already kills
+                // at the source; this host-side guard is belt-and-braces against the residual
+                // (host + guest working the SAME box within the touch window), where blocking
+                // equal/lower counts suffices.
+                bool applyContent = !(hostOpen && hostCount > 0 && !_remoteCarried.Contains(e.Id)
+                                      && e.Count <= hostCount);
+                ApplyToBox(box, e, hostAuthoritative: true, applyContent: applyContent);
             }
             // fan the change out to everyone NOW - with 3+ players the other
             // clients otherwise wait out the periodic tick and the hash gate.
@@ -667,12 +713,13 @@ namespace CardShopCoop.Sync
         private static readonly Dictionary<int, int> _remWindowCount = new Dictionary<int, int>();
 
         /// <summary>Shared by ALL box-family modules (item/card/furniture): true if this
-        /// client's removal budget for the current 2s window is spent. No human trashes
-        /// 5 boxes in 2 seconds - but a client whose game is re-running its world-load
-        /// teardown echoes its ENTIRE box population, all three lists, as "trashed"
-        /// (first field incident: 250 boxes in 10ms). Per-connection, so one player's
-        /// flood never eats another player's legitimate trash.</summary>
-        public static bool RemovalFlooded(int connId, string channel)
+        /// client's removal budget for the current 2s window is spent. A human trashing a
+        /// warehouse won't exceed 16 boxes in 2 seconds (C-b raised the cap from 4) - but a
+        /// client whose game is re-running its world-load teardown echoes its ENTIRE box
+        /// population, all three lists, as "trashed" (first field incident: 250 boxes in
+        /// 10ms). Per-connection, so one player's flood never eats another's legitimate
+        /// trash. refusedId (optional) names the box in the throttled over-budget warning.</summary>
+        public static bool RemovalFlooded(int connId, string channel, int refusedId = -1)
         {
             double nowT = Time.realtimeSinceStartupAsDouble;
             if (!_remWindowStart.TryGetValue(connId, out double start) || nowT - start > 2.0)
@@ -681,9 +728,19 @@ namespace CardShopCoop.Sync
                 _remWindowCount[connId] = 0;
             }
             int c = _remWindowCount[connId] = _remWindowCount[connId] + 1;
-            if (c <= 4) return false;
-            if (c == 5 || c % 100 == 0)
-                CoopPlugin.Log.LogWarning($"ignoring {channel} removal flood from client {connId} (reload echo, not gameplay)");
+            // C-b: cap raised 4 -> 16 (4x). This is friends-coop, not anti-grief-critical:
+            // the old cap of 4/2s stranded host-side boxes during a legitimate warehouse
+            // cleanup spree, and the guest - believing them trashed - watched them 'respawn
+            // next day' and clog shelving (field report). A reload teardown echo still floods
+            // hundreds in milliseconds, so the flood protection stays; only the ceiling moves.
+            if (c <= 16) return false;
+            // C-b: a refused removal must NOT be silent - name the box id and say 'removal
+            // budget' so a stranded/respawning box is traceable. Throttled (first over-cap
+            // removal of the window, then every 100th) so the reload-echo flood can't spam.
+            if (c == 17 || c % 100 == 0)
+                CoopPlugin.Log.LogWarning($"ignoring {channel} removal"
+                    + (refusedId >= 0 ? $" of box id {refusedId}" : "")
+                    + $" from client {connId} - removal budget spent for this 2s window (reload echo, not gameplay)");
             return true;
         }
 
@@ -691,7 +748,7 @@ namespace CardShopCoop.Sync
         /// broadcast doesn't resurrect it at its old spot.</summary>
         public void HostApplyRemoval(int id, int type, int connId)
         {
-            if (RemovalFlooded(connId, "item-box")) return;
+            if (RemovalFlooded(connId, "item-box", id)) return;
             if (!_hostById.TryGetValue((ushort)id, out var box) || box == null) return;
             if ((int)box.m_ItemCompartment.GetItemType() != type) return;
             if (IsLocallyCarried(box) || IsBeingHeld(box)) return; // player's OR worker's hands
@@ -968,64 +1025,75 @@ namespace CardShopCoop.Sync
                 {
                     var truth = _lastApplied[i];
                     _byId.TryGetValue(truth.Id, out var box);
+                    // C-c (guest side): the guest must only echo a box it has a REASON to
+                    // report. The old loop parroted EVERY box every cycle - dead ones verbatim,
+                    // stored/other-carried verbatim, and every live box's Snapshot - so a box's
+                    // LAGGING mirror count was re-reported forever, and the host applied that
+                    // stale count to a box it was actively dispensing from, refilling it
+                    // endlessly ("boxes get unlimited items"). Reasons to report: I'm carrying
+                    // it (carry transition), I just set it down, or its live snapshot DIFFERS
+                    // from the applied truth / I touched it within the window. An untouched box
+                    // is left out entirely; the host's own snapshot stays its authority.
                     if (box == null)
-                    {
-                        // dead or unmapped locally: parrot the host truth; if we trashed
-                        // it, the BoxRemoved message (sent separately) settles it
-                        list.Add(truth);
-                        continue;
-                    }
-                    // while I'M carrying it: tell the host (so everyone else hides
-                    // their copy) but keep reporting the last settled position
+                        continue; // dead/unmapped locally: nothing local to report; a trash is settled by the separate BoxRemoved message
+
+                    bool touchedRecently = _locallyTouched.TryGetValue(truth.Id, out double tch) && nowT - tch < 6.0;
+                    bool justReleased = _recentlyReleased.TryGetValue(truth.Id, out double rr) && nowT - rr < 6.0;
+
+                    // while I'M carrying it: tell the host (so everyone else hides their copy)
+                    // but keep reporting the last settled position. Carry IS a report reason;
+                    // the pickup/set-down transitions themselves force a send (see above).
                     if (IsLocallyCarried(box))
                     {
                         var held = truth;
                         held.Carried = true;
-                        held.Stored = false; // just took it off a rack: a stale stored
-                        list.Add(held);      // flag would keep the host's copy slotted
+                        held.Stored = false; // just took it off a rack: a stale stored flag would keep the host's copy slotted
+                        list.Add(held);
                         continue;
                     }
-                    // host says STORED: the rack slot is host-authoritative. Report the
-                    // truth VERBATIM - if our local store mirror was rejected (full slot,
-                    // stale type), reporting our not-stored state would command the host
-                    // to yank its legitimately-stored box off the rack (revert war). The
-                    // carried branch above is the one legitimate exit: the player took it.
-                    // EXCEPTION: if WE physically took this exact box off the rack (it's no
-                    // longer stored locally AND we recently carried+released it), report the
-                    // real loose state so the take mirrors even when the transient Carried
-                    // frame was missed and a stale host Stored=true echo re-pinned us -
-                    // otherwise the box stays frozen slotted on the other screen forever.
+                    // host says STORED: the rack slot is host-authoritative. Do NOT echo an
+                    // untouched stored box - that is exactly the stale echo C-c removes, and
+                    // reporting a not-stored state for a box the host legitimately shelved would
+                    // command it to yank the box off the rack (revert war). Only report when I
+                    // actively touched it recently. EXCEPTION: if WE physically took this exact
+                    // box off the rack (no longer stored locally AND recently carried+released),
+                    // fall through to Snapshot so the take mirrors even if the transient Carried
+                    // frame was missed and a stale host Stored=true echo re-pinned us.
                     if (truth.Stored)
                     {
                         bool reallyStored = true;
                         try { reallyStored = box.m_IsStored; } catch { }
-                        bool weTookItOff = !reallyStored
-                            && _recentlyReleased.TryGetValue(truth.Id, out double rel) && nowT - rel < 6.0;
+                        bool weTookItOff = !reallyStored && justReleased;
                         if (!weTookItOff)
                         {
-                            list.Add(truth);
+                            if (touchedRecently) { list.Add(truth); changed = true; }
                             continue;
                         }
                         // else fall through to Snapshot(box): reports Stored=false + real pose
                     }
-                    // hidden because ANOTHER player carries it: no local truth to
-                    // report (its transform is parked at the hide spot, contents
-                    // stale) - UNLESS I just set it down myself: that report IS the
-                    // set-down, and skipping it deadlocks the box as carried-forever
-                    if (truth.Carried
-                        && !(_recentlyReleased.TryGetValue(truth.Id, out double rr) && nowT - rr < 6.0))
-                    {
-                        list.Add(truth);
+                    // hidden because ANOTHER player carries it: nothing local to report UNLESS I
+                    // just set it down myself (that report IS the set-down, and skipping it
+                    // deadlocks the box as carried-forever on the other screen)
+                    if (truth.Carried && !justReleased)
                         continue;
-                    }
+
                     var now = Snapshot(box);
                     now.Id = truth.Id;
-                    if (Differs(now, truth))
+                    bool differs = Differs(now, truth);
+                    if (differs)
                     {
                         changed = true;
                         _locallyTouched[truth.Id] = nowT;
                     }
-                    list.Add(now);
+                    // C-c: echo this box only with a genuine local reason - a fresh diff this
+                    // tick, a recent local edit still in the window, or a set-down/take we're
+                    // confirming. An untouched box whose mirror already matches the applied
+                    // truth is dropped (no lagging-count re-report -> no host refill).
+                    if (differs || touchedRecently || justReleased)
+                    {
+                        list.Add(now);
+                        if (justReleased) changed = true; // ensure the set-down/take actually sends
+                    }
                 }
                 if (changed) OnClientChanges?.Invoke(list);
             }
@@ -1034,130 +1102,234 @@ namespace CardShopCoop.Sync
 
         // ---------------- shared apply ----------------
 
-        private static void ApplyToBox(InteractablePackagingBox_Item box, Entry want, bool applyPosition = true)
+        // C-e: box ids we've already warned about for an under-map pose, so the "refusing
+        // under-map pose" warning fires ONCE per box id (a stuck under-floor host pose would
+        // otherwise spam it every tick). Cleared in Reset() with the rest of the session state.
+        private static readonly HashSet<ushort> _underMapLogged = new HashSet<ushort>();
+
+        /// <summary>C-e: an under-map pose (y &lt; -2) must never be applied - a box written
+        /// there falls through the world and is unrecoverable (a corrupt/late snapshot or a
+        /// box that slipped below the floor host-side). Returns true (and logs ONCE per box id)
+        /// when the wanted pose is under the floor, so pose-apply callers skip the position
+        /// write and leave the box where it is.</summary>
+        private static bool UnderMapPose(Entry want)
+        {
+            if (want.Pos.y >= -2f) return false;
+            if (_underMapLogged.Add(want.Id))
+                CoopPlugin.Log.LogWarning($"BoxSync: refusing under-map pose (y={want.Pos.y:F2}) for box id {want.Id} - keeping its current position");
+            return true;
+        }
+
+        private static void ApplyToBox(InteractablePackagingBox_Item box, Entry want, bool applyPosition = true, bool hostAuthoritative = false, bool applyContent = true)
         {
             try
             {
-                // warehouse-rack storage FIRST: a stored box is parented to a rack slot
-                // the game owns. Syncing it as a loose box yanked stored boxes off the
-                // rack on BOTH sides ("boxes all over the place" report) and left them
-                // uninteractable - the store/unstore transition must go through the
-                // game's own methods so the compartment registration mirrors too
-                bool locallyStored = false;
-                try { locallyStored = box.m_IsStored; } catch { }
-                if (want.Stored)
+                // C-a: on the HOST this runs for a guest's REQUEST (hostAuthoritative=true).
+                // The host owns rack placement AND pose for every box it tracks - only guest-
+                // authoritative transitions may cross: carried enter/leave (worker lock paired
+                // in HostApplyRequest), open/close, CONTENT changes that pass the C-c guard
+                // (applyContent), and the STORE-ON-SETDOWN below. Skip the client's stored/rack
+                // mirror machinery and the pose write; the host's own next snapshot rebroadcasts
+                // its truth and heals the guest. This is exactly what stops the 1.0.29 give-up
+                // PIN (kinematic freeze at want.Pos) from running HOST-side and freezing
+                // authoritative boxes at the guest's reported pose.
+                //
+                // STORE-ON-SETDOWN (the one stored-transition the host MUST record): a guest
+                // racking a box is as guest-authoritative as carrying it off one - BoxSync's
+                // Stored field is the ONLY carrier (no dedicated store message exists), so if
+                // the host never stores its copy the box stays LOOSE in the authoritative
+                // world, the guest's report re-differs forever, and the storage is silently
+                // LOST on save. Run the game's own store recipe ONCE per report (no retry
+                // loop, no give-up pin, no eviction - those are client-mirror machinery); if
+                // the host's rack genuinely rejects it (slot truly full), the box stays a
+                // normal loose box and the host's truth rebroadcast pops it back off the
+                // guest's rack too - correct, visible, self-consistent.
+                if (hostAuthoritative && want.Stored && !want.Carried)
                 {
-                    // contents FIRST: DispenseItem rejects "empty" boxes, and a mirror
-                    // whose count went stale while the box was carried would otherwise
-                    // live-lock the store forever (closed-box path is data-only, safe
-                    // whether stored already or about to be)
-                    ApplyClosedCount(box, want.Count);
-                    if (locallyStored) return;              // already stored; slot owns it
-                    // give-up guard: a genuinely full/mismatched rack slot rejects the
-                    // store on EVERY tick, and the old code retried forever (field log:
-                    // "rejected box id 252 ... retrying" every 30s all session). Once we
-                    // give up we STOP dispensing - but instead of the old fall-through to a
-                    // loose pose (which rendered the box floating at the elevated rack-slot
-                    // world position want.Pos with physics on - the "storage boxes floating
-                    // in the air" report), we KINEMATICALLY PIN it at the host pose so it
-                    // reads as shelved (B1). A later snapshot retries the store on change.
-                    if (!_storeGaveUp.Contains(want.Id))
+                    bool hostStored = false;
+                    try { hostStored = box.m_IsStored; } catch { }
+                    if (!hostStored)
                     {
-                        if (!box.gameObject.activeSelf) box.gameObject.SetActive(true);
-                        var rackComp = ResolveWarehouseCompartment(want.StoreShelf, want.StoreComp);
-                        if (rackComp != null)
+                        var hostRack = ResolveWarehouseCompartment(want.StoreShelf, want.StoreComp);
+                        if (hostRack != null)
                         {
                             try
                             {
-                                // the game's OWN restore recipe (ShelfManager.DelayLoad):
-                                // physics off, then DispenseItem. In the player flow
-                                // StartHoldBox already disabled physics; a live loose box
-                                // here still has gravity and would fall off the rack
+                                // reactivate FIRST (a guest-carried box is hidden host-side):
+                                // DispenseItem on an OPEN box runs SetOpenCloseBox, whose
+                                // StartCoroutine throws on an inactive GameObject - the throw
+                                // landed before m_IsStored and silently lost the store
+                                if (!box.gameObject.activeSelf) box.gameObject.SetActive(true);
+                                // seed contents only when the HOST box is genuinely empty
+                                // (all DispenseItem's empty-check needs) - an unconditional
+                                // count write here would bypass the applyContent authority
+                                // gate and let a stale carried-mirror count shrink/inflate
+                                // the host's authoritative contents at store time
+                                if (box.m_ItemCompartment.GetItemCount() <= 0)
+                                    ApplyClosedCount(box, Mathf.Max(want.Count, 1));
                                 box.SetPhysicsEnabled(false);
-                                box.DispenseItem(isPlayer: false, rackComp);
+                                box.DispenseItem(isPlayer: false, hostRack);
+                                bool ok = false;
+                                try { ok = box.m_IsStored; } catch { }
+                                if (!ok) box.SetPhysicsEnabled(true); // rejected: stay a normal loose box
                             }
-                            catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync store: " + e.Message); }
-                            if (box.m_IsStored)
+                            catch (Exception e)
                             {
-                                _storeFails.Remove(want.Id);
-                                return; // stored successfully; slot owns pose
+                                CoopPlugin.Log.LogWarning("BoxSync host store: " + e.Message);
+                                try { box.SetPhysicsEnabled(true); } catch { }
                             }
-                            // DispenseItem returns void and eats failures. On the 2nd+ attempt,
-                            // before we count another fail, check whether the slot is blocked by
-                            // a GHOST occupant - a box WE track that the host places somewhere
-                            // else (or not stored) - and if so evict it and retry in THIS pass
-                            // (B2). This is also our field probe for the rack-index-divergence
-                            // theory: we log the resolved rack's indices, the occupant ids, and
-                            // where the host claims each occupant lives.
-                            _storeFails.TryGetValue(want.Id, out int fails);
-                            if (fails >= 1 && TryEvictGhostAndRetryStore(box, rackComp, want))
+                        }
+                    }
+                }
+                if (!hostAuthoritative)
+                {
+                    // warehouse-rack storage FIRST: a stored box is parented to a rack slot
+                    // the game owns. Syncing it as a loose box yanked stored boxes off the
+                    // rack on BOTH sides ("boxes all over the place" report) and left them
+                    // uninteractable - the store/unstore transition must go through the
+                    // game's own methods so the compartment registration mirrors too
+                    bool locallyStored = false;
+                    try { locallyStored = box.m_IsStored; } catch { }
+                    if (want.Stored)
+                    {
+                        // contents FIRST: DispenseItem rejects "empty" boxes, and a mirror
+                        // whose count went stale while the box was carried would otherwise
+                        // live-lock the store forever (closed-box path is data-only, safe
+                        // whether stored already or about to be)
+                        ApplyClosedCount(box, want.Count);
+                        if (locallyStored) return;              // already stored; slot owns it
+                        // give-up guard: a genuinely full/mismatched rack slot rejects the
+                        // store on EVERY tick, and the old code retried forever (field log:
+                        // "rejected box id 252 ... retrying" every 30s all session). Once we
+                        // give up we STOP dispensing - but instead of the old fall-through to a
+                        // loose pose (which rendered the box floating at the elevated rack-slot
+                        // world position want.Pos with physics on - the "storage boxes floating
+                        // in the air" report), we KINEMATICALLY PIN it at the host pose so it
+                        // reads as shelved (B1). A later snapshot retries the store on change.
+                        if (!_storeGaveUp.Contains(want.Id))
+                        {
+                            if (!box.gameObject.activeSelf) box.gameObject.SetActive(true);
+                            var rackComp = ResolveWarehouseCompartment(want.StoreShelf, want.StoreComp);
+                            if (rackComp != null)
                             {
+                                try
+                                {
+                                    // the game's OWN restore recipe (ShelfManager.DelayLoad):
+                                    // physics off, then DispenseItem. In the player flow
+                                    // StartHoldBox already disabled physics; a live loose box
+                                    // here still has gravity and would fall off the rack
+                                    box.SetPhysicsEnabled(false);
+                                    box.DispenseItem(isPlayer: false, rackComp);
+                                }
+                                catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync store: " + e.Message); }
                                 if (box.m_IsStored)
                                 {
                                     _storeFails.Remove(want.Id);
-                                    return; // ghost gone, store succeeded; slot owns pose
+                                    return; // stored successfully; slot owns pose
                                 }
+                                // DispenseItem returns void and eats failures. On the 2nd+ attempt,
+                                // before we count another fail, check whether the slot is blocked by
+                                // a GHOST occupant - a box WE track that the host places somewhere
+                                // else (or not stored) - and if so evict it and retry in THIS pass
+                                // (B2). This is also our field probe for the rack-index-divergence
+                                // theory: we log the resolved rack's indices, the occupant ids, and
+                                // where the host claims each occupant lives.
+                                _storeFails.TryGetValue(want.Id, out int fails);
+                                if (fails >= 1 && TryEvictGhostAndRetryStore(box, rackComp, want))
+                                {
+                                    if (box.m_IsStored)
+                                    {
+                                        _storeFails.Remove(want.Id);
+                                        return; // ghost gone, store succeeded; slot owns pose
+                                    }
+                                }
+                                box.SetPhysicsEnabled(true); // don't leave a loose box frozen mid-retry
+                                _storeFails[want.Id] = ++fails;
+                                if (fails < 4)
+                                    return; // still trying; don't apply a loose pose mid-attempt
+                                _storeGaveUp.Add(want.Id);
+                                CoopPlugin.Log.LogWarning($"BoxSync store: rack {want.StoreShelf}/{want.StoreComp} keeps rejecting box id {want.Id} (slot full or size/type mismatch) - pinning it shelved at the host pose");
+                                // fall through to the B1 pin below (do NOT return here)
                             }
-                            box.SetPhysicsEnabled(true); // don't leave a loose box frozen mid-retry
-                            _storeFails[want.Id] = ++fails;
-                            if (fails < 4)
-                                return; // still trying; don't apply a loose pose mid-attempt
-                            _storeGaveUp.Add(want.Id);
-                            CoopPlugin.Log.LogWarning($"BoxSync store: rack {want.StoreShelf}/{want.StoreComp} keeps rejecting box id {want.Id} (slot full or size/type mismatch) - pinning it shelved at the host pose");
-                            // fall through to the B1 pin below (do NOT return here)
+                            else
+                            {
+                                return; // no rack yet; don't apply a loose pose mid-attempt
+                            }
                         }
-                        else
+                        // GAVE UP (this pass or a prior one): the give-up branch OWNS the final
+                        // physics/pose so the generic loose-apply further down can't fight it.
+                        // Kinematic pin at the host pose = sits AT the rack, matching the host,
+                        // instead of floating loose. SetPhysicsEnabled(false) => isKinematic +
+                        // collider off (InteractablePackagingBox.cs ~163-175). Once the host
+                        // takes it off the rack, want.Stored flips false and the else-branch
+                        // below re-enables physics so it behaves normally again.
+                        try
                         {
-                            return; // no rack yet; don't apply a loose pose mid-attempt
+                            if (!box.gameObject.activeSelf)
+                            {
+                                box.gameObject.SetActive(true);
+                                try { box.m_ItemCompartment.SetPriceTagVisibility(true); } catch { }
+                            }
+                            box.SetPhysicsEnabled(false);
+                            // C-e: never write an under-map pose (y < -2) - a box pinned there
+                            // falls through the world unrecoverable; keep its current position.
+                            if (!UnderMapPose(want))
+                            {
+                                box.transform.SetPositionAndRotation(want.Pos, Quaternion.Euler(0f, want.Yaw, 0f));
+                                ObjMoveSync.SyncTagGroup(box.transform); // box price tags ride in their own group
+                            }
+                        }
+                        catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync store pin: " + e.Message); }
+                        return;
+                    }
+                    else
+                    {
+                        // host says NOT stored: clear any give-up state so a future store
+                        // (rack slot freed up, box re-placed) is attempted fresh
+                        bool wasPinned = _storeGaveUp.Count > 0 && _storeGaveUp.Remove(want.Id);
+                        if (_storeFails.Count > 0) _storeFails.Remove(want.Id);
+                        // a give-up box was pinned KINEMATIC (physics off) at the rack pose. Now
+                        // the host has taken it off the rack, so it must behave as a normal loose
+                        // box again - re-enable physics here (the locallyStored take-recipe below
+                        // won't fire for it, because the pin never actually stored it: m_IsStored
+                        // is false). Without this the box stays an unclickable frozen ghost.
+                        if (wasPinned && !locallyStored)
+                        {
+                            try { box.SetPhysicsEnabled(true); } catch { }
                         }
                     }
-                    // GAVE UP (this pass or a prior one): the give-up branch OWNS the final
-                    // physics/pose so the generic loose-apply further down can't fight it.
-                    // Kinematic pin at the host pose = sits AT the rack, matching the host,
-                    // instead of floating loose. SetPhysicsEnabled(false) => isKinematic +
-                    // collider off (InteractablePackagingBox.cs ~163-175). Once the host
-                    // takes it off the rack, want.Stored flips false and the else-branch
-                    // below re-enables physics so it behaves normally again.
-                    try
+                    if (locallyStored)
                     {
-                        if (!box.gameObject.activeSelf)
-                        {
-                            box.gameObject.SetActive(true);
-                            try { box.m_ItemCompartment.SetPriceTagVisibility(true); } catch { }
-                        }
-                        box.SetPhysicsEnabled(false);
-                        box.transform.SetPositionAndRotation(want.Pos, Quaternion.Euler(0f, want.Yaw, 0f));
-                        ObjMoveSync.SyncTagGroup(box.transform); // box price tags ride in their own group
-                    }
-                    catch (Exception e) { CoopPlugin.Log.LogWarning("BoxSync store pin: " + e.Message); }
-                    return;
-                }
-                else
-                {
-                    // host says NOT stored: clear any give-up state so a future store
-                    // (rack slot freed up, box re-placed) is attempted fresh
-                    bool wasPinned = _storeGaveUp.Count > 0 && _storeGaveUp.Remove(want.Id);
-                    if (_storeFails.Count > 0) _storeFails.Remove(want.Id);
-                    // a give-up box was pinned KINEMATIC (physics off) at the rack pose. Now
-                    // the host has taken it off the rack, so it must behave as a normal loose
-                    // box again - re-enable physics here (the locallyStored take-recipe below
-                    // won't fire for it, because the pin never actually stored it: m_IsStored
-                    // is false). Without this the box stays an unclickable frozen ghost.
-                    if (wasPinned && !locallyStored)
-                    {
+                        // remote took it off the rack: replicate the take recipe, not just
+                        // the bookkeeping - a stored box has physics DISABLED, and skipping
+                        // the re-enable left an unclickable kinematic ghost at the drop spot
+                        UnhookIfStored(box);
+                        try { box.transform.SetParent(null); } catch { }
                         try { box.SetPhysicsEnabled(true); } catch { }
+                        try { if (box.m_MoveStateValidArea != null) box.m_MoveStateValidArea.gameObject.SetActive(true); } catch { }
+                        try { box.m_ItemCompartment.SetPriceTagVisibility(box.gameObject.activeSelf); } catch { }
                     }
                 }
-                if (locallyStored)
+                else if (want.Carried)
                 {
-                    // remote took it off the rack: replicate the take recipe, not just
-                    // the bookkeeping - a stored box has physics DISABLED, and skipping
-                    // the re-enable left an unclickable kinematic ghost at the drop spot
-                    UnhookIfStored(box);
-                    try { box.transform.SetParent(null); } catch { }
-                    try { box.SetPhysicsEnabled(true); } catch { }
-                    try { if (box.m_MoveStateValidArea != null) box.m_MoveStateValidArea.gameObject.SetActive(true); } catch { }
-                    try { box.m_ItemCompartment.SetPriceTagVisibility(box.gameObject.activeSelf); } catch { }
+                    // C-a (host): the host ignores guest store/pose noise for tracked boxes,
+                    // but a guest now CARRYING this box has physically taken it off the rack.
+                    // Mirror THAT unstore via the game's own take recipe - a Carried-enter is a
+                    // guest-authoritative transition, and for a stored box it means "off the
+                    // rack." Skipping it leaves the host box registered on the slot: it
+                    // rebroadcasts Stored=true when the guest sets it down and teleports the box
+                    // back onto the rack on the guest (rack-take desync). Bare not-stored noise
+                    // without a carry is still ignored (that's what C-a set out to stop).
+                    bool hostStored = false;
+                    try { hostStored = box.m_IsStored; } catch { }
+                    if (hostStored)
+                    {
+                        UnhookIfStored(box);
+                        try { box.transform.SetParent(null); } catch { }
+                        try { box.SetPhysicsEnabled(true); } catch { }
+                        try { if (box.m_MoveStateValidArea != null) box.m_MoveStateValidArea.gameObject.SetActive(true); } catch { }
+                        try { box.m_ItemCompartment.SetPriceTagVisibility(box.gameObject.activeSelf); } catch { }
+                    }
                 }
 
                 // someone (remote) is carrying it: their avatar shows the box in hand,
@@ -1178,15 +1350,21 @@ namespace CardShopCoop.Sync
                     try { box.m_ItemCompartment.SetPriceTagVisibility(true); } catch { }
                 }
 
-                // open/close FIRST: content semantics depend on the resulting state
-                if (box.IsBoxOpened() != want.IsOpen && MiSetOpenClose != null)
+                // open/close FIRST: content semantics depend on the resulting state.
+                // C-c belt+braces: applyContent is false when the HOST box is open and NOT
+                // remote-carried (an open box on the host is being worked by host/workers and
+                // its contents are host-authoritative) - so a guest's stale count/open never
+                // stomps it. That guest echo of an open box's lagging count was the endless
+                // item-refill ("boxes get unlimited items"). On the client applyContent is
+                // always true, so nothing changes there.
+                if (applyContent && box.IsBoxOpened() != want.IsOpen && MiSetOpenClose != null)
                 {
                     try { MiSetOpenClose.Invoke(box, null); } catch { }
                 }
 
                 var comp = box.m_ItemCompartment;
                 int cur = comp.GetItemCount();
-                if (cur != want.Count)
+                if (applyContent && cur != want.Count)
                 {
                     // EMPTY box gaining its first item: adopt the wanted type + build the
                     // pos list (B1). Without this, an empty box whose host compartment is
@@ -1220,7 +1398,20 @@ namespace CardShopCoop.Sync
                         FiAmountToSpawn?.SetValue(box, want.Count);
                     }
                 }
-                if (applyPosition && want.Settled)
+                // C-a + relocation: apply the guest's settled/drop pose so a box the guest
+                // carried and SET DOWN (or nudged loose) actually moves on the host too. This
+                // is NOT the C-a bug - that was the STORE give-up PIN (kinematic freeze at
+                // want.Pos) running host-side, which the skipped store block above now
+                // prevents. Only boxes the guest actually touched reach here (its C-c report
+                // gate drops untouched boxes), and a box the HOST is move-dragging never gets
+                // this far (C-d drops it in HostApplyRequest) - so this is exactly a guest
+                // relocation, not a stale echo or a snap-back. Skip when the box is (still)
+                // STORED: the host owns rack placement and want.Pos for a stored box is the
+                // elevated rack-slot pose, which as a loose pose would drop it off the rack.
+                // C-e: never write an under-map pose (logged once per id inside UnderMapPose).
+                bool boxStoredNow = false;
+                try { boxStoredNow = box.m_IsStored; } catch { }
+                if (applyPosition && want.Settled && !want.Stored && !boxStoredNow && !UnderMapPose(want))
                 {
                     var t = box.transform;
                     if ((t.position - want.Pos).sqrMagnitude > 0.01f
