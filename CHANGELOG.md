@@ -5,6 +5,9 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.0.31
+**New in-game look.** The co-op window (F2) got a full visual overhaul - a proper themed panel matching the game's cozy style (rounded corners, title bar, HOST/JOIN section cards, colored status chips, styled buttons and fields), and the on-screen prompts (serve hints, host clock, errors) are now readable dark pills instead of floating text. No gameplay or sync changes. Both players must update - the launcher does it automatically.
+
 ## 1.0.30
 **Fixes for the full 1.0.29 field-report batch — thank you Bytelocker, SerDakota, dereck, Kamun, Elvundil, Latch, and everyone in the Discord.** Wire format changed again, so 1.0.30 only connects to 1.0.30. Both players must update — the launcher does it automatically.
 
