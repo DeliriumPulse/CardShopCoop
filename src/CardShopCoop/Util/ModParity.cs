@@ -118,10 +118,52 @@ namespace CardShopCoop.Util
             try
             {
                 string p = EnumFilePath();
-                _enum = File.Exists(p) ? Short(Sha1Bytes(File.ReadAllBytes(p))) : "none";
+                if (!File.Exists(p)) { _enum = "none"; return _enum; }
+                // Hash the registry's MEANING, not its bytes. EPL re-serializes
+                // enum_values.json on every boot (ordering / whitespace / rewrite churn),
+                // so a byte hash made two LOGICALLY IDENTICAL registries mismatch forever:
+                // the sync installed a byte-copy of the host's file, the next boot rewrote
+                // it, the next Hello re-mismatched - an endless "synced - RESTART - rejoin"
+                // loop that no number of restarts escapes (field report: "custom card
+                // database error, regardless of multiple restarts, via LAN"). Canonical
+                // form: every "EnumType:Name=id" pair, sorted - byte-order-proof. If the
+                // parse ever fails (format change), fall back to the old byte hash: never
+                // worse than before.
+                var lines = CanonicalEnumLines(File.ReadAllText(p));
+                _enum = lines != null && lines.Count > 0
+                    ? Short(Sha1(string.Join("\n", lines)))
+                    : Short(Sha1Bytes(File.ReadAllBytes(p)));
             }
             catch { _enum = "none"; }
             return _enum;
+        }
+
+        /// <summary>Parse EPL's two-level registry ({ "EnumType": { "Name": id, ... }, ... })
+        /// into sorted "EnumType:Name=id" lines. The file is machine-written with exactly this
+        /// shape (integer leaves, no nested objects inside a section), so a compact regex walk
+        /// is safe; returns null on anything surprising so the caller can fall back.</summary>
+        private static List<string> CanonicalEnumLines(string json)
+        {
+            try
+            {
+                var outLines = new List<string>();
+                // sections: "Name": { ...no nested braces (leaves are ints)... }
+                var secRx = new System.Text.RegularExpressions.Regex(
+                    "\"([^\"]+)\"\\s*:\\s*\\{([^{}]*)\\}",
+                    System.Text.RegularExpressions.RegexOptions.Singleline);
+                var pairRx = new System.Text.RegularExpressions.Regex(
+                    "\"([^\"]+)\"\\s*:\\s*(-?\\d+)");
+                foreach (System.Text.RegularExpressions.Match sec in secRx.Matches(json))
+                {
+                    string section = sec.Groups[1].Value;
+                    foreach (System.Text.RegularExpressions.Match pr in pairRx.Matches(sec.Groups[2].Value))
+                        outLines.Add(section + ":" + pr.Groups[1].Value + "=" + pr.Groups[2].Value);
+                }
+                if (outLines.Count == 0) return null; // nothing recognizable: let the byte hash decide
+                outLines.Sort(StringComparer.Ordinal);
+                return outLines;
+            }
+            catch { return null; }
         }
 
         /// <summary>Install the host's registry over ours, keeping timestamped backups
@@ -135,7 +177,19 @@ namespace CardShopCoop.Util
                 if (File.Exists(p))
                 {
                     var current = File.ReadAllBytes(p);
-                    if (SameBytes(current, hostBytes))
+                    // "already synced" must be a CANONICAL comparison, not bytes: EPL
+                    // rewrites the file at boot, so a byte compare told the user "already
+                    // synced - RESTART" on every attempt while the (equally byte-bound)
+                    // host hash kept rejecting - the two halves of the endless loop. With
+                    // canonical hashing on both sides this branch should rarely fire at
+                    // all; when it does, the registries genuinely agree and the user's
+                    // next join will pass.
+                    var curLines = CanonicalEnumLines(System.Text.Encoding.UTF8.GetString(current));
+                    var newLines = CanonicalEnumLines(System.Text.Encoding.UTF8.GetString(hostBytes));
+                    bool same = curLines != null && newLines != null
+                        ? string.Join("\n", curLines) == string.Join("\n", newLines)
+                        : SameBytes(current, hostBytes);
+                    if (same)
                         return "card database already synced - RESTART the game, then join again";
                     bak = p + ".coopbak-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
                     File.Copy(p, bak, overwrite: true);
@@ -146,6 +200,7 @@ namespace CardShopCoop.Util
                     Directory.CreateDirectory(Path.GetDirectoryName(p));
                 }
                 File.WriteAllBytes(p, hostBytes);
+                _enum = null; // the on-disk registry changed: never serve a stale hash
                 // Drop a marker so the mod KNOWS the machine-global registry is now the HOST's,
                 // not the guest's own. Without a restore path a mismatched-enum join used to
                 // silently brick every modded SOLO save ("data lost") until the file was fixed
@@ -221,6 +276,7 @@ namespace CardShopCoop.Util
                 if (File.Exists(p))
                     File.Copy(p, p + ".hostcopy", overwrite: true);
                 File.Copy(newest, p, overwrite: true);
+                _enum = null; // the on-disk registry changed: never serve a stale hash
                 try { File.Delete(EnumMarkerPath()); } catch { }
                 message = "your card database was restored from backup - RESTART the game before loading your solo saves";
                 return true;

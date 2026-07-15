@@ -5,6 +5,9 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.0.33
+**Hotfix: the endless "custom-card database differed - RESTART" loop (thanks joshepi89).** The database check compared the registry file byte-for-byte - but the prefab loader rewrites that file on every game boot, so two players whose card databases genuinely MATCHED could mismatch forever (sync, restart, rejoin, rejected again - no number of restarts escaped it). The check now compares what the registry actually MEANS (every card/item name and its ID), so identical databases match on the first rejoin, and the "already synced" message can no longer appear in a loop. If the databases genuinely differ, sync + one restart still fixes it as designed. Both players must update - the launcher does it automatically.
+
 ## 1.0.32
 **Hotfix: the guest's serve key going permanently dead ("guest can't interact with npc" - thanks Coke).** A safety guard added in 1.0.29 (don't fire the serve key while typing in a text box) checked whether a game text field was *selected* rather than *actively being edited* - and Unity keeps the last-clicked UI element selected forever, so touching any price box / phone app / website input silently killed the serve key for the rest of the session. It now only suppresses while you are genuinely typing, the co-op window can no longer leave a stale focus behind when closed, and a suppressed press is logged instead of silent - so if a key ever dies again, the log says exactly why. Both players must update - the launcher does it automatically.
 
