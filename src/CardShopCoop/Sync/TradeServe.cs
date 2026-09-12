@@ -500,9 +500,9 @@ namespace CardShopCoop.Sync
                 SoundManager.GenericConfirm();
             }
             catch (System.Exception e) { Swallow.Log(e); }
-            t._awaitingResult = true;
             // keep the offer while the host decides: ApplyOutcome needs it for the refusal fields
-            t.SendOpFor(OpAccept, idx, price, null, clearOffer: false);
+            if (t.SendOpFor(OpAccept, idx, price, null, clearOffer: false))
+                t._awaitingResult = true;
             return false;
         }
 
@@ -1022,9 +1022,20 @@ namespace CardShopCoop.Sync
             float price = message.Price;
             if (op == OpScreen)
             {
+                var sm = Sm();
+                if (sm == null || idx < 0 || idx >= sm.m_CashierCounterList.Count)
+                {
+                    CoopPlugin.Log.LogError($"TradeServe host: rejected invalid screen claim counter {idx} from conn {connId}");
+                    return;
+                }
                 // joiner's screen-open claim (renewed ~2s; expiry is time-based so no
                 // close message is ever needed). Not logged - it's a heartbeat.
                 _guestClaims[idx] = new GuestClaim { Time = Time.realtimeSinceStartupAsDouble, ConnId = connId };
+                return;
+            }
+            if (!_guestClaims.TryGetValue(idx, out var claim) || claim.ConnId != connId)
+            {
+                CoopPlugin.Log.LogWarning($"TradeServe host: rejected answer without claim counter={idx} conn={connId}");
                 return;
             }
             CoopPlugin.Log.LogInfo($"TradeServe host: received {(op == OpAccept ? "accept" : op == OpDecline ? "decline" : "op " + op)} @ counter {idx}, price {price:F2}");
@@ -1563,11 +1574,13 @@ namespace CardShopCoop.Sync
         /// <summary>Client: send one op for a counter with local feedback. Accept keeps the
         /// offer so ApplyOutcome can read the host's post-haggle fields; decline clears it
         /// optimistically (its vanilla body closes the screen immediately).</summary>
-        private void SendOpFor(byte op, int idx, float price, string line, bool clearOffer = true)
+        private bool SendOpFor(byte op, int idx, float price, string line, bool clearOffer = true)
         {
             _opThrottle = 0.5f;
             CoopPlugin.Log.LogInfo($"TradeServe client: sending {(op == OpAccept ? "accept" : "decline")} @ counter {idx}, price {price:F2}");
-            SendOp?.Invoke(new TradeOpMessage { Op = op, CounterIdx = (byte)idx, Price = price });
+            if (SendOp == null)
+                return false;
+            SendOp.Invoke(new TradeOpMessage { Op = op, CounterIdx = (byte)idx, Price = price });
             if (clearOffer)
                 _offers.Remove(idx);
             if (!string.IsNullOrEmpty(line) && CoopCore.Instance != null)
@@ -1575,6 +1588,7 @@ namespace CardShopCoop.Sync
                 CoopCore.Instance.RegisterLine = line;
                 CoopCore.Instance.RegisterLineTimer = 2f;
             }
+            return true;
         }
 
         /// <summary>Client (S1): an accept/decline press landed on a screen with no bound

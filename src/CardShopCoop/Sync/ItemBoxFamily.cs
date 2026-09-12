@@ -103,6 +103,11 @@ namespace CardShopCoop.Sync
             return true;
         }
 
+        public void ApplyLidOnly(InteractablePackagingBox box, bool open)
+        {
+            BoxVisuals.EnsureOpenState(box, open);
+        }
+
         public IList<InteractablePackagingBox> LiveBoxes()
         {
             var src = RestockManager.GetItemPackagingBoxList();
@@ -260,13 +265,18 @@ namespace CardShopCoop.Sync
                     // An open compartment owns actual pooled Item objects. Remove those
                     // objects through the game's API before changing the type or respawning,
                     // otherwise the list count and visible stack diverge.
-                    while (comp.GetItemCount() > 0)
+                    HandEscrow.BeginSuppressNote();
+                    try
                     {
-                        var item = comp.TakeItemToHand();
-                        if (item == null)
-                            break;
-                        item.DisableItem();
+                        while (comp.GetItemCount() > 0)
+                        {
+                            var item = comp.TakeItemToHand();
+                            if (item == null)
+                                break;
+                            item.DisableItem();
+                        }
                     }
+                    finally { HandEscrow.EndSuppressNote(); }
                 }
                 box.SetItemType(type);
                 comp.SetCompartmentItemType(type);

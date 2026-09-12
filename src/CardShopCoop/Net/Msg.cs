@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.IO;
 
 namespace CardShopCoop.Net
@@ -119,6 +120,30 @@ namespace CardShopCoop.Net
         // substantial change behind an existing message requires a minor bump.
         // 1.2.3 therefore becomes 102 (major * 100 + minor).
         public static readonly int WireVersion = DeriveWireVersion(CoopPlugin.Version);
+        private const int DecodeWarningCooldownMs = 2000;
+        private static readonly ConcurrentDictionary<MsgType, int> LastDecodeWarning
+            = new ConcurrentDictionary<MsgType, int>();
+
+        internal static void LogDecodeWarning(MsgType type, string warning)
+        {
+            int now = Environment.TickCount;
+            while (true)
+            {
+                if (LastDecodeWarning.TryGetValue(type, out int last))
+                {
+                    if (unchecked(now - last) < DecodeWarningCooldownMs)
+                        return;
+                    if (!LastDecodeWarning.TryUpdate(type, now, last))
+                        continue;
+                }
+                else if (!LastDecodeWarning.TryAdd(type, now))
+                {
+                    continue;
+                }
+                break;
+            }
+            CoopPlugin.Log?.LogWarning(warning);
+        }
 
         private static int DeriveWireVersion(string version)
         {
@@ -167,7 +192,7 @@ namespace CardShopCoop.Net
             // Decode centrally. A malformed or unknown DTO is DROPPED (return false) so a
             // single bad frame can never unwind a transport pump thread - the same fail-safe
             // the transport used to get from the switch's per-message try/catch. Unknown
-            // message types are logged once per type by MessageRegistry.
+            // message types and malformed payloads are rate-limited per type.
             try
             {
                 message.Message = MessageRegistry.Deserialize(message.Type, payload);
@@ -175,7 +200,8 @@ namespace CardShopCoop.Net
             catch (Exception e)
             {
                 MsgType type = (MsgType)frame[offset + FrameHeaderSize];
-                CoopPlugin.Log?.LogWarning($"discarding malformed {type} frame: {e.GetType().Name}: {e.Message}");
+                if (MessageRegistry.IsKnown(type))
+                    LogDecodeWarning(type, $"discarding malformed {type} frame: {e.GetType().Name}: {e.Message}");
                 return false;
             }
             return true;

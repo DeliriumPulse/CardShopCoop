@@ -171,6 +171,7 @@ namespace CardShopCoop
         private bool _localModelSavePending;
         private float _localModelSaveTimer;
         private readonly WorldSync _world = new WorldSync();
+        internal WorldSync World => _world;
         private readonly NpcSync _npcs = new NpcSync();
         private readonly CardShelfSync _cardShelves = new CardShelfSync();
         private readonly ObjMoveSync _objMoves = new ObjMoveSync();
@@ -258,6 +259,9 @@ namespace CardShopCoop
 
         // client-side save + mod-sidecar download
         private MemoryStream _saveBuf;
+        // Compressed transfers are framed below 64 MB; keep decompression and buffering well
+        // below that so a peer cannot force a hostile allocation while remaining above honest saves.
+        private const int MaxWorldTransferBytes = 32 * 1024 * 1024;
         private int _saveExpected = -1;
         private byte[] _pendingSave;
         private MemoryStream _bundleBuf;
@@ -399,6 +403,7 @@ namespace CardShopCoop
         private float _reloadStartedAt;
         private int _reloadStartedFrame;
         private bool _clientWorldArrived;
+        private bool _sessionInGame;
         /// <summary>True for the entire borrowed-world load: the old world may still be
         /// live before the scene changes, and the new world is only partially constructed
         /// afterward. Hold client-side sync until ShelfManager reports completion.</summary>
@@ -411,6 +416,14 @@ namespace CardShopCoop
             = new System.Collections.Generic.List<InMsg>(64);
         private readonly System.Collections.Generic.List<InMsg> _dispatchRetryNextFrame
             = new System.Collections.Generic.List<InMsg>(8);
+        private readonly System.Collections.Generic.List<InMsg> _dispatchHeldTransfers
+            = new System.Collections.Generic.List<InMsg>(1);
+        private bool _dispatchBacklogWarned;
+        private bool _dispatchDeferredWarned;
+        private bool _dispatchTransferOverflowWarned;
+        private bool _dispatchTransferHardDropWarned;
+        private int _dispatchDeferredFrames;
+        private const int MaxDispatchDeferredFrames = 600;
         private readonly MessageRouter _messageRouter = new MessageRouter();
         private readonly System.Collections.Generic.HashSet<long> _dispatchSeen
             = new System.Collections.Generic.HashSet<long>();
@@ -418,6 +431,7 @@ namespace CardShopCoop
         /// into _dispatchBuf (the coalescer needs the full picture), but applying an unbounded
         /// backlog in one frame is the hitch itself; the remainder keeps its order and waits.</summary>
         private const int DispatchBudget = 256;
+        private const int DispatchBacklogCap = DispatchBudget * 8;
         private const byte MaxDispatchRetries = 3;
         private const int MainThreadActionBudget = 64;
 
@@ -507,10 +521,18 @@ namespace CardShopCoop
             _messageRouter.Register<SprayHitMessage>((context, message) => ApplySprayHit(message),
                 retryable: true, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
             _messageRouter.Register<GradedRemoveMessage>((context, message) => ApplyGradedRemove(context.ConnectionId, message),
-                retryable: true, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                retryable: true, heal: () => CoopPlugin.Log.LogError("Binder heal deferred: GradedRemove requires a full binder resync message, which is a wire change."));
             _ui = new UI.CoopUI();
             _world.OnLocalChanges = OnLocalWorldChanges;
             _world.SendResult = (result, connId) => Send(connId, result);
+            _world.RequestResync = () =>
+            {
+                CoopPlugin.Log.LogWarning("WorldSync requested authoritative shelf resync");
+                if (Role == CoopRole.Host)
+                    Broadcast(new ShelfDeltaMessage { Entries = _world.BuildFullState() });
+                else if (Role == CoopRole.Client)
+                    Send(1, new JoinResyncRequestMessage());
+            };
             _cardShelves.OnLocalChanges = changes =>
             {
                 if (Role == CoopRole.Host)
@@ -618,6 +640,13 @@ namespace CardShopCoop
             _settings.SendOp = Send(1);
             _settings.BroadcastState = Broadcast;
             _market.BroadcastState = Broadcast;
+            _market.RequestResync = () =>
+            {
+                if (Role == CoopRole.Client)
+                    Send(1, new JoinResyncRequestMessage());
+                else
+                    _market.ForceResend();
+            };
             _report.BroadcastState = Broadcast;
             _containers.SendOp = Send(1);
             _containers.BroadcastState = Broadcast;
@@ -1861,6 +1890,11 @@ namespace CardShopCoop
             _net = null;
             DeactivateLiveModuleHooks();
             Role = CoopRole.None;
+            _sessionInGame = false;
+            _dispatchDeferredFrames = 0;
+            _dispatchBuf.Clear();
+            _dispatchRetryNextFrame.Clear();
+            _dispatchHeldTransfers.Clear();
             IsSteamSession = false;
             GuestBorrowedWorld = false;
             HostPassword = "";
@@ -1878,7 +1912,7 @@ namespace CardShopCoop
                 // indexes, so read the structure back fresh instead of diffing against
                 // garbage. Repaired objects start with loader defaults; those defaults must
                 // not be reported as guest edits through any index-based mirror.
-                _world.Reset();
+                _world.InvalidateBaseline();
                 _objMoves.Reset();
                 if (kind == 2 || kind == 3 || kind == 14)
                     _cardShelves.InvalidateBaseline();
@@ -2410,7 +2444,8 @@ namespace CardShopCoop
                 try
                 {
                     MiRemoveHoldItem.Invoke(ipc, new object[] { item });
-                    return;
+                    if (items.IndexOf(item) < 0)
+                        return;
                 }
                 catch (System.Exception e)
                 {
@@ -3474,6 +3509,7 @@ namespace CardShopCoop
             _priceWarnedKeys.Clear(); // the once-per-session warn memo is per session
             _dispatchBuf.Clear();   // leftovers held back by the per-frame dispatch budget
             _dispatchRetryNextFrame.Clear();
+            _dispatchHeldTransfers.Clear();
             _dispatchSeen.Clear();
             _gotStateFrom.Clear();
             _saveBuf = null;
@@ -3552,6 +3588,8 @@ namespace CardShopCoop
             Role = CoopRole.None;
             ClientReloading = false;
             _clientWorldArrived = false;
+            _sessionInGame = false;
+            _dispatchDeferredFrames = 0;
             IsTearingDown = false;
             // Only clear the save guard if we're NOT in a level - i.e. a join that failed at
             // the title before loading the host's world. A mid-session disconnect leaves the
@@ -3691,6 +3729,13 @@ namespace CardShopCoop
             if (_net == null)
                 return;
 
+            if (!_sessionInGame && InGameLevel())
+            {
+                _sessionInGame = true;
+                _dispatchDeferredFrames = 0;
+                CoopPlugin.Log.LogInfo("Dispatch session gate opened after entering the game world");
+            }
+
             Guarded("net-pump", _actNetPump);
 
             // The game forces Application.runInBackground=false (changeFramerate coroutine),
@@ -3726,6 +3771,7 @@ namespace CardShopCoop
                     _playerModels.Remove(left);
                 if (Role == CoopRole.Host)
                 {
+                    _world.HostReleaseConn(left);
                     // release anything the departed guest was CARRYING: the set-down
                     // request is never coming, and without this the boxes stay hidden /
                     // worker-locked / carried-frozen on every peer until a full shutdown
@@ -3796,8 +3842,61 @@ namespace CardShopCoop
             // Anything last frame's budget held back is still at the FRONT of _dispatchBuf, in
             // order; the fresh drain appends after it. The coalescer then re-runs over the
             // combined buffer, so a stale leftover snapshot still loses to a newer one.
-            while (_net != null && _net.Incoming.TryDequeue(out var msg))
+            if (_dispatchHeldTransfers.Count > 0 && _dispatchBuf.Count < DispatchBacklogCap)
+            {
+                _dispatchBuf.Add(_dispatchHeldTransfers[0]);
+                _dispatchHeldTransfers.RemoveAt(0);
+            }
+            bool canDrainIncoming = _dispatchHeldTransfers.Count == 0;
+            while (canDrainIncoming && _net != null && _net.Incoming.TryDequeue(out var msg))
+            {
+                if (_dispatchBuf.Count >= DispatchBacklogCap)
+                {
+                    int drop = FindBufferedSnapshot();
+                    if (drop >= 0)
+                        _dispatchBuf.RemoveAt(drop);
+                    else
+                    {
+                        bool transferMessage = IsTransferMessage(msg.Type);
+                        if (transferMessage)
+                        {
+                            if (!_dispatchTransferOverflowWarned)
+                            {
+                                _dispatchTransferOverflowWarned = true;
+                                CoopPlugin.Log.LogWarning($"Dispatch backlog cap reached; bounding transfer admission for {msg.Type}");
+                            }
+                            _dispatchHeldTransfers.Add(msg);
+                            break;
+                        }
+                        if (!_dispatchBacklogWarned)
+                        {
+                            _dispatchBacklogWarned = true;
+                            CoopPlugin.Log.LogWarning("Dispatch backlog cap reached; dropping incoming traffic until it drains");
+                        }
+                        if (!_dispatchTransferHardDropWarned)
+                        {
+                            _dispatchTransferHardDropWarned = true;
+                            CoopPlugin.Log.LogError($"Dispatch backlog hard-drop path consumed non-transfer message {msg.Type}");
+                        }
+                        // A dropped BoxSnapshot is not self-healing (the host's content hash
+                        // already advanced and it is never re-sent), so ask for a fresh one.
+                        // Use the coalesced/rate-limited request so a sustained flood cannot
+                        // form a request/response loop.
+                        if (msg.Type == MsgType.BoxSnapshot)
+                            _boxEngine?.RequestResyncCoalesced();
+                        else if (IsSingleShotOp(msg.Type))
+                            _messageRouter.Heal(msg.Type);
+                        continue;
+                    }
+                }
                 _dispatchBuf.Add(msg);
+            }
+            if (_dispatchBuf.Count < DispatchBacklogCap / 2)
+            {
+                _dispatchBacklogWarned = false;
+                _dispatchTransferOverflowWarned = false;
+                _dispatchTransferHardDropWarned = false;
+            }
             if (_dispatchBuf.Count > 8)
             {
                 _dispatchSeen.Clear();
@@ -3843,14 +3942,42 @@ namespace CardShopCoop
                     break; // next frame's work
                 dispatched++;
                 unitsSpent += cost;
-                consumed = i + 1;
                 InMsg current = _dispatchBuf[i];
                 try
                 {
-                    Dispatch(current);
+                    if (!Dispatch(current))
+                    {
+                        if (!_sessionInGame)
+                        {
+                            consumed = i + 1;
+                            if (current.Type == MsgType.BoxSnapshot)
+                                _boxEngine?.RequestResyncCoalesced();
+                            continue;
+                        }
+                        _dispatchDeferredFrames++;
+                        if (_dispatchDeferredFrames > MaxDispatchDeferredFrames)
+                        {
+                            CoopPlugin.Log.LogError($"Dispatch: dropping gated head {current.Type} after {MaxDispatchDeferredFrames} deferred frames");
+                            _messageRouter.Heal(current.Type);
+                            consumed = i + 1;
+                            _dispatchDeferredFrames = 0;
+                            continue;
+                        }
+                        if (!_dispatchDeferredWarned)
+                        {
+                            _dispatchDeferredWarned = true;
+                            CoopPlugin.Log.LogWarning($"Dispatch queue waiting for in-game gate before applying {current.Type}");
+                        }
+                        consumed = i;
+                        break;
+                    }
+                    _dispatchDeferredWarned = false;
+                    _dispatchDeferredFrames = 0;
+                    consumed = i + 1;
                 }
                 catch (Exception e)
                 {
+                    consumed = i + 1;
                     bool retryable = _messageRouter.IsRetryable(current.Type);
                     CoopPlugin.Log.LogError($"Dispatch conn={current.ConnId} type={current.Type} "
                         + (retryable ? "delta/op" : "snapshot") + " failed: " + e);
@@ -3881,6 +4008,8 @@ namespace CardShopCoop
                 _dispatchBuf.Clear();
             else if (consumed > 0)
                 _dispatchBuf.RemoveRange(0, consumed);
+            if (_dispatchBuf.Count == 0)
+                _dispatchDeferredWarned = false;
             if (_net == null)
                 return;
 
@@ -4063,6 +4192,24 @@ namespace CardShopCoop
                 Broadcast(new ShelfDeltaMessage { Entries = changes });
             else if (Role == CoopRole.Client)
                 Send(1, new ShelfRequestMessage { Entries = changes });
+        }
+
+        private int FindBufferedSnapshot()
+        {
+            for (int i = 0; i < _dispatchBuf.Count; i++)
+            {
+                var type = _dispatchBuf[i].Type;
+                if (type == MsgType.PlayerState || type == MsgType.RegisterState
+                    || type == MsgType.RegisterCart || type == MsgType.PopState)
+                    return i;
+            }
+            return -1;
+        }
+
+        private static bool IsTransferMessage(MsgType type)
+        {
+            return type == MsgType.BoxUpdate || type == MsgType.BoxTransferResult
+                || type == MsgType.ShelfRequest || type == MsgType.ShelfTransferResult;
         }
 
         /// <summary>Host: one item price entry changed (player/worker/EPL, or a joiner
@@ -4448,16 +4595,22 @@ namespace CardShopCoop
             }
         }
 
-        private void Dispatch(InMsg msg)
+        private bool Dispatch(InMsg msg)
         {
-            if (msg.Message != null && _messageRouter.Dispatch(new MessageContext
+            if (msg.Message != null)
             {
-                ConnectionId = msg.ConnId,
-                Role = Role,
-                InGame = InGameLevel(),
-                Transport = _net
-            }, msg.Message))
-                return;
+                bool routed = _messageRouter.Dispatch(new MessageContext
+                {
+                    ConnectionId = msg.ConnId,
+                    Role = Role,
+                    InGame = InGameLevel(),
+                    Transport = _net
+                }, msg.Message);
+                if (routed)
+                    return true;
+                if (_messageRouter.IsRegistered(msg.Message))
+                    return false;
+            }
             switch (msg.Type)
             {
                 case MsgType.Hello:
@@ -4747,6 +4900,18 @@ namespace CardShopCoop
                                 Shutdown("wire protocol mismatch");
                                 break;
                             }
+                            if (!string.Equals(welcome.Version, CoopPlugin.Version, StringComparison.Ordinal))
+                            {
+                                Shutdown("plugin version mismatch (host " + welcome.Version + ", client " + CoopPlugin.Version + ")");
+                                break;
+                            }
+                            if (welcome.SaveLength <= 0 || welcome.SaveLength > MaxWorldTransferBytes
+                                || welcome.BundleLength < 0 || welcome.BundleLength > MaxWorldTransferBytes)
+                            {
+                                CoopPlugin.Log.LogError($"Welcome advertised invalid transfer lengths save={welcome.SaveLength} bundle={welcome.BundleLength} (cap {MaxWorldTransferBytes})");
+                                Shutdown("invalid world download lengths");
+                                break;
+                            }
                             string hostName = ResolvePeerName(welcome.SteamId, welcome.HostName ?? "");
                             _saveExpected = welcome.SaveLength;
                             _hostSlot = welcome.HostSlot;
@@ -4795,8 +4960,8 @@ namespace CardShopCoop
                             // opened, while the UI can later submit richer CC slider data.
                             EnsureLocalPlayerModel();
                             SubmitLocalPlayerModel();
-                            _saveBuf = new MemoryStream(_saveExpected > 0 ? _saveExpected : 1024);
-                            _bundleBuf = new MemoryStream(_bundleExpected > 0 ? _bundleExpected : 16);
+                            _saveBuf = new MemoryStream(1024);
+                            _bundleBuf = new MemoryStream(1024);
                             StatusLine = $"Downloading {hostName}'s shop ({(_saveExpected + _bundleExpected) / 1024} KB)...";
                         }
                         break;
@@ -4808,6 +4973,12 @@ namespace CardShopCoop
                         if (msg.Message is SaveChunkMessage saveChunk)
                         {
                             var bytes = saveChunk.Data ?? new byte[0];
+                            if (_saveExpected >= 0 && _saveBuf.Length + bytes.Length > _saveExpected)
+                            {
+                                CoopPlugin.Log.LogError($"Save download exceeded advertised length {_saveExpected}; rejecting session");
+                                Shutdown("bad download");
+                                break;
+                            }
                             _saveBuf.Write(bytes, 0, bytes.Length);
                             if (_saveExpected > 0)
                                 StatusLine = $"downloading shop... {Math.Min(100, _saveBuf.Length * 100 / _saveExpected)}%";
@@ -4828,7 +4999,9 @@ namespace CardShopCoop
                         }
                         try
                         {
-                            data = Msg.Gunzip(data);
+                            data = GunzipCappedBytes(data, Msg.MaxFrameSize);
+                            if (data == null)
+                                throw new InvalidDataException("save exceeded decompression cap");
                         }
                         catch
                         {
@@ -4853,6 +5026,12 @@ namespace CardShopCoop
                         if (msg.Message is BundleChunkMessage bundleChunk)
                         {
                             var bytes = bundleChunk.Data ?? new byte[0];
+                            if (_bundleExpected >= 0 && _bundleBuf.Length + bytes.Length > _bundleExpected)
+                            {
+                                CoopPlugin.Log.LogError($"Bundle download exceeded advertised length {_bundleExpected}; rejecting session");
+                                Shutdown("bad download");
+                                break;
+                            }
                             _bundleBuf.Write(bytes, 0, bytes.Length);
                             if (_bundleExpected > 0)
                                 StatusLine = $"downloading mod data... {Math.Min(100, _bundleBuf.Length * 100 / _bundleExpected)}%";
@@ -4889,7 +5068,9 @@ namespace CardShopCoop
                         try
                         {
                             if (bundle.Length > 0)
-                                bundle = Msg.Gunzip(bundle);
+                                bundle = GunzipCappedBytes(bundle, Msg.MaxFrameSize);
+                            if (bundle == null)
+                                throw new InvalidDataException("bundle exceeded decompression cap");
                         }
                         catch (Exception e)
                         {
@@ -4939,7 +5120,9 @@ namespace CardShopCoop
                             break;
                         if (msg.Message is EnumSyncMessage enumSync)
                         {
-                            var hostBytes = Msg.Gunzip(enumSync.Data);
+                            var hostBytes = GunzipCappedBytes(enumSync.Data, Msg.MaxFrameSize);
+                            if (hostBytes == null)
+                                throw new InvalidDataException("enum sync exceeded decompression cap");
                             if (CoopPlugin.AutoSyncCardDatabase.Value)
                             {
                                 StatusLine = Util.ModParity.InstallEnumFile(hostBytes);
@@ -4970,6 +5153,7 @@ namespace CardShopCoop
                         break;
                     }
             }
+            return true;
         }
 
         private void SendWorldTo(int connId)
@@ -5422,6 +5606,32 @@ namespace CardShopCoop
             foreach (int id in _net.ConnIds())
                 if (id != connectionId)
                     _net.Send(id, message);
+        }
+        private static bool IsSingleShotOp(MsgType type)
+        {
+            return type == MsgType.FurnitureBoxOp || type == MsgType.TradeOp
+                || type == MsgType.RegisterOp || type == MsgType.ShopOp
+                || type == MsgType.SettingsOp || type == MsgType.TvOp
+                || type == MsgType.StaffOp || type == MsgType.GradingOp
+                || type == MsgType.ContainerOp;
+        }
+
+        private static byte[] GunzipCappedBytes(byte[] data, int cap)
+        {
+            using (var src = new MemoryStream(data, false))
+            using (var gz = new System.IO.Compression.GZipStream(src, System.IO.Compression.CompressionMode.Decompress))
+            using (var dst = new MemoryStream())
+            {
+                var buffer = new byte[8192];
+                int n;
+                while ((n = gz.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    if (dst.Length + n > cap)
+                        throw new InvalidDataException("decompressed payload exceeds cap " + cap);
+                    dst.Write(buffer, 0, n);
+                }
+                return dst.ToArray();
+            }
         }
     }
 }

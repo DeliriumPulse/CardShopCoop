@@ -155,7 +155,11 @@ namespace CardShopCoop.Sync
             try
             {
                 controller.OnExitHoldBoxMode();
-                box.OnDestroyed();
+                try
+                {
+                    box.OnDestroyed();
+                }
+                catch (Exception e) { CoopPlugin.Log.LogError($"FurnitureBoxOps: client sell destroy failed for {box.name}; sale was forwarded but not completed: {e}"); }
                 BoxFields.HoldingBoxShelf?.SetValue(controller, null);
             }
             finally { ApplyingRemote = false; }
@@ -290,17 +294,22 @@ namespace CardShopCoop.Sync
             float salePrice = purchase.price / 2f;
             CoopPlugin.Log.LogInfo($"FurnitureBoxOps: sell accepted connId={connId} type={obj.m_ObjectType}");
             BoxShared.DebugLog("furniture-op", $"host: accepting guest sale of {obj.m_ObjectType} for {salePrice}");
-            PriceChangeManager.AddTransaction(salePrice, ETransactionType.SellFurniture, (int)obj.m_ObjectType);
-            CEventManager.QueueEvent(new CEventPlayer_AddCoin(salePrice));
             ApplyingRemote = true;
+            bool destroyed = false;
             try
             {
                 if (box != null)
                     box.OnDestroyed();
                 else
                     obj.OnDestroyed();
+                destroyed = true;
             }
+            catch (Exception e) { CoopPlugin.Log.LogError($"FurnitureBoxOps: sell destroy failed connId={connId} type={obj.m_ObjectType}; no credit issued: {e}"); }
             finally { ApplyingRemote = false; }
+            if (!destroyed)
+                return;
+            PriceChangeManager.AddTransaction(salePrice, ETransactionType.SellFurniture, (int)obj.m_ObjectType);
+            CEventManager.QueueEvent(new CEventPlayer_AddCoin(salePrice));
             if (box != null)
                 Engine?.ForgetHostBox(Engine.EnsureHostId(box));
             CoopCore.Instance?.NotifyHostStructureChanged();

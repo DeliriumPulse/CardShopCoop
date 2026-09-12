@@ -36,6 +36,7 @@ namespace CardShopCoop.Sync
         public static bool ApplyingRemote;
 
         public Action<INetMessage> BroadcastState; // set by CoopCore: host -> clients
+        public Action RequestResync;
 
         private int _lastAppliedGen; // client: which host roll's history append already ran
 
@@ -106,7 +107,10 @@ namespace CardShopCoop.Sync
 
         public override void ForceResend()
         {
-            s_dirty = true;
+            if (CoopCore.Role == CoopRole.Client)
+                RequestResync?.Invoke();
+            else
+                s_dirty = true;
         }
 
         // ---------------- patches ----------------

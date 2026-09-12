@@ -42,10 +42,16 @@ namespace CardShopCoop.Net
             Type messageType;
             if (!Types.TryGetValue(type, out messageType))
             {
-                CoopPlugin.Log.LogWarning("network: no DTO registered for message type " + type + " - frame dropped");
+                Msg.LogDecodeWarning(type,
+                    "network: no DTO registered for message type " + type + " - frame dropped");
                 throw new InvalidDataException("No DTO registered for " + type);
             }
             return WireCodec.Deserialize(messageType, payload ?? new byte[0]);
+        }
+
+        internal static bool IsKnown(MsgType type)
+        {
+            return Types.ContainsKey(type);
         }
     }
 }

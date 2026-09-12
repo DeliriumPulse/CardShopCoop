@@ -35,6 +35,7 @@ namespace CardShopCoop.Net
         // the buffer so a pathological value can never grow memory without bound.
         private const int MaxDelayMs = 60000;
         private const int MaxBufferedFrames = 20000;
+        private const long MaxBufferedBytes = 64L * 1024 * 1024;
         private static readonly double TicksPerMs = Stopwatch.Frequency / 1000.0;
 
         private readonly ICoopTransport _inner;
@@ -42,6 +43,7 @@ namespace CardShopCoop.Net
         private readonly Queue<Pending> _delay = new Queue<Pending>();
         private readonly Random _random = new Random();
         private bool _overflowWarned;
+        private long _delayBytes;
 
         private LagTransport(ICoopTransport inner)
         {
@@ -135,6 +137,12 @@ namespace CardShopCoop.Net
         public void Stop()
         {
             _inner.Stop();
+            while (_incoming.TryDequeue(out _))
+            {
+            }
+            _delay.Clear();
+            _delayBytes = 0;
+            _overflowWarned = false;
         }
 
         public void PumpMainThread()
@@ -150,7 +158,7 @@ namespace CardShopCoop.Net
 
             while (_inner.Incoming.TryDequeue(out InMsg msg))
             {
-                if (_delay.Count >= MaxBufferedFrames)
+                if (_delay.Count >= MaxBufferedFrames || _delayBytes >= MaxBufferedBytes)
                 {
                     // Safety valve: a huge delay must never let the buffer grow without
                     // bound. Release the oldest frame undelayed and warn once; newer frames
@@ -161,7 +169,9 @@ namespace CardShopCoop.Net
                         CoopPlugin.Log?.LogWarning("LagTransport: delay buffer reached "
                             + MaxBufferedFrames + " frames - releasing the oldest frames without delay");
                     }
-                    _incoming.Enqueue(_delay.Dequeue().Message);
+                    var released = _delay.Dequeue().Message;
+                    _incoming.Enqueue(released);
+                    _delayBytes = Math.Max(0, _delayBytes - EstimateBytes(released));
                 }
                 int extra = jitter > 0 ? _random.Next(-jitter, jitter + 1) : 0;
                 int delayMs = lag + extra;
@@ -172,10 +182,17 @@ namespace CardShopCoop.Net
                     ReleaseAt = now + (long)(delayMs * TicksPerMs),
                     Message = msg,
                 });
+                _delayBytes += EstimateBytes(msg);
             }
 
             while (_delay.Count > 0 && _delay.Peek().ReleaseAt <= now)
-                _incoming.Enqueue(_delay.Dequeue().Message);
+            {
+                var released = _delay.Dequeue().Message;
+                _incoming.Enqueue(released);
+                _delayBytes = Math.Max(0, _delayBytes - EstimateBytes(released));
+            }
+            if (_delay.Count < MaxBufferedFrames / 2 && _delayBytes < MaxBufferedBytes / 2)
+                _overflowWarned = false;
         }
 
         private static int ClampMs(int value)
@@ -183,6 +200,11 @@ namespace CardShopCoop.Net
             if (value < 0)
                 return 0;
             return value > MaxDelayMs ? MaxDelayMs : value;
+        }
+
+        private static int EstimateBytes(InMsg message)
+        {
+            return message.Message == null ? Msg.MinimumFrameSize : NetMessageCodec.Encode(message.Message).Length;
         }
 
         public void Dispose()

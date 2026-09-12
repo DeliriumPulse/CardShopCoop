@@ -36,6 +36,11 @@ namespace CardShopCoop.Sync
             return false;
         }
 
+        public void ApplyLidOnly(InteractablePackagingBox box, bool open)
+        {
+            BoxVisuals.EnsureOpenState(box, open);
+        }
+
         public IList<InteractablePackagingBox> LiveBoxes()
         {
             var src = RestockManager.GetCardPackagingBoxList();
@@ -96,6 +101,11 @@ namespace CardShopCoop.Sync
             int h = 17;
             h = h * 31 + (int)c.monsterType;
             h = h * 31 + (int)c.expansionType;
+            h = h * 31 + (int)c.borderType;
+            h = h * 31 + c.cardGrade;
+            h = h * 31 + (c.isDestiny ? 1 : 0);
+            h = h * 31 + (c.isChampionCard ? 1 : 0);
+            h = h * 31 + c.gradedCardIndex;
             h = h * 31 + (c.isFoil ? 1 : 0);
             return h;
         }

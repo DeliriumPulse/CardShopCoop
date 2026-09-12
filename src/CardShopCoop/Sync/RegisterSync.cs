@@ -736,6 +736,15 @@ namespace CardShopCoop.Sync
         // ---------------- host op application ----------------
         public void HostApplyOp(RegisterOpMessage message, int connId)
         {
+            try
+            {
+                HostApplyOpInner(message, connId);
+            }
+            catch (System.Exception e) { CoopPlugin.Log.LogError($"RegisterSync: op apply failed connId={connId}: {e}"); }
+        }
+
+        private void HostApplyOpInner(RegisterOpMessage message, int connId)
+        {
             int idx = message.Index;
             byte op = message.Op;
             var sm = Sm();

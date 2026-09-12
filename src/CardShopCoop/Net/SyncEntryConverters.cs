@@ -76,7 +76,7 @@ namespace CardShopCoop.Net
                 TransferType = wireTransfer < 0
                     ? -1
                     : Util.EnumMap.FromWire(Util.EnumKind.ItemType, wireTransfer),
-                TransferSeq = (uint)SyncJson.Int(o, "TransferSeq"),
+                TransferSeq = Convert.ToUInt32(o["TransferSeq"], System.Globalization.CultureInfo.InvariantCulture),
             };
         }
     }

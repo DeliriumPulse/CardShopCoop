@@ -86,6 +86,31 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
   exactly like the host can. Money and cards still change once, on the host. If a player
   disconnects mid-trade, the host immediately releases that customer and the guest's screen is
   closed cleanly instead of being left open.
+- **Fixed: an item you picked up could be placed or opened before the host confirmed the pickup,
+  and a delayed or rejected transfer could leave two copies of the same item.** A pickup is now
+  held and protected from the moment you take it, and an answer the game is slow to deliver is
+  retried until the host confirms it instead of being treated as accepted after a timeout. This
+  covers taking an item off a shelf and immediately using it, and adding or removing items while
+  the other player is editing the same box.
+- **Fixed: opening or closing a loose box without picking it up did not update the lid on the
+  other player's screen.** A guest can now open, close, add to, and take from a loose box, and the
+  lid and contents stay consistent for both players.
+- **Fixed: after stopping and starting a session, hiring or interacting with a worker and changing
+  shop settings (decorations, equipment, game-event fees, cashiers, and table numbers) could
+  silently stop working.** The affected systems now reconnect on every session.
+- **Fixed: a card placed on a display that the host never confirmed could stay on the shelf
+  forever without a word.** The card is now kept safely on the display and you are told it is still
+  waiting for the host, instead of the shelf quietly disagreeing; if the host explicitly rejects
+  the placement, the card is returned to the binder.
+- **Fixed: opening a graded-card return box could fail with a misleading "save drift" message.**
+  Failures now explain the real reason, including when the other player is holding the box or is
+  missing a card content pack.
+- The SETTINGS tab gained **latency testing** sliders that add artificial delay and jitter to
+  incoming network traffic, so connection problems can be reproduced on purpose.
+- **Item transfers are now confirmed by a single answer from the host instead of being retried in
+  the background.** A pickup or placement is decided once: it either goes through or the item is
+  returned exactly once, so a slow connection cannot cause repeated retries or leave an item caught
+  between the two players.
 
 Both players must update.
 

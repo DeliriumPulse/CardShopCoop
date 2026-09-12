@@ -101,7 +101,11 @@ namespace CardShopCoop.Net
             if (r.TokenType != JsonToken.StartArray)
                 throw new JsonSerializationException("Expected vector array");
             while (r.Read() && r.TokenType != JsonToken.EndArray)
+            {
+                if (a.Count >= count)
+                    throw new JsonSerializationException("Too many vector components");
                 a.Add(r.Value);
+            }
             if (a.Count != count)
                 throw new JsonSerializationException("Wrong vector component count");
             return a;
@@ -130,7 +134,11 @@ namespace CardShopCoop.Net
             if (r.TokenType != JsonToken.StartArray)
                 throw new JsonSerializationException("Expected quaternion array");
             while (r.Read() && r.TokenType != JsonToken.EndArray)
+            {
+                if (a.Count >= 4)
+                    throw new JsonSerializationException("Too many quaternion components");
                 a.Add(r.Value);
+            }
             if (a.Count != 4)
                 throw new JsonSerializationException("Wrong quaternion component count");
             return new Quaternion(Convert.ToSingle(a[0], CultureInfo.InvariantCulture), Convert.ToSingle(a[1], CultureInfo.InvariantCulture), Convert.ToSingle(a[2], CultureInfo.InvariantCulture), Convert.ToSingle(a[3], CultureInfo.InvariantCulture));

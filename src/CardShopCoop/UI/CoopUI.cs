@@ -161,18 +161,15 @@ namespace CardShopCoop.UI
             }
             if (core.RegisterLine.Length > 0)
             {
-                if (core.RegisterLine.Length > 0)
+                if (core.RegisterLine != _registerSeen)
                 {
-                    if (core.RegisterLine != _registerSeen)
-                    {
-                        _registerSeen = core.RegisterLine;
-                        _registerText = $"<size=18><color=#8ef58a>{core.RegisterLine}</color></size>";
-                        _registerGc = new GUIContent(_registerText);
-                    }
-                    Vector2 sz = CoopTheme.PillSize(CoopTheme.HudPillBig, _registerGc, 740f);
-                    GUI.Label(new Rect((Screen.width - sz.x) / 2f, Screen.height * 0.63f, sz.x, sz.y),
-                        _registerGc, CoopTheme.HudPillBig);
+                    _registerSeen = core.RegisterLine;
+                    _registerText = $"<size=18><color=#8ef58a>{core.RegisterLine}</color></size>";
+                    _registerGc = new GUIContent(_registerText);
                 }
+                Vector2 sz = CoopTheme.PillSize(CoopTheme.HudPillBig, _registerGc, 740f);
+                GUI.Label(new Rect((Screen.width - sz.x) / 2f, Screen.height * 0.63f, sz.x, sz.y),
+                    _registerGc, CoopTheme.HudPillBig);
             }
             if (!Visible)
             {

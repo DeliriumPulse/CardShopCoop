@@ -461,9 +461,10 @@ namespace CardShopCoop.Patches
         /// shelf), not the box object, so a box take is invisible to the box engine until the
         /// round-robin reaches the box. Mark the owning box dirty so the take is reported (and
         /// escrowed) on the next tick instead of after a player-action window.</summary>
-        public static void TakeItemToHandPostfix(ShelfCompartment __instance)
+        public static void TakeItemToHandPostfix(ShelfCompartment __instance, Item __result)
         {
             ObjectMutationPostfix();
+            HandEscrow.NoteTakenItem(__result);
             if (__instance != null)
                 CoopCore.Instance?.Boxes?.MarkClientCompartmentDirty(__instance);
         }
@@ -1167,7 +1168,7 @@ namespace CardShopCoop.Patches
 
         public static bool ReservedDisableItemPrefix(Item __instance)
         {
-            return !HandEscrow.IsReserved(__instance);
+            return !HandEscrow.IsReserved(__instance) || !HandEscrow.IsInLocalHand(__instance);
         }
 
         public static void NpcMoneyPopupPostfix(PricePopupSpawner __instance, float price,

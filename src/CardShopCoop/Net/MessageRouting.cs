@@ -87,9 +87,14 @@ namespace CardShopCoop.Net
             if (!_routes.TryGetValue(message.GetType(), out route))
                 return false;
             if (!Allowed(route.Policy, context))
-                return true;
+                return false;
             route.Handler(context, message);
             return true;
+        }
+
+        public bool IsRegistered(INetMessage message)
+        {
+            return message != null && _routes.ContainsKey(message.GetType());
         }
 
         /// <summary>True when a failed dispatch of this type should be retried.</summary>

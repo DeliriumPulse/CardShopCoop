@@ -84,6 +84,8 @@ namespace CardShopCoop.Sync
             Instance = this;
         }
 
+        public override void Start() => Instance = this;
+
         protected override void OnHostTick(in SyncFrame frame) => HostTick(frame.Dt, frame.InGame);
 
         public override void Reset()

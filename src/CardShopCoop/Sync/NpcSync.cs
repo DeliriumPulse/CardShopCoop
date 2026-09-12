@@ -89,6 +89,7 @@ namespace CardShopCoop.Sync
         private readonly Dictionary<int, bool> _workerActive = new Dictionary<int, bool>();
         private readonly Dictionary<int, ExistingCustomer> _existing = new Dictionary<int, ExistingCustomer>();
         private static NpcSync _live;
+        private bool _missingHoldFieldLogged;
 
         public override string Name => "npcs";
 
@@ -147,6 +148,7 @@ namespace CardShopCoop.Sync
             if (CoopCore.Role != CoopRole.None && !CoopCore.IsTearingDown)
                 _live = this;
             _cm = null;
+            _missingHoldFieldLogged = false;
             _sendTimer = 0f;
             _nameRefreshIn = 0f;
             _sentNames.Clear();
@@ -265,7 +267,12 @@ namespace CardShopCoop.Sync
                     // worker names aren't prefixed "Female", so gender must ride a flag or
                     // female workers spawn from the male customer prefab on the guest
                     var wflags = CollectFlags(w.m_Anim);
-                    var holdBox = FiCurrentHoldItemBox.GetValue(w) as InteractablePackagingBox_Item;
+                    if (FiCurrentHoldItemBox == null && !_missingHoldFieldLogged)
+                    {
+                        _missingHoldFieldLogged = true;
+                        CoopPlugin.Log.LogError("NpcSync: Worker hold-item field is missing; holding-box visuals disabled");
+                    }
+                    var holdBox = FiCurrentHoldItemBox == null ? null : FiCurrentHoldItemBox.GetValue(w) as InteractablePackagingBox_Item;
                     bool holdBig = false;
                     int holdItemType = 0;
                     if (holdBox != null)

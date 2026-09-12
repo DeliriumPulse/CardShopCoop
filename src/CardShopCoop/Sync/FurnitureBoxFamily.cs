@@ -40,6 +40,11 @@ namespace CardShopCoop.Sync
             return false;
         }
 
+        public void ApplyLidOnly(InteractablePackagingBox box, bool open)
+        {
+            BoxVisuals.EnsureOpenState(box, open);
+        }
+
         public IList<InteractablePackagingBox> LiveBoxes()
         {
             var src = RestockManager.GetShelfPackagingBoxList();

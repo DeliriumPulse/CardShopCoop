@@ -48,7 +48,7 @@ namespace CardShopCoop
             // Log may be null very early in plugin startup; never let diagnostics throw.
             try
             {
-                CoopPlugin.Log?.LogWarning("[caught] " + site + ": " + e.GetType().Name + ": " + e.Message);
+                CoopPlugin.Log?.LogWarning("[caught] " + site + ": " + e);
             }
             catch
             {

@@ -153,6 +153,7 @@ namespace CardShopCoop.Sync
         // the separate BoxRemoved message for the atomic path; the host consumes the same stable
         // id only after validating the storage slot.
         private static InteractablePackagingBox_Item _suppressedStorageDestroy;
+        private static int _suppressedStorageDestroyFrame = -1;
         /// <summary>Client: cleanser reconcile-catch throttle, keyed PER CONTAINER INDEX. A single
         /// shared timestamp made the machines compete for one 10s window - the first cleanser to
         /// fault printed, and every other cleanser faulting in that window was silenced, so a shop
@@ -230,6 +231,7 @@ namespace CardShopCoop.Sync
             Instance = null;
             ApplyingRemote = false;
             _suppressedStorageDestroy = null;
+            _suppressedStorageDestroyFrame = -1;
         }
 
         public static void ActivateLive(ContainerSync instance)
@@ -253,6 +255,7 @@ namespace CardShopCoop.Sync
             _pendingBoxTakeSlots.Clear();
             _waitingBoxTakeStorages.Clear();
             _suppressedStorageDestroy = null;
+            _suppressedStorageDestroyFrame = -1;
             // container indices are re-derived per world, so a kept timestamp would throttle a
             // DIFFERENT machine in the next session
             _lastCleanserWarn.Clear();
@@ -1324,7 +1327,15 @@ namespace CardShopCoop.Sync
         {
             if (box == null || !ReferenceEquals(_suppressedStorageDestroy, box))
                 return false;
+            if (Time.frameCount != _suppressedStorageDestroyFrame)
+            {
+                CoopPlugin.Log.LogWarning($"ContainerSync: refused stale storage destroy suppression for {box.name}; armed frame {_suppressedStorageDestroyFrame}, current frame {Time.frameCount}");
+                _suppressedStorageDestroy = null;
+                _suppressedStorageDestroyFrame = -1;
+                return false;
+            }
             _suppressedStorageDestroy = null;
+            _suppressedStorageDestroyFrame = -1;
             return true;
         }
 
@@ -1591,6 +1602,7 @@ namespace CardShopCoop.Sync
             __state.BoxBig = packagingBox.m_IsBigBox;
             __state.Atomic = true;
             _suppressedStorageDestroy = packagingBox;
+            _suppressedStorageDestroyFrame = Time.frameCount;
             return true;
         }
 
@@ -1599,7 +1611,10 @@ namespace CardShopCoop.Sync
             if (CoopCore.Role != CoopRole.Client || ApplyingRemote)
             {
                 if (__state.Atomic && ReferenceEquals(_suppressedStorageDestroy, __state.Box))
+                {
                     _suppressedStorageDestroy = null;
+                    _suppressedStorageDestroyFrame = -1;
+                }
                 return;
             }
             // vanilla StoreBox has four rejection exits; only a grown count means the
@@ -1608,7 +1623,10 @@ namespace CardShopCoop.Sync
             if (__instance.GetBoxStoredCount() <= __state.Count)
             {
                 if (__state.Atomic && ReferenceEquals(_suppressedStorageDestroy, __state.Box))
+                {
                     _suppressedStorageDestroy = null;
+                    _suppressedStorageDestroyFrame = -1;
+                }
                 return;
             }
             var self = Instance;

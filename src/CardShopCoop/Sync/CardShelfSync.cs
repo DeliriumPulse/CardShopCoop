@@ -84,7 +84,7 @@ namespace CardShopCoop.Sync
         private readonly Dictionary<int, PendingPlacement> _pendingPlacements = new Dictionary<int, PendingPlacement>();
         private float _pendingResendTimer;
         private const float PendingResendInterval = 2.0f;
-        private const int PendingResendMax = 15; // ~30s, then leave the slot local (never delete)
+        private const int PendingResendMax = 15; // ~30s, then stop resending but keep the card flagged on the display
 
         /// <summary>Live instance, for the card-compartment placement patch. Mirrors
         /// PlayTableSync.Active; the module registry owns Start/Dispose.</summary>
@@ -509,7 +509,26 @@ namespace CardShopCoop.Sync
                 int key = keys[i];
                 var p = _pendingPlacements[key];
                 if (p.Attempts >= PendingResendMax)
-                    continue; // bounded: the card stays local, never deleted
+                {
+                    if (p.Attempts == PendingResendMax)
+                    {
+                        // Stop resending but KEEP the placement tracked. Banking the card while it
+                        // may already sit on the host's display would duplicate it; clearing the
+                        // local slot could destroy the only copy. Instead notify once and leave it
+                        // flagged so a later host echo still resolves it.
+                        p.Attempts++;
+                        _pendingPlacements[key] = p;
+                        CoopPlugin.Log.LogWarning(
+                            $"CardShelfSync: placement for {CardName(p.Card)} at {key:X} still unconfirmed after {PendingResendMax} attempts; keeping it on the display and waiting for the host");
+                        CoopCore.Instance?.World?.RequestResync?.Invoke();
+                        if (CoopCore.Instance != null)
+                        {
+                            CoopCore.Instance.RegisterLine = "a placed card is waiting for the host to confirm - it is safe on the display";
+                            CoopCore.Instance.RegisterLineTimer = 6f;
+                        }
+                    }
+                    continue;
+                }
                 p.Attempts++;
                 _pendingPlacements[key] = p;
                 _locallyChanged[key] = Time.realtimeSinceStartupAsDouble;

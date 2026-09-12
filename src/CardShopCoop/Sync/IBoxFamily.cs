@@ -48,6 +48,9 @@ namespace CardShopCoop.Sync
         /// returns 0 for families without a mutable count.</summary>
         int ReadItemType(InteractablePackagingBox box);
 
+        /// <summary>Apply only the lid state; never changes box content.</summary>
+        void ApplyLidOnly(InteractablePackagingBox box, bool open);
+
         IList<InteractablePackagingBox> LiveBoxes();
 
         /// <summary>Reads the family content into the wire entry (host snapshot / client report).</summary>
