@@ -8,6 +8,16 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 ## 1.2.0
 **Boxes and furniture now stay in sync through pickups, throws, placement, and joining, and cards no longer vanish when a guest sets them out to sell or is holding them.**
 
+- **Fixed: a shelf placed during the session wouldn't let the other player stock it.** A brand-new
+  shelf hadn't worked out how many items fit yet, so the game treated it as full for the other
+  player only — your item jumped straight back into your hand while the shelf showed the product's
+  label with nothing underneath it. The host now works out the shelf's real capacity when the first
+  item arrives, so either player can stock a new shelf immediately, and a shelf that genuinely can't
+  fit the item still refuses it cleanly.
+- **Fixed: removing a label from a warehouse rack didn't update the other player.** Right-clicking a
+  warehouse rack's tag cleared the label on your screen but the other player's rack kept it. Warehouse
+  rack labels now sync like ordinary shelf labels, without touching the boxes stored on the rack.
+
 - **Fixed: a guest manning a register could get stuck after a sale — the money drawer stayed
   open, the received/total/change screen never cleared, and the guest could not interact or
   open the pause menu.** The guest now runs the game's own register completion, the host
