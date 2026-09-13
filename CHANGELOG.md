@@ -8,6 +8,18 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 ## 1.2.0
 **Boxes and furniture now stay in sync through pickups, throws, placement, and joining, and cards no longer vanish when a guest sets them out to sell or is holding them.**
 
+- **Fixed: a guest manning a register could get stuck after a sale — the money drawer stayed
+  open, the received/total/change screen never cleared, and the guest could not interact or
+  open the pause menu.** The guest now runs the game's own register completion, the host
+  validates every action and asks the guest to reset if the two disagree, and the drawer,
+  payment screen and card reader are released properly.
+- **Fixed: money a player had already taken out during checkout was invisible to a client who
+  took over that register, and the finish could be refused.** Every change click is now
+  mirrored to the other player and the live change state rides the register snapshot, so the
+  money on the table and the change total match for everyone.
+- Fixed: a player standing near another player's register could scan items or take change there.
+- Fixed: a register could be left with frozen coins or a floating card reader after a sale.
+
 - **Fixed: a card a guest placed on a display could be deleted by a later sync instead of
   returning to the binder.** A card leaves your collection the moment you pick it up, so until
   the host confirms it is on the display, the card in your hand or on the shelf is the only copy.

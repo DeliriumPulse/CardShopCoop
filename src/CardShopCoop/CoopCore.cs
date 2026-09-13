@@ -632,6 +632,8 @@ namespace CardShopCoop
             _register.SendOp = Send(1);
             _register.BroadcastState = Broadcast;
             _register.BroadcastCart = Broadcast;
+            _register.BroadcastChange = Broadcast;
+            _register.SendToClient = Send;
             _staff.SendOp = Send(1);
             _staff.BroadcastState = Broadcast;
             _staff.SendToClient = Send;
@@ -4102,7 +4104,7 @@ namespace CardShopCoop
                     {
                         int local = NpcSync.CountLocalActiveNpcs();
                         npcStr = Role == CoopRole.Client
-                            ? $" puppets={_npcs.PuppetCount} localNpcs={local}(should be 0)"
+                            ? $" puppets={_npcs.PuppetCount} localNpcs={NpcSync.CountUnexpectedActiveNpcs()}(should be 0) carriers={RegisterSync.CarrierCount} mirrors={NpcSync.ExistingMirrorCount}"
                             : $" liveNpcs={local}";
                     }
                     catch (System.Exception e) { Swallow.Log(e); }
@@ -5630,7 +5632,8 @@ namespace CardShopCoop
         private static bool IsSingleShotOp(MsgType type)
         {
             return type == MsgType.FurnitureBoxOp || type == MsgType.TradeOp
-                || type == MsgType.RegisterOp || type == MsgType.ShopOp
+                || type == MsgType.RegisterOp || type == MsgType.RegisterRejected
+                || type == MsgType.ShopOp
                 || type == MsgType.SettingsOp || type == MsgType.TvOp
                 || type == MsgType.StaffOp || type == MsgType.GradingOp
                 || type == MsgType.ContainerOp;

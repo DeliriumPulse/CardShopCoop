@@ -95,6 +95,7 @@ namespace CardShopCoop.Net
         NpcMoneyPopup = 97,   // host -> client: green money popup above a customer
         BoxTransferResult = 98, // host -> sender: how much of a loose-box item delta was accepted
         ShelfTransferResult = 99, // host -> sender: how much of a shelf item delta was accepted
+        RegisterRejected = 100, // host -> client: a register op was rejected; reset that counter
     }
 
     /// <summary>One received message, already reassembled and decoded from the wire.

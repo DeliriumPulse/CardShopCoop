@@ -1530,6 +1530,7 @@ namespace CardShopCoop.Sync
             }
             if (_carrierSource.TryGetValue(counterIdx, out var source))
                 NpcSync.DetachExistingCustomer(source, carrier);
+            carrier.gameObject.SetActive(false);
             _carriers.Remove(counterIdx);
             _carrierSource.Remove(counterIdx);
             _carrierGeneration.Remove(counterIdx);

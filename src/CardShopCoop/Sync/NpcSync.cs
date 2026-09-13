@@ -639,6 +639,34 @@ namespace CardShopCoop.Sync
             return n;
         }
 
+        /// <summary>Client diagnostic: active local NPCs which are not intentional register
+        /// carriers or NpcSync customer mirrors.</summary>
+        public static int CountUnexpectedActiveNpcs()
+        {
+            if (s_diagCm == null)
+                s_diagCm = Object.FindObjectOfType<CustomerManager>();
+            int n = 0;
+            if (s_diagCm != null)
+            {
+                var list = s_diagCm.GetCustomerList();
+                for (int i = 0; i < list.Count; i++)
+                {
+                    var customer = list[i];
+                    if (customer != null && customer.gameObject.activeSelf
+                        && !RegisterSync.IsCarrier(customer) && !IsExistingCustomer(customer))
+                        n++;
+                }
+            }
+            var workers = WorkerManager.GetWorkerList();
+            if (workers != null)
+                for (int i = 0; i < workers.Count; i++)
+                    if (workers[i] != null && workers[i].gameObject.activeSelf)
+                        n++;
+            return n;
+        }
+
+        public static int ExistingMirrorCount => _live == null ? 0 : _live._existing.Count;
+
         public void ClearPuppets()
         {
             foreach (var p in _puppets.Values)
@@ -753,18 +781,23 @@ namespace CardShopCoop.Sync
         {
             if (_live == null)
                 return;
-            SuppressedCustomer.Remove(index);
             int key = (KindCustomer << 16) | index;
-            if (_live._puppets.TryGetValue(key, out var puppet) && puppet.Go != null && puppet.BufCount > 0)
+            // The list index can be reused by a newer pooled customer. Only tear down the mirror
+            // registry entries that still belong to the customer being detached, so an old
+            // teardown can never hide or de-suppress a newer customer that took the same slot.
+            bool ownsMirror = _live._existing.TryGetValue(index, out var existing)
+                && (customer == null || ReferenceEquals(existing.Customer, customer));
+            if (ownsMirror)
             {
                 _live._existing.Remove(index);
-                puppet.Go.SetActive(true);
-                if (customer != null)
-                    customer.gameObject.SetActive(false);
+                SuppressedCustomer.Remove(index);
+                if (_live._puppets.TryGetValue(key, out var puppet) && puppet.Go != null && puppet.BufCount > 0)
+                    puppet.Go.SetActive(true);
             }
-            // If the puppet has not received a usable snapshot yet, retain the existing
-            // customer mirror as the visible representation. It will continue interpolating
-            // until the puppet is ready, so checkout can never create a one-frame disappearance.
+            // The caller owns the real carrier it passes in: always take it off the scene.
+            // A ready puppet was revealed above; if none exists yet, the next snapshot spawns it.
+            if (customer != null)
+                customer.gameObject.SetActive(false);
         }
 
         public static void AttachExistingCustomer(int index, int generation, Customer customer, bool keepPuppetVisible = false)
@@ -1181,7 +1214,12 @@ namespace CardShopCoop.Sync
             }
             if (existingDead != null)
                 foreach (int key in existingDead)
+                {
+                    // The mirror timed out and was hidden: release the suppression too, or the
+                    // next puppet that reuses this list slot would stay hidden until Reset.
                     _existing.Remove(key);
+                    SuppressedCustomer.Remove(key);
+                }
         }
 
         private static void SampleExisting(ExistingCustomer mirror, float renderTime,
