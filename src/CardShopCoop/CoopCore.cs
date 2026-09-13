@@ -526,6 +526,7 @@ namespace CardShopCoop
             _ui = new UI.CoopUI();
             _world.OnLocalChanges = OnLocalWorldChanges;
             _world.SendResult = (result, connId) => Send(connId, result);
+            _world.SendBoxPull = message => Send(1, message);
             _world.RequestResync = () =>
             {
                 CoopPlugin.Log.LogWarning("WorldSync requested authoritative shelf resync");
@@ -1995,6 +1996,9 @@ namespace CardShopCoop
             if (message != null && Role == CoopRole.Client)
                 Send(1, message);
         }
+
+        internal void RequestShelfBoxPull(InteractablePackagingBox_Item box, ShelfCompartment source)
+            => _world.RequestBoxPull(box, source, _boxEngine);
 
         private void NpcSweepTick()
         {
@@ -5649,7 +5653,7 @@ namespace CardShopCoop
                 || type == MsgType.ShopOp
                 || type == MsgType.SettingsOp || type == MsgType.TvOp
                 || type == MsgType.StaffOp || type == MsgType.GradingOp
-                || type == MsgType.ContainerOp;
+                || type == MsgType.ContainerOp || type == MsgType.ShelfBoxPull;
         }
 
         private static byte[] GunzipCappedBytes(byte[] data, int cap)

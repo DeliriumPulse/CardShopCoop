@@ -30,6 +30,10 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
   could not be unticked there.** The guest's worker mirror was built without the list those
   checkboxes use, so the boxes could not be changed and no change reached the host. That list is
   now rebuilt from the game's own card-pack catalog and kept in step with the host.
+- Fixed: pulling shelf stock into a box could duplicate an item if a customer or another player
+  took stock at the same time. Guest pulls now move the item on the host before updating either
+  inventory on the guest. A refused pull leaves both containers unchanged. The item appears in
+  the guest's box when the host update arrives.
 - **Fixed: a shelf placed during the session wouldn't let the other player stock it.** A brand-new
   shelf hadn't worked out how many items fit yet, so the game treated it as full for the other
   player only — your item jumped straight back into your hand while the shelf showed the product's
