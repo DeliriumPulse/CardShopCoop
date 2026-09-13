@@ -19,6 +19,14 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
   money on the table and the change total match for everyone.
 - Fixed: a player standing near another player's register could scan items or take change there.
 - Fixed: a register could be left with frozen coins or a floating card reader after a sale.
+- **Fixed: a customer who had just been served could vanish for a few seconds on the other
+  player's screen and then reappear.** The customer's mirrored body is now kept ready while the
+  register is using it and handed back the moment the sale ends, instead of being rebuilt from
+  scratch.
+- **Fixed: a player joining during a checkout saw the change total but not the bills and coins
+  already on the table, and could not take change back with right-click.** The host now
+  replays the checkout's money clicks to the joining player, so the table and the change state
+  look the same to everyone and taking change back works.
 
 - **Fixed: a card a guest placed on a display could be deleted by a later sync instead of
   returning to the binder.** A card leaves your collection the moment you pick it up, so until

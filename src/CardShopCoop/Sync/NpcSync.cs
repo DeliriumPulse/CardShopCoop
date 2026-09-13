@@ -911,12 +911,13 @@ namespace CardShopCoop.Sync
                             existing.GrabSequence = actionSequence;
                         }
 
-                        // Trade uses the pooled customer only as an interaction carrier. Keep
-                        // the visual puppet alive and feed it the same snapshot while the
-                        // carrier remains active and renderer-hidden.
+                        // A pooled customer is the interaction carrier. Keep its visual puppet
+                        // alive and fed with the same snapshot even while the carrier is on
+                        // screen, so handing the customer back (register sale finish, trade end)
+                        // reveals a ready puppet instead of a hole that NpcSync has to rebuild
+                        // from scratch - the puppet must not age out while it is hidden.
                         int visualKey = (KindCustomer << 16) | index;
-                        if (existing.KeepPuppetVisible && _puppets.TryGetValue(visualKey, out var visual)
-                            && visual != null)
+                        if (_puppets.TryGetValue(visualKey, out var visual) && visual != null)
                         {
                             visual.LastSeen = _now;
                             visual.Flags = flags;
@@ -936,8 +937,11 @@ namespace CardShopCoop.Sync
                                 catch (System.Exception e) { Swallow.Log(e); }
                                 visual.GrabSequence = actionSequence;
                             }
+                            // Register carriers render the real customer, so their puppet stays
+                            // hidden (still alive and buffered) until DetachExistingCustomer shows
+                            // it; trade carriers keep the puppet visible.
                             if (visual.Go != null)
-                                visual.Go.SetActive(true);
+                                visual.Go.SetActive(existing.KeepPuppetVisible);
                         }
                     }
                     continue;

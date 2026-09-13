@@ -45,6 +45,11 @@ namespace CardShopCoop.Sync
         public const byte OpGiveChange = 7;
         public const byte OpFinishCash = 8;
         public const byte OpFinishCard = 9;
+        // host -> client catch-up (OnFullyJoin): zero a counter's change controls, then replay
+        // its clicks. Catch-up clicks bypass the own-echo skip and may arrive before the cart
+        // that opens the change phase, so the client defers them until GivingChange.
+        public const byte OpChangeReset = 10;
+        public const byte OpGiveChangeCatchUp = 11;
 
         // ---- reflection: InteractableCashierCounter privates ----
         private static readonly FieldInfo FiIsUsingCard = ReflectionSurface.RequiredField(typeof(InteractableCashierCounter), "m_IsUsingCard");
@@ -53,6 +58,8 @@ namespace CardShopCoop.Sync
         private static readonly FieldInfo FiCashScreen = ReflectionSurface.RequiredField(typeof(InteractableCashierCounter), "m_UICashCounterScreen");
         private static readonly FieldInfo FiChangeReady = ReflectionSurface.RequiredField(typeof(InteractableCashierCounter), "m_IsChangeReady");
         private static readonly FieldInfo FiStartGivingChange = ReflectionSurface.RequiredField(typeof(InteractableCashierCounter), "m_IsStartGivingChange");
+        private static readonly FieldInfo FiChangeMoneyAdded = ReflectionSurface.RequiredField(typeof(InteractableCashierCounter), "m_ChangeMoneyAddedCount");
+        private static readonly FieldInfo FiChangeCoinAdded = ReflectionSurface.RequiredField(typeof(InteractableCashierCounter), "m_ChangeCoinAddedCount");
         private static readonly FieldInfo FiCurrentMoneyChange = ReflectionSurface.RequiredField(typeof(InteractableCashierCounter), "m_CurrentMoneyChangeValue");
         private static readonly FieldInfo FiTooMuchChange = ReflectionSurface.RequiredField(typeof(InteractableCashierCounter), "m_TooMuchChangeGiven");
         private static readonly FieldInfo FiCreditScreen = ReflectionSurface.RequiredField(typeof(InteractableCashierCounter), "m_UICreditCardScreen");
@@ -68,6 +75,7 @@ namespace CardShopCoop.Sync
         private static readonly MethodInfo MiEvaluateFinish = ReflectionSurface.RequiredMethod(typeof(Customer), "EvaluateFinishScanItem");
         // ---- reflection: InteractableCustomerCash privates ----
         private static readonly FieldInfo FiCashCustomer = ReflectionSurface.RequiredField(typeof(InteractableCustomerCash), "m_CurrentCustomer");
+        private static readonly FieldInfo FiGivenAmount = ReflectionSurface.RequiredField(typeof(InteractableCounterMoneyChange), "m_GivenAmount");
         private static readonly FieldInfo FiInUIMode = ReflectionSurface.RequiredField(typeof(InteractionPlayerController), "m_IsInUIMode");
 
         /// <summary>Set by CoopCore: client -> host op (MsgType.RegisterOp).</summary>
@@ -153,6 +161,10 @@ namespace CardShopCoop.Sync
         // While non-zero the cart's change scalars are stale for this station, so the backstop
         // must not overwrite the local player's in-flight change.
         private readonly Dictionary<int, int> _pendingLocalChange = new Dictionary<int, int>();
+        // counter idx -> change clicks that arrived before the cart opened GivingChange. They
+        // are replayed once the counter enters the change phase, so catch-up is order-proof.
+        private readonly Dictionary<int, List<KeyValuePair<int, bool>>> _deferredChange =
+            new Dictionary<int, List<KeyValuePair<int, bool>>>();
 
         public override void Reset()
         {
@@ -168,6 +180,7 @@ namespace CardShopCoop.Sync
             // _sourceIndex is cleared inside TeardownCarriers after it detaches each mirror.
             _authoritativeTotal.Clear();
             _pendingLocalChange.Clear();
+            _deferredChange.Clear();
             AllowClientCustomerLifecycle = false;
             SuppressClientRegisterEvents = false;
             ApplyingAuthoritativePayment = false;
@@ -180,6 +193,84 @@ namespace CardShopCoop.Sync
             _cartCustomer.Clear(); // force fresh RegisterCart digests on the next host tick
             _cartSignature.Clear();
             _cartPollTimer = CartPollInterval;
+        }
+
+        /// <summary>Host: one connection just finished joining. Reconstruct any checkout that is
+        /// currently in the change phase for the joiner:
+        ///  1. unicast the authoritative cart, so the client can build the carrier and enter
+        ///     GivingChange (catch-up clicks land once it has);
+        ///  2. per counter, unicast an OpChangeReset so its change controls start from zero;
+        ///  3. unicast one catch-up click per bill/coin already given, rebuilding the models and
+        ///     each control's m_GivenAmount (right-click take-back works), and the change total.
+        /// The client defers clicks that arrive before the cart, so step 1 being polled/coalesced
+        /// cannot lose them. Nothing here is broadcast - existing clients already have the state.
+        /// Bounded: only counters actually in the change phase, and m_GivenAmount is capped by
+        /// vanilla, so the burst is normally a handful of clicks.</summary>
+        public override void OnFullyJoin(int connId)
+        {
+            if (CoopCore.Role != CoopRole.Host || SendToClient == null)
+                return;
+            var sm = Sm();
+            if (sm == null || sm.m_CashierCounterList == null)
+                return;
+            var cart = WriteCarts();
+            if (cart != null)
+                SendToClient(connId, cart);
+            int counters = 0, clicks = 0;
+            for (int i = 0; i < sm.m_CashierCounterList.Count && i < 250; i++)
+            {
+                var counter = sm.m_CashierCounterList[i];
+                if (counter == null || counter.m_CurrentCustomer == null || !counter.m_CurrentCustomer.m_IsActive)
+                    continue;
+                if (counter.m_CashierCounterState != ECashierCounterState.GivingChange)
+                    continue;
+                // OnFullyJoin also fires from heal paths, not just a fresh join. Never reset or
+                // replay a counter the requesting connection mans - that would wipe their real
+                // in-flight change. A fresh joiner owns nothing, so join catch-up is unaffected.
+                if (_guestManned.TryGetValue(i, out int ownerConn) && ownerConn == connId)
+                    continue;
+                var money = counter.m_InteractableCounterMoneyChangeList;
+                if (money == null)
+                    continue;
+                bool any = false;
+                for (int b = 0; b < money.Count; b++)
+                {
+                    var button = money[b];
+                    if (button == null)
+                        continue;
+                    int given = FiGivenAmount?.GetValue(button) is int g ? g : 0;
+                    if (given <= 0)
+                        continue;
+                    if (!any)
+                    {
+                        // Primer first: the reconstruction must not stack on top of whatever the
+                        // joiner already saw, so zero this counter's controls before replaying.
+                        SendToClient(connId, new RegisterOpMessage
+                        {
+                            Index = (byte)i,
+                            Op = OpChangeReset,
+                        });
+                        any = true;
+                    }
+                    for (int n = 0; n < given; n++)
+                    {
+                        SendToClient(connId, new RegisterOpMessage
+                        {
+                            Index = (byte)i,
+                            Op = OpGiveChangeCatchUp,
+                            ChangeIndex = button.m_Index,
+                            ChangeValue = button.m_ValueDouble,
+                            TakingBack = false,
+                        });
+                        clicks++;
+                    }
+                }
+                if (any)
+                    counters++;
+            }
+            if (clicks > 0)
+                CoopPlugin.Log.LogInfo(
+                    $"RegisterSync host: replayed {clicks} change click(s) over {counters} counter(s) to conn {connId}");
         }
 
         public override void Dispose()
@@ -1096,6 +1187,9 @@ namespace CardShopCoop.Sync
                 {
                     // Customer left this counter: drop the local mirror. A normal sale has
                     // already run the vanilla teardown locally; this only releases the carrier.
+                    // Drop any deferred catch-up clicks too, even if we were not tracking the
+                    // token (a coalesced primer can leave them after a customer already left).
+                    _deferredChange.Remove(idx);
                     if (_cartGen.Remove(idx))
                         ResetClientCounter(idx);
                     continue;
@@ -1144,9 +1238,23 @@ namespace CardShopCoop.Sync
         /// yet on this client the cart's values still carry the readiness (ordering backstop).</summary>
         public void ClientApplyChange(RegisterOpMessage message)
         {
-            if (message == null || message.Op != OpGiveChange)
+            if (message == null)
                 return;
-            if (_localManned == message.Index)
+            // Catch-up primer: zero this counter's change controls and any stale deferred clicks,
+            // so the catch-up burst below rebuilds exactly the host's state (idempotent even if
+            // some live clicks already landed).
+            if (message.Op == OpChangeReset)
+            {
+                // Defense in depth: never wipe the local player's own in-flight change.
+                if (_localManned == message.Index && _pendingLocalChange.ContainsKey(message.Index))
+                    return;
+                ClearClientChange(message.Index);
+                return;
+            }
+            bool catchUp = message.Op == OpGiveChangeCatchUp;
+            if (!catchUp && message.Op != OpGiveChange)
+                return;
+            if (!catchUp && _localManned == message.Index)
             {
                 // Our own click echoed back: the host has applied it, so it is no longer
                 // unacknowledged and the cart backstop may adopt the host's value again.
@@ -1157,24 +1265,99 @@ namespace CardShopCoop.Sync
             if (sm == null || message.Index >= sm.m_CashierCounterList.Count)
                 return;
             var counter = sm.m_CashierCounterList[message.Index];
-            if (counter == null || !counter.IsGivingChange())
+            if (counter == null)
                 return;
+            if (!counter.IsGivingChange())
+            {
+                // Order-proofing: the cart that opens GivingChange is polled/coalesced and may
+                // arrive after the clicks. Queue them and replay when the phase exists.
+                if (!_deferredChange.TryGetValue(message.Index, out var list))
+                {
+                    list = new List<KeyValuePair<int, bool>>();
+                    _deferredChange[message.Index] = list;
+                }
+                list.Add(new KeyValuePair<int, bool>(message.ChangeIndex, message.TakingBack));
+                return;
+            }
+            ReplayChange(counter, message.ChangeIndex, message.TakingBack);
+        }
+
+        /// <summary>Client: replay one money click on a counter that is already in the change
+        /// phase. The applying guard stops the replay from emitting an op of its own.</summary>
+        private static void ReplayChange(InteractableCashierCounter counter, int changeIndex, bool takingBack)
+        {
             var money = counter.m_InteractableCounterMoneyChangeList;
-            if (money == null || message.ChangeIndex < 0 || message.ChangeIndex >= money.Count)
+            if (money == null || changeIndex < 0 || changeIndex >= money.Count)
                 return;
-            var button = money[message.ChangeIndex];
+            var button = money[changeIndex];
             if (button == null)
                 return;
             ApplyingAuthoritativePayment = true;
             try
             {
-                if (message.TakingBack)
+                if (takingBack)
                     button.OnRightMouseButtonUp();
                 else
                     button.OnMouseButtonUp();
             }
             catch (System.Exception e) { Swallow.Log(e); }
             finally { ApplyingAuthoritativePayment = false; }
+        }
+
+        /// <summary>Client: replay any change clicks that arrived before this counter entered the
+        /// change phase. Must run after GivingChange is established and before the cart's change
+        /// scalars are applied, so the rebuilt controls and the authoritative total agree.</summary>
+        private void DrainDeferredChange(int idx)
+        {
+            if (!_deferredChange.TryGetValue(idx, out var list))
+                return;
+            _deferredChange.Remove(idx);
+            var sm = Sm();
+            if (sm == null || idx >= sm.m_CashierCounterList.Count)
+                return;
+            var counter = sm.m_CashierCounterList[idx];
+            if (counter == null || !counter.IsGivingChange())
+            {
+                // Not in change mode (anymore): drop the stale clicks rather than apply later.
+                return;
+            }
+            for (int i = 0; i < list.Count; i++)
+                ReplayChange(counter, list[i].Key, list[i].Value);
+        }
+
+        /// <summary>Client: zero a counter's change controls/scalars without changing its phase,
+        /// used by the OnFullyJoin catch-up primer.</summary>
+        private void ClearClientChange(int idx)
+        {
+            _deferredChange.Remove(idx);
+            var sm = Sm();
+            if (sm == null || idx >= sm.m_CashierCounterList.Count)
+                return;
+            var counter = sm.m_CashierCounterList[idx];
+            if (counter == null)
+                return;
+            try
+            {
+                if (counter.m_InteractableCounterMoneyChangeList != null)
+                    foreach (var money in counter.m_InteractableCounterMoneyChangeList)
+                        if (money != null)
+                            money.ResetAmountGiven();
+                FiCurrentMoneyChange?.SetValue(counter, 0.0);
+                FiChangeReady?.SetValue(counter, false);
+                FiTooMuchChange?.SetValue(counter, false);
+                // Vanilla's StartGivingChange zeroes these per-denomination counters; the catch-up
+                // rebuild must start from the same clean slate or the offsets/coin count double.
+                FiChangeMoneyAdded?.SetValue(counter, 0);
+                FiChangeCoinAdded?.SetValue(counter, 0);
+                var screen = FiCashScreen?.GetValue(counter) as UI_CashCounterScreen;
+                if (screen != null)
+                {
+                    double paid = FiPaidAmount?.GetValue(counter) is double p ? p : 0.0;
+                    double total = FiTotalScanned?.GetValue(counter) is double t ? t : 0.0;
+                    screen.UpdateMoneyChangeAmount(false, paid, total, 0.0);
+                }
+            }
+            catch (System.Exception e) { Swallow.Log(e); }
         }
 
         private void ApplyCart(Cart c, int cid)
@@ -1211,6 +1394,7 @@ namespace CardShopCoop.Sync
                     _cartScanSignature[c.Index] = c.ScanSignature;
                 }
                 ApplyAuthoritativePayment(c);
+                DrainDeferredChange(c.Index);
                 ApplyAuthoritativeChange(c);
                 ApplyAuthoritativePhase(c);
                 ApplyAuthoritativeTotal(c);
@@ -1311,6 +1495,7 @@ namespace CardShopCoop.Sync
             }
             ApplyScannedItems(c);
             ApplyAuthoritativePayment(c);
+            DrainDeferredChange(c.Index);
             ApplyAuthoritativeChange(c);
             ApplyAuthoritativePhase(c);
             ApplyAuthoritativeTotal(c);
@@ -1714,6 +1899,7 @@ namespace CardShopCoop.Sync
             }
             catch (System.Exception e) { Swallow.Log(e); }
             _pendingLocalChange.Remove(idx);
+            _deferredChange.Remove(idx);
             Teardown(idx);
         }
 

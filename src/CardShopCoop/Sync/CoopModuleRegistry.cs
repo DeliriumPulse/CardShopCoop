@@ -71,6 +71,22 @@ namespace CardShopCoop.Sync
             }
         }
 
+        public void OnFullyJoin(int connId)
+        {
+            ThrowIfDisposed();
+            for (int i = 0; i < _modules.Count; i++)
+            {
+                try
+                {
+                    _modules[i].OnFullyJoin(connId);
+                }
+                catch (Exception e)
+                {
+                    CoopPlugin.Log.LogError("co-op module OnFullyJoin failed (" + _modules[i].Name + "): " + e);
+                }
+            }
+        }
+
         public void Dispose()
         {
             if (_disposed)
@@ -107,13 +123,15 @@ namespace CardShopCoop.Sync
         private readonly Action _reset;
         private readonly Action _resend;
         private readonly Action _dispose;
+        private readonly Action<int> _fullyJoin;
 
         public string Name
         {
             get;
         }
 
-        public DelegateCoopModule(string name, Action start, Action reset, Action resend, Action dispose = null)
+        public DelegateCoopModule(string name, Action start, Action reset, Action resend,
+            Action dispose = null, Action<int> fullyJoin = null)
         {
             if (string.IsNullOrEmpty(name))
                 throw new ArgumentException("Module name is required.", nameof(name));
@@ -122,11 +140,13 @@ namespace CardShopCoop.Sync
             _reset = reset ?? (() => { });
             _resend = resend ?? (() => { });
             _dispose = dispose ?? (() => { });
+            _fullyJoin = fullyJoin ?? (_ => { });
         }
 
         public void Start() => _start();
         public void ResetState() => _reset();
         public void ForceResend() => _resend();
+        public void OnFullyJoin(int connId) => _fullyJoin(connId);
         public void Dispose() => _dispose();
     }
 }

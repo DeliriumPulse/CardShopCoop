@@ -19,6 +19,12 @@ namespace CardShopCoop.Sync
 
         /// <summary>Invalidates change gates so the next host tick sends a baseline.</summary>
         void ForceResend();
+
+        /// <summary>Host: a specific connection finished joining. Per-conn resync that cannot be
+        /// expressed as a broadcast baseline - e.g. replaying state the other players already
+        /// have - belongs here. Runs after <see cref="ForceResend"/>, so a module can rely on
+        /// its baseline having been armed first.</summary>
+        void OnFullyJoin(int connId);
     }
 
     /// <summary>A module that participates in the per-frame co-op sync pipeline. CoopCore
