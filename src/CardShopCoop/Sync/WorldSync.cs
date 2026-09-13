@@ -70,6 +70,9 @@ namespace CardShopCoop.Sync
         /// requester can roll the unaccepted part out of its hand.</summary>
         public Action<ShelfTransferResultMessage, int> SendResult;
         public Action RequestResync;
+        public Action<ShelfBoxPullMessage> SendBoxPull;
+        private uint _boxPullSequence;
+        private readonly ShelfBoxPull _boxPulls = new ShelfBoxPull();
         private bool _resyncRequested;
         private float _lastResyncRequestAt = -999f;
         private const float ResyncCooldownSeconds = 2f;
@@ -128,6 +131,8 @@ namespace CardShopCoop.Sync
             _resyncRequested = false;
             _lastResyncRequestAt = -999f;
             _hostAcks.Clear();
+            _boxPulls.Clear();
+            _boxPullSequence = 0;
             _sm = null;
         }
 
@@ -242,6 +247,60 @@ namespace CardShopCoop.Sync
 
         public bool TryGetShelfKey(ShelfCompartment comp, out int key)
             => TryGetKey(comp, out key);
+
+        public void RequestBoxPull(InteractablePackagingBox_Item box, ShelfCompartment source, BoxEngine boxes)
+        {
+            if (CoopCore.Role != CoopRole.Client || box == null || source == null || boxes == null
+                || !BoxVisuals.ReadOpen(box) || !source.m_CanPutItem || source.GetItemCount() <= 0
+                || source.GetWarehouseShelf() != null || !TryGetKey(source, out int key)
+                || !boxes.TryGetClientId(box, out ushort id) || SendBoxPull == null)
+                return;
+            // Let existing optimistic hand operations settle before asking to move this stock.
+            if (_transfers.IsAddReserved(key) || _transfers.IsTakeReserved(key)
+                || _dirtyTakes.Exists(t => t.Comp == source))
+                return;
+            SendBoxPull(new ShelfBoxPullMessage
+            {
+                ShelfKey = key,
+                BoxId = id,
+                ItemType = source.GetItemType(),
+                Sequence = ++_boxPullSequence
+            });
+        }
+
+        public void HostApplyBoxPull(ShelfBoxPullMessage message, int connId, BoxEngine boxes)
+        {
+            if (CoopCore.Role != CoopRole.Host || message == null || boxes == null)
+                return;
+            int kind = message.ShelfKey >> 24;
+            if (kind != 0 && kind != 3 && kind != 14)
+                return;
+            var sm = ResolveShelfManager();
+            if (sm == null || !boxes.TryGetHostBox(message.BoxId, out var rawBox)
+                || !(rawBox is InteractablePackagingBox_Item box)
+                || !boxes.HostBoxHeldByConnection(message.BoxId, connId))
+                return;
+            var source = Resolve(sm, message.ShelfKey);
+            bool previous = _applyingRemote;
+            _applyingRemote = true;
+            try
+            {
+                _boxPulls.Apply(connId, message.Sequence, source, box, message.ItemType);
+            }
+            finally
+            {
+                _applyingRemote = previous;
+                // Publish only after both inventories have been updated. Rejections also heal
+                // stale mirrors, without refunding an item the guest was never given.
+                boxes.MarkBoxDirty(box);
+                boxes.ForceNextTick();
+                if (source != null)
+                    OnLocalChanges?.Invoke(new List<Entry>
+                    {
+                        new Entry { Key = message.ShelfKey, Type = (int)source.GetItemType(), Count = source.GetItemCount() }
+                    });
+            }
+        }
 
         public void LocalCompartmentMutation(ShelfCompartment comp, int baseCount, int transferType, int delta)
             => LocalCompartmentMutation(comp, baseCount, transferType, delta, null);
@@ -717,7 +776,11 @@ namespace CardShopCoop.Sync
             FlushQueued(pending.Target);
         }
 
-        public void HostReleaseConn(int connId) => _hostAcks.ReleaseConn(connId);
+        public void HostReleaseConn(int connId)
+        {
+            _hostAcks.ReleaseConn(connId);
+            _boxPulls.ReleaseConn(connId);
+        }
 
         /// <summary>
         /// Can THIS machine actually build a compartment of this item type? A peer running a

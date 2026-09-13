@@ -420,6 +420,14 @@ namespace CardShopCoop
                 return;
             },
                 MessagePolicy.HostOnlyInGame, true, heal: () => { _boxEngine?.RequestFullSnapshot(); _market.ForceResend(); });
+            _messageRouter.Register<ShelfBoxPullMessage>((context, message) =>
+            {
+                _world.HostApplyBoxPull(message, context.ConnectionId, _boxEngine);
+            }, MessagePolicy.HostOnlyInGame, false, heal: () =>
+            {
+                _boxEngine?.RequestFullSnapshot();
+                _world.RequestResyncCoalesced();
+            });
             _messageRouter.Register<BoxCollectMessage>((context, message) =>
             {
                 if (Role != CoopRole.Host || !InGameLevel())
