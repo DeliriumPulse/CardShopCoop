@@ -96,9 +96,6 @@ namespace CardShopCoop.Sync
 
         public void RequestResyncCoalesced() => _resyncRequested = true;
 
-        private static readonly FieldInfo FiWarehouseComps =
-            ReflectionSurface.RequiredField(typeof(WarehouseShelf), "m_ItemCompartmentList");
-
         // NEVER CSingleton<ShelfManager>.Instance: if touched before the game scene
         // exists (e.g. deltas arriving during the client's loading screen) it silently
         // creates and caches an empty fake manager that then shadows the real one for
@@ -180,6 +177,13 @@ namespace CardShopCoop.Sync
             var sm = ResolveShelfManager();
             if (sm == null || comp == null)
                 return false;
+            // A warehouse rack compartment back-references its owning rack and its index within it
+            // (set in WarehouseShelf.Init), so resolve kind 1 directly instead of scanning
+            // m_WarehouseShelfList on every unresolved lookup (box-internal compartments hit this
+            // path constantly during restocking).
+            var warehouse = comp.GetWarehouseShelf();
+            if (warehouse != null)
+                return TryKey(1, warehouse, comp.GetIndex(), out key);
             for (int i = 0; i < sm.m_ShelfList.Count; i++)
             {
                 var s = sm.m_ShelfList[i];
@@ -204,6 +208,38 @@ namespace CardShopCoop.Sync
             return false;
         }
 
+        /// <summary>Client or host: an explicit right-click label removal. Sent as a TYPE-ONLY
+        /// entry (BaseCount -1) on BOTH roles, so the receiver's ApplyRemote never runs the
+        /// loose-item clear-and-rebuild path - a compartment's label is independent of its
+        /// contents. Used only for warehouse racks (see GamePatches.RemoveLabelPostfix), whose
+        /// box contents are owned by ItemBoxFamily and whose type also changes during box
+        /// add/remove; conflating a label edit with a box edit would corrupt the rack.</summary>
+        internal void LocalLabelRemoval(ShelfCompartment comp)
+        {
+            if (_applyingRemote || comp == null || CoopCore.Role == CoopRole.None)
+                return;
+            if (!TryGetKey(comp, out int key))
+            {
+                // The rack's stable identity has not been bound yet (PopulationSync normally does
+                // this within a roster tick). Fail loud rather than silently leaving the two
+                // sides disagreeing about the label.
+                CoopPlugin.Log.LogWarning(
+                    "WorldSync: a warehouse rack label change could not be keyed (rack not bound yet) - it will not sync");
+                return;
+            }
+            OnLocalChanges?.Invoke(new List<Entry>
+            {
+                new Entry
+                {
+                    Key = key,
+                    Type = (int)comp.GetItemType(),
+                    Count = comp.GetItemCount(),
+                    BaseCount = -1,
+                    TransferType = -1,
+                }
+            });
+        }
+
         public bool TryGetShelfKey(ShelfCompartment comp, out int key)
             => TryGetKey(comp, out key);
 
@@ -212,7 +248,8 @@ namespace CardShopCoop.Sync
 
         public void QueueTake(ShelfCompartment comp, int baseCount, Item item)
         {
-            if (_applyingRemote || comp == null || item == null || CoopCore.Role == CoopRole.None)
+            if (_applyingRemote || comp == null || item == null || CoopCore.Role == CoopRole.None
+                || comp.GetWarehouseShelf() != null)
                 return;
             _dirtyTakes.Add(new DirtyTake
             {
@@ -225,7 +262,15 @@ namespace CardShopCoop.Sync
 
         private void LocalCompartmentMutation(ShelfCompartment comp, int baseCount, int transferType, int delta, Item takeItem)
         {
-            if (_applyingRemote || comp == null || CoopCore.Role == CoopRole.None || !TryGetKey(comp, out int key))
+            if (_applyingRemote || comp == null || CoopCore.Role == CoopRole.None)
+                return;
+            // A warehouse rack compartment holds BOXES (owned by the box engine, ItemBoxFamily),
+            // never loose items. Keep the loose-item transfer API from ever emitting a kind-1
+            // entry even if a future/modded caller reaches it; only LocalLabelRemoval may key a
+            // warehouse compartment.
+            if (comp.GetWarehouseShelf() != null)
+                return;
+            if (!TryGetKey(comp, out int key))
                 return;
             int type = (int)comp.GetItemType();
             var e = new Entry { Key = key, Type = type, Count = comp.GetItemCount(), BaseCount = baseCount, TransferType = transferType };
@@ -482,9 +527,24 @@ namespace CardShopCoop.Sync
                             }
                             else if (typeOk)
                             {
+                                // A shelf placed mid-session never ran CalculatePositionList, so its
+                                // empty compartments report m_MaxItemCount == 0 (and an empty
+                                // m_ItemPosList) until someone places the first item locally. Reading
+                                // that as "no room" rejected every client restock of a brand-new
+                                // shelf: capacity 0 accepted 0, so the host still stamped the item
+                                // label (applyCount 0 with a type) but kept no items, and the client
+                                // got its item bounced back to hand. Trust the add exactly like the
+                                // box path (ItemBoxFamily.ApplyContentDelta): ApplyCompartment below
+                                // rebuilds through SetCompartmentItemType -> CalculatePositionList ->
+                                // SpawnItem, which computes the real capacity and clamps to it, and
+                                // the read-back then reports only what actually landed.
                                 int capacity = comp.GetMaxItemCount();
                                 if (capacity <= 0)
-                                    capacity = hostCount;
+                                {
+                                    capacity = hostCount + requested;
+                                    CoopPlugin.Log.LogDebug(
+                                        $"WorldSync: compartment {e.Key:X} capacity not built (new shelf?); trusting add host={hostCount} requested={requested}");
+                                }
                                 accepted = Mathf.Min(requested, Mathf.Max(0, capacity - hostCount));
                                 applyCount = hostCount + accepted;
                                 applyType = hostType == (int)EItemType.None && e.TransferType >= 0
@@ -689,6 +749,10 @@ namespace CardShopCoop.Sync
             int compIdx = key & 0xFF;
             if (!PlacedObjectIdentity.TryResolve(sm, kind, objectId, out var obj))
                 return null;
+            // Warehouse racks store boxes in the same compartment type; GetWarehouseCompartment
+            // is the public accessor and already bounds-checks the index.
+            if (kind == 1)
+                return (obj as WarehouseShelf)?.GetWarehouseCompartment(compIdx);
             List<ShelfCompartment> comps = null;
             if (kind == 0)
                 comps = (obj as Shelf)?.GetItemCompartmentList();

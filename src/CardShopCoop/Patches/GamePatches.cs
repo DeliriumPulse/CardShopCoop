@@ -334,6 +334,12 @@ namespace CardShopCoop.Patches
             // kept its label). Nudge the world sync immediately.
             Try(h, typeof(ShelfCompartment), "SetCompartmentItemType",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(SetCompartmentItemTypePostfix)));
+            // Warehouse racks share SetCompartmentItemType with normal shelves, but their type
+            // ALSO changes as boxes are added/removed (owned by the box engine). Route only the
+            // explicit right-click label removal through the world sync for kind 1; see the
+            // warehouse guard in SetCompartmentItemTypePostfix.
+            Try(h, typeof(ShelfCompartment), "RemoveLabel",
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(RemoveLabelPostfix)));
             Try(h, typeof(InteractableCardCompartment), "SetCardOnShelf",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
             Try(h, typeof(InteractableCardCompartment), "RemoveCardFromShelf",
@@ -487,12 +493,35 @@ namespace CardShopCoop.Patches
             if (CoopCore.Instance?.World?.ApplyingRemote == true || __instance == null
                 || (CoopCore.Role == CoopRole.Client && CoopCore.ClientReloading))
                 return;
+            // Warehouse racks are box containers, not loose-item shelves, and their type is also
+            // driven by box add/remove (RemoveBox clears it when the last box leaves). Reporting
+            // every warehouse type change here would turn a box removal into a loose-item shelf
+            // mutation and fight the box engine; only RemoveLabelPostfix may emit kind 1.
+            if (__instance.GetWarehouseShelf() != null)
+                return;
             // AddItem emits the item transfer itself; its resulting type assignment is not a
             // second world mutation. Empty-label/type edits have no AddItem event and do emit.
             if (__instance.GetItemCount() > 0)
                 return;
             CoopCore.Instance?.World?.LocalCompartmentMutation(__instance,
                 __instance.GetItemCount(), -1, 0);
+        }
+
+        /// <summary>Right-clicking a shelf's price tag removes its label via
+        /// ShelfCompartment.RemoveLabel -> SetCompartmentItemType(None). Normal shelves already
+        /// emit through SetCompartmentItemTypePostfix; warehouse racks deliberately do NOT (their
+        /// type also changes during box add/remove), so their label removal is forwarded here as
+        /// a non-destructive type-only entry.</summary>
+        public static void RemoveLabelPostfix(ShelfCompartment __instance)
+        {
+            if (CoopCore.Instance?.World?.ApplyingRemote == true || __instance == null
+                || (CoopCore.Role == CoopRole.Client && CoopCore.ClientReloading))
+                return;
+            if (__instance.GetWarehouseShelf() == null)
+                return; // normal shelves are handled by SetCompartmentItemTypePostfix
+            if (__instance.GetItemCount() > 0)
+                return; // RemoveLabel only acts on an empty compartment
+            CoopCore.Instance?.World?.LocalLabelRemoval(__instance);
         }
 
         public static void TakeItemToHandPrefix(ShelfCompartment __instance, out int __state)
