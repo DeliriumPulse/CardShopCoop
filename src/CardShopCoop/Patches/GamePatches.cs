@@ -308,6 +308,7 @@ namespace CardShopCoop.Patches
             Try(h, typeof(InteractablePackagingBox_Item), "DispenseItem",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
             Try(h, typeof(InteractablePackagingBox_Item), "RemoveItemFromShelf",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(ShelfBoxPullPrefix)),
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
             Try(h, typeof(InteractablePackagingBox_Item), "SetOpenCloseBox",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(BoxOpenClosePostfix)));
@@ -464,6 +465,16 @@ namespace CardShopCoop.Patches
         {
             if (CoopCore.Role != CoopRole.None)
                 CoopCore.RequestImmediateObjectSync();
+        }
+
+        public static bool ShelfBoxPullPrefix(InteractablePackagingBox_Item __instance,
+            ShelfCompartment targetItemCompartment)
+        {
+            if (CoopCore.Role != CoopRole.Client)
+                return true;
+            // Do not remove from the guest shelf or add to its box before host authorization.
+            CoopCore.Instance?.RequestShelfBoxPull(__instance, targetItemCompartment);
+            return false;
         }
 
         public struct ShelfMutationState

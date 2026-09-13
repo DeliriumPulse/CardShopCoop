@@ -338,6 +338,10 @@ namespace CardShopCoop.Sync
                 && lease.Owner != NoOwner && lease.Owner != HostConn && lease.Owner != connId;
         }
 
+        public bool HostBoxHeldByConnection(ushort id, int connId)
+            => _leases.TryGetValue(id, out var lease)
+                && lease.Possession == BoxPossession.Held && lease.Owner == connId;
+
         /// <summary>Client: this machine destroyed a box through local gameplay (trash,
         /// storage). Tell the host to retire the real one and stop tracking the mirror.</summary>
         public void ClientNotifyLocalDestroyed(InteractablePackagingBox box)

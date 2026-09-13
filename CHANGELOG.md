@@ -8,6 +8,11 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 ## 1.2.0
 **Boxes and furniture now stay in sync through pickups, throws, placement, and joining, and cards no longer vanish when a guest sets them out to sell or is holding them.**
 
+- Fixed: pulling shelf stock into a box could duplicate an item if a customer or another player
+  took stock at the same time. Guest pulls now move the item on the host before updating either
+  inventory on the guest. A refused pull leaves both containers unchanged. The item appears in
+  the guest's box when the host update arrives.
+
 - **Fixed: a shelf placed during the session wouldn't let the other player stock it.** A brand-new
   shelf hadn't worked out how many items fit yet, so the game treated it as full for the other
   player only — your item jumped straight back into your hand while the shelf showed the product's
