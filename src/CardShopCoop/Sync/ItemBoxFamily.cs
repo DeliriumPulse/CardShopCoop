@@ -77,15 +77,29 @@ namespace CardShopCoop.Sync
             }
             else
             {
-                // Add: only into an empty or same-type compartment, bounded by capacity.
-                if (hostType != EItemType.None && hostType != moveType)
+                // Add: only into an empty or same-type compartment, bounded by capacity. An empty
+                // compartment is rebindable: vanilla's locked label (CGameManager.m_LockItemLabel)
+                // leaves a stale type after the last item leaves, and ShelfCompartment.CheckItemType
+                // rebinds a 0-count compartment to whatever arrives next. Only a non-empty
+                // compartment constrains the incoming type.
+                if (hostCount > 0 && hostType != EItemType.None && hostType != moveType)
                     return false;
+                if (hostCount <= 0)
+                {
+                    // Rebind before measuring capacity: a compartment's slot count comes from the
+                    // item's dimensions, so the stale label's capacity must not bound the new type.
+                    b.SetItemType(moveType);
+                    comp.SetCompartmentItemType(moveType);
+                    comp.CalculatePositionList();
+                }
                 int capacity = comp.GetMaxItemCount();
                 if (capacity <= 0)
                     capacity = hostCount + requested; // capacity unknown/unbuilt: trust the add
                 int room = Mathf.Max(0, capacity - hostCount);
                 acceptedDelta = Mathf.Min(requested, room);
-                targetType = hostType == EItemType.None ? moveType : hostType;
+                // An empty compartment rebinds; a positive count with no label is an
+                // inconsistent state that heals to the incoming type rather than writing None.
+                targetType = hostCount <= 0 || hostType == EItemType.None ? moveType : hostType;
             }
 
             if (acceptedDelta != 0)
@@ -262,6 +276,12 @@ namespace CardShopCoop.Sync
             if (!typeChanged && !countChanged)
                 return;
 
+            // A content rebuild is remote reconciliation, not local gameplay. The game-side
+            // TakeItemToHand / SetCompartmentItemType calls below must not be mistaken for a
+            // player edit (queueing a shelf take or marking the owning mirror dirty), or every
+            // authoritative apply would re-report itself and feed a snapshot/report loop.
+            bool prevApplyingRemote = BoxShared.ApplyingRemote;
+            BoxShared.ApplyingRemote = true;
             try
             {
                 if (open)
@@ -300,6 +320,7 @@ namespace CardShopCoop.Sync
             {
                 CoopPlugin.Log.LogWarning("ItemBoxFamily content apply: " + e.Message);
             }
+            finally { BoxShared.ApplyingRemote = prevApplyingRemote; }
         }
 
         public bool TryReadLocal(InteractablePackagingBox box, out BoxPossession possession,
