@@ -98,7 +98,7 @@ namespace CardShopCoop.Util
             {
                 return CardEntries();
             }
-            catch { return new List<string>(); }
+            catch (System.Exception e) { Swallow.Log(e); return new List<string>(); }
         }
 
         /// <summary>The .ini-derived custom-card identity strings, sorted - the single source
@@ -153,7 +153,7 @@ namespace CardShopCoop.Util
             {
                 return PluginEntries();
             }
-            catch { return new List<string>(); }
+            catch (System.Exception e) { Swallow.Log(e); return new List<string>(); }
         }
 
         /// <summary>The loaded plugin set as sorted "guid=version" strings - the single source
@@ -272,7 +272,7 @@ namespace CardShopCoop.Util
                     _eplLoaded = true;
                     break;
                 }
-                catch { /* a probe must never throw into a handshake or into OnGUI */ }
+                catch (System.Exception e) { Swallow.Log(e); /* a probe must never throw into a handshake or into OnGUI */ }
             }
             if (!_eplLoaded)
             {
@@ -290,7 +290,7 @@ namespace CardShopCoop.Util
                         }
                     }
                 }
-                catch { /* same rule: a probe must never throw */ }
+                catch (System.Exception e) { Swallow.Log(e); /* same rule: a probe must never throw */ }
             }
             if (_eplLoaded && !_eplLoadedLogged)
             {
@@ -299,7 +299,7 @@ namespace CardShopCoop.Util
                 {
                     CoopPlugin.Log.LogInfo("EnhancedPrefabLoader detected - a custom id registry is in play");
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
             return _eplLoaded;
         }
@@ -328,12 +328,12 @@ namespace CardShopCoop.Util
                 if (t != null)
                     return t;
             }
-            catch { /* a lookup must never throw into a handshake, a probe or OnGUI */ }
+            catch (System.Exception e) { Swallow.Log(e); /* a lookup must never throw into a handshake, a probe or OnGUI */ }
             try
             {
                 return HarmonyLib.AccessTools.TypeByName(typeName);
             }
-            catch { return null; }
+            catch (System.Exception e) { Swallow.Log(e); return null; }
         }
 
         /// <summary>Case-insensitive substring test used by the plugin-list backstop above.
@@ -500,7 +500,7 @@ namespace CardShopCoop.Util
                 LogEnumSourceOnce("enum_values.json fallback (" + modded.Count + " modded ids) - the runtime walk found none");
                 return modded;
             }
-            catch { return new List<string>(); }
+            catch (System.Exception e) { Swallow.Log(e); return new List<string>(); }
         }
 
         private static bool _enumSourceLogged;
@@ -518,7 +518,7 @@ namespace CardShopCoop.Util
             {
                 CoopPlugin.Log.LogInfo("enum identity source: " + source);
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
         }
 
         /// <summary>The modded enum ids resolved from the LOADED types, sorted - the single source
@@ -615,7 +615,7 @@ namespace CardShopCoop.Util
                 outLines.Sort(StringComparer.Ordinal);
                 return outLines;
             }
-            catch { return null; }
+            catch (System.Exception e) { Swallow.Log(e); return null; }
         }
 
         /// <summary>The .coopbak-* file InstallEnumFile set aside IN THIS PROCESS, i.e. the one
@@ -729,7 +729,7 @@ namespace CardShopCoop.Util
                     return false;
                 return File.Exists(EnumMarkerPath());
             }
-            catch { return false; }
+            catch (System.Exception e) { Swallow.Log(e); return false; }
         }
 
         /// <summary>Undo a host-enum lend: put the guest's OWN registry back so their modded solo
@@ -809,7 +809,7 @@ namespace CardShopCoop.Util
                     {
                         CoopPlugin.Log.LogWarning("enum restore: " + message);
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                     return cleared;
                 }
                 // Preserve the host's installed file first so a restore is never a one-way loss.
@@ -833,13 +833,13 @@ namespace CardShopCoop.Util
                     {
                         File.Delete(EnumMarkerPath());
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                     message = "your card database was restored from the backup this session made - it is exactly what the game is already running, so NO restart is needed";
                     try
                     {
                         CoopPlugin.Log.LogInfo("enum restore: " + message + " (from " + Path.GetFileName(newest) + ")");
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                     return true;
                 }
                 // Any OTHER backup is a registry this process never loaded: same invariant as
@@ -851,7 +851,7 @@ namespace CardShopCoop.Util
                 {
                     File.Delete(EnumMarkerPath());
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
                 message = "your card database was restored from backup - RESTART the game before loading your solo saves";
                 // Same reason as the no-backup branch: the marker is gone, so the banner the UI
                 // shows this under is gone too. Name the backup we used - a player who restored
@@ -860,7 +860,7 @@ namespace CardShopCoop.Util
                 {
                     CoopPlugin.Log.LogInfo("enum restore: " + message + " (from " + Path.GetFileName(newest) + ")");
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
                 return true;
             }
             catch (Exception e)
@@ -891,7 +891,7 @@ namespace CardShopCoop.Util
                 for (int i = 0; i < baks.Length - 3; i++)
                     File.Delete(baks[i]);
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
         }
 
         private static string Sha1(string s)

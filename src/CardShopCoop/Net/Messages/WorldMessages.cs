@@ -34,6 +34,25 @@ namespace CardShopCoop.Net.Messages
         }
     }
 
+    /// <summary>Host -> sender: the outcome of one client shelf item delta. AcceptedDelta is how
+    /// much of the requested delta the host applied, so the requester can roll back the rest of
+    /// its hand (last to pull loses). Sent only in reply to an Entry whose TransferSeq is non-zero.</summary>
+    [NetworkMessage(MsgType.ShelfTransferResult, Policy = MessagePolicy.ClientOnlyInGame)]
+    public sealed class ShelfTransferResultMessage : INetMessage
+    {
+        public int Key;
+        public uint TransferSeq;
+        public int AcceptedDelta;
+
+        public MsgType Type
+        {
+            get
+            {
+                return MsgType.ShelfTransferResult;
+            }
+        }
+    }
+
     [NetworkMessage(MsgType.ObjMoveDelta, Policy = MessagePolicy.ClientOnly)]
     public sealed class ObjMoveDeltaMessage : INetMessage
     {
@@ -60,49 +79,6 @@ namespace CardShopCoop.Net.Messages
         }
     }
 
-    [NetworkMessage(MsgType.BoxState, Policy = MessagePolicy.ClientOnly)]
-    public sealed class BoxStateMessage : INetMessage
-    {
-        public List<BoxSync.Entry> Entries = new List<BoxSync.Entry>();
-        public MsgType Type
-        {
-            get
-            {
-                return MsgType.BoxState;
-            }
-        }
-    }
-
-    [NetworkMessage(MsgType.BoxRequest, Policy = MessagePolicy.HostOnly)]
-    public sealed class BoxRequestMessage : INetMessage
-    {
-        public List<BoxSync.Entry> Entries = new List<BoxSync.Entry>();
-        public MsgType Type
-        {
-            get
-            {
-                return MsgType.BoxRequest;
-            }
-        }
-    }
-
-    // Guest trashed a loose box: client -> host, keyed by the box's stable id + its type
-    // (the host refuses a removal unless the wire type matches the tracked box's type, so
-    // the id has to be in LOCAL terms - Msg.ReadItemType does that translation).
-    [NetworkMessage(MsgType.BoxRemoved, Policy = MessagePolicy.HostOnly)]
-    public sealed class BoxRemovedMessage : INetMessage
-    {
-        public int Index;
-        public EItemType ItemType;
-        public MsgType Type
-        {
-            get
-            {
-                return MsgType.BoxRemoved;
-            }
-        }
-    }
-
     // Placed-object population roster, one list per kind: host -> client. Deferred entirely
     // to PopulationSync's writer/reader so the nested (list-of-lists) layout stays identical.
     [NetworkMessage(MsgType.PopState, Policy = MessagePolicy.ClientOnly)]
@@ -122,6 +98,16 @@ namespace CardShopCoop.Net.Messages
     public sealed class CardShelfDeltaMessage : INetMessage
     {
         public List<CardShelfSync.Entry> Entries = new List<CardShelfSync.Entry>();
+
+        /// <summary>True only on the direct reply the host sends after applying a
+        /// <see cref="CardShelfRequestMessage"/>. A periodic/snapshot delta does NOT set it. The
+        /// placing client uses the distinction to tell "the host processed my request" from "this
+        /// snapshot was already in flight before the host saw it": an echo whose entry is empty
+        /// means the host could not apply the placement, so the client banks the card back into
+        /// the shared collection instead of destroying the only copy. Non-echo snapshots never
+        /// resolve a pending placement.</summary>
+        public bool Echo;
+
         public MsgType Type
         {
             get
@@ -211,6 +197,9 @@ namespace CardShopCoop.Net.Messages
     [NetworkMessage(MsgType.PriceList, Policy = MessagePolicy.ClientOnly)]
     public sealed class PriceListMessage : INetMessage
     {
+        // True for the join/session full table (absent entries mean "the host cleared this
+        // price"). False for per-change partials: only the listed entries change.
+        public bool Full;
         public List<PriceEntry> Prices = new List<PriceEntry>();
         public MsgType Type
         {

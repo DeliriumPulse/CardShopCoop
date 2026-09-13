@@ -169,7 +169,7 @@ namespace CardShopCoop.Util
                 }
                 return string.Join(", ", parts);
             }
-            catch { return "<unreadable>"; }
+            catch (System.Exception e) { Swallow.Log(e); return "<unreadable>"; }
         }
 
         /// <summary>The grading company the local website is showing RIGHT NOW, as an ordinal,
@@ -188,7 +188,7 @@ namespace CardShopCoop.Util
                     object v = PiCurrentCompany.GetValue(null, null);
                     return v == null ? NoCompany : Convert.ToInt32(v);
                 }
-                catch { return NoCompany; }
+                catch (System.Exception e) { Swallow.Log(e); return NoCompany; }
             }
         }
 
@@ -220,7 +220,7 @@ namespace CardShopCoop.Util
                         return true;
                 return false;
             }
-            catch { return false; }
+            catch (System.Exception e) { Swallow.Log(e); return false; }
         }
 
         /// <summary>Display name of a company ordinal, for the enrollment log line.</summary>
@@ -232,7 +232,7 @@ namespace CardShopCoop.Util
             {
                 return Enum.GetName(TCompany, Enum.ToObject(TCompany, id)) ?? id.ToString();
             }
-            catch { return id.ToString(); }
+            catch (System.Exception e) { Swallow.Log(e); return id.ToString(); }
         }
 
         /// <summary>This machine's Grading Overhaul "Enable Probability System (FAKE CARDS)"
@@ -255,7 +255,7 @@ namespace CardShopCoop.Util
                     var entry = FiUseCheats?.GetValue(null) as BepInEx.Configuration.ConfigEntry<bool>;
                     return entry != null && entry.Value;
                 }
-                catch { return false; }
+                catch (System.Exception e) { Swallow.Log(e); return false; }
             }
         }
 
@@ -453,7 +453,7 @@ namespace CardShopCoop.Util
             {
                 return (int)MiGetEncoded.Invoke(null, new object[] { card });
             }
-            catch { return card.cardGrade; }
+            catch (System.Exception e) { Swallow.Log(e); return card.cardGrade; }
         }
 
         /// <summary>Decode an encoded grade to its real 1-10 value (identity for a bare 1-10).</summary>
@@ -465,7 +465,7 @@ namespace CardShopCoop.Util
             {
                 return (int)MiActual.Invoke(null, new object[] { encoded });
             }
-            catch { return encoded; }
+            catch (System.Exception e) { Swallow.Log(e); return encoded; }
         }
 
         // ------------------------------------------------------------------
@@ -556,7 +556,7 @@ namespace CardShopCoop.Util
                 if ((bool)MiIsBoundTo.Invoke(null, new object[] { company, cert, card }))
                     return true;
             }
-            catch { return true; }
+            catch (System.Exception e) { Swallow.Log(e); return true; }
 
             // MEMOIZED PER CERT, exactly like CoopCore's _priceWarnedKeys and for the same
             // reason. Three of Remember()'s four callers are one-shot per card event, but
@@ -599,7 +599,7 @@ namespace CardShopCoop.Util
                     + (card.isFoil ? " foil" : "") + (card.isDestiny ? " destiny" : "")
                     + " border " + (int)card.borderType;
             }
-            catch { return "(unreadable card)"; }
+            catch (System.Exception e) { Swallow.Log(e); return "(unreadable card)"; }
         }
 
         /// <summary>Split an encoded grade into its grading company ordinal and cert serial.
@@ -620,7 +620,7 @@ namespace CardShopCoop.Util
                 cert = Convert.ToInt32(args[3]);
                 return cert > 0;
             }
-            catch { return false; }
+            catch (System.Exception e) { Swallow.Log(e); return false; }
         }
 
         /// <summary>(company, cert) packed exactly the way GO's own BuildExistingCertSet packs it
@@ -645,7 +645,7 @@ namespace CardShopCoop.Util
             {
                 return (bool)MiIsCheat.Invoke(null, new object[] { encoded });
             }
-            catch { return false; }
+            catch (System.Exception e) { Swallow.Log(e); return false; }
         }
 
         /// <summary>One graded card as the digest identifies it. Everything
@@ -775,7 +775,7 @@ namespace CardShopCoop.Util
         ///  - m_GradedCardInventoryList, the album - CardDelta / GradedRemove.
         ///  - m_GradeCardInProgressList, jobs at the grader - GradingSync's pending-list mirror.
         ///  - card shelves and card/item combi shelves - CardShelfSync.
-        ///  - card packaging (graded-return) boxes - CardBoxSync.
+        ///  - card packaging (graded-return) boxes - CardBoxOps.
         ///  - card storage shelves, bulk donation boxes, auto pack openers - ContainerSync.
         ///
         /// THE FIVE WORLD CLASSES ARE READ LIVE, never from CPlayerData's save-time snapshot
@@ -950,7 +950,7 @@ namespace CardShopCoop.Util
         /// NEVER CSingleton&lt;ShelfManager&gt;.Instance: that getter CREATES an empty fake
         /// manager when the real one does not exist yet and the fake then shadows the real one for
         /// the rest of the session (the 1.0.11 store-mirror field report; the same warning is
-        /// written out at Sync/BoxSync.cs and Sync/WorldSync.cs). Unity's fake-null makes this
+        /// written out at Sync/ItemBoxFamily.cs and Sync/WorldSync.cs). Unity's fake-null makes this
         /// cache self-invalidating across a scene change, so there is nothing to reset.</summary>
         private static ShelfManager _shelfMgr;
         private static ShelfManager Shelves()
@@ -1044,7 +1044,7 @@ namespace CardShopCoop.Util
                 {
                     Add(list, seen, CPlayerData.GetGradedCardData(row));
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
         }
 

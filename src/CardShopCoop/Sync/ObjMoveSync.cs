@@ -14,7 +14,7 @@ namespace CardShopCoop.Sync
     /// boxed-up shelf being carried around doesn't stream; it pops to its new spot on the
     /// other side when placed. Children (compartments, items, price tags) ride along.
     /// </summary>
-    public class ObjMoveSync
+    public class ObjMoveSync : CoopModule
     {
         public struct Entry
         {
@@ -67,6 +67,14 @@ namespace CardShopCoop.Sync
         private float _lastRejectLog = -999f; // throttle the identity-reject spam to ~1/5s
         private float _lastAcceptedLog = -999f;
 
+        // Time-sliced scan state: the O(all-objects) walk is spread over frames.
+        private readonly ListScanCursor _cursor = new ListScanCursor { Budget = 32 };
+        private System.Collections.IList[] _groups;
+        private bool _scanning;
+        private List<Entry> _scanChanges;
+        private bool _scanImmediate;
+        private bool _scanHeal;
+
         public Action<List<Entry>> OnLocalChanges;
 
         // Client role: a fresh joiner must ADOPT every object's loaded pose as its silent
@@ -85,7 +93,11 @@ namespace CardShopCoop.Sync
             return (kind == 5) ? (int)io.m_DecoObjectType : (int)io.m_ObjectType;
         }
 
-        public void Reset()
+        public override string Name => "object-moves";
+
+        public override void ForceResend() => ForceNextTick();
+
+        public override void Reset()
         {
             _sent.Clear();
             _candidate.Clear();
@@ -94,6 +106,10 @@ namespace CardShopCoop.Sync
             _heal = 0f;
             _forceImmediate = false;
             _lastAcceptedLog = -999f;
+            _scanning = false;
+            _groups = null;
+            _scanChanges = null;
+            _cursor.Reset();
         }
 
         private ShelfManager Sm()
@@ -108,102 +124,108 @@ namespace CardShopCoop.Sync
             if (!active)
                 return;
             _timer += dt;
-            if (_timer < 1.0f)
-                return;
-            _timer -= 1.0f;
-            bool immediate = _forceImmediate;
-            _forceImmediate = false;
-            _heal += 1.0f;
-            bool heal = false;
-            if (_heal >= HealInterval)
+            if (!_scanning)
             {
-                _heal -= HealInterval;
-                heal = true;
-            }
-
-            List<Entry> changes = null;
-            try
-            {
+                if (_timer < 1.0f)
+                    return;
+                _timer -= 1.0f;
+                _scanImmediate = _forceImmediate;
+                _forceImmediate = false;
+                _heal += 1.0f;
+                _scanHeal = false;
+                if (_heal >= HealInterval)
+                {
+                    _heal -= HealInterval;
+                    _scanHeal = true;
+                }
                 var sm = Sm();
                 if (sm == null)
                     return;
-                for (int kind = 0; kind < PopulationSync.KindCount; kind++)
-                    Walk(PopulationSync.GetList(sm, kind), kind, ref changes, immediate, heal);
+                if (_groups == null || _groups.Length != PopulationSync.KindCount)
+                    _groups = new System.Collections.IList[PopulationSync.KindCount];
+                for (int k = 0; k < _groups.Length; k++)
+                    _groups[k] = PopulationSync.GetList(sm, k);
+                _cursor.Reset();
+                _scanning = true;
+                _scanChanges = null;
+            }
+            try
+            {
+                _cursor.Scan(_groups, VisitObjMove);
             }
             catch (Exception e)
             {
                 CoopPlugin.Log.LogWarning("ObjMoveSync snapshot: " + e.Message);
+                _scanning = false;
                 return;
             }
-            if (changes != null && changes.Count > 0)
-                OnLocalChanges?.Invoke(changes);
+            if (_cursor.Done)
+            {
+                _scanning = false;
+                if (_scanChanges != null && _scanChanges.Count > 0)
+                    OnLocalChanges?.Invoke(_scanChanges);
+            }
         }
 
-        private void Walk(System.Collections.IList list, int kind, ref List<Entry> changes,
-            bool immediate = false, bool heal = false)
+        private void VisitObjMove(object item, int kind, int index)
         {
-            if (list == null)
+            var obj = item as Component;
+            if (obj == null || !obj.gameObject.activeInHierarchy)
+                return; // boxed/carried
+            if (kind == 5 && CardShopCoop.Patches.GamePatches.IsPendingDeco(obj as InteractableObject))
                 return;
-            for (int i = 0; i < list.Count; i++)
+            if (!PlacedObjectIdentity.TryMakeObjectKey(kind, obj as InteractableObject, out int key))
+                return;
+            // Never author a move for an object the game is actively moving (a drag in
+            // progress). On the guest there is nothing legitimate to report mid-drag, and
+            // reporting the pre-settle pose is exactly the packet that races the host's
+            // settle-delta and starts the snap-back / off-grid-rotation echo war.
+            if (obj is InteractableObject moving && moving.GetIsMovingObject())
             {
-                var obj = list[i] as Component;
-                if (obj == null || !obj.gameObject.activeInHierarchy)
-                    continue; // boxed/carried
-                if (kind == 5 && CardShopCoop.Patches.GamePatches.IsPendingDeco(obj as InteractableObject))
-                    continue;
-                if (!PlacedObjectIdentity.TryMakeObjectKey(kind, obj as InteractableObject, out int key))
-                    continue;
-                // Never author a move for an object the game is actively moving (a drag in
-                // progress). On the guest there is nothing legitimate to report mid-drag, and
-                // reporting the pre-settle pose is exactly the packet that races the host's
-                // settle-delta and starts the snap-back / off-grid-rotation echo war.
-                if (obj is InteractableObject moving && moving.GetIsMovingObject())
-                {
-                    _candidate.Remove(key);
-                    continue;
-                }
-                var p = obj.transform.position;
-                var r = obj.transform.rotation;
+                _candidate.Remove(key);
+                return;
+            }
+            var p = obj.transform.position;
+            var r = obj.transform.rotation;
 
-                bool knownSent = _sent.TryGetValue(key, out var sent);
-                // Only the host emits periodic authoritative heals. A client must not
-                // turn a heal into a request for every placed object.
-                bool forceHeal = heal && !IsClientRole;
-                if (knownSent && sent.Same(p, r) && !forceHeal)
-                {
-                    _candidate.Remove(key);
-                    continue;
-                }
-                // FRESH-JOINER ADOPTION (client only): the first time we see an object after
-                // Reset, its pose is the loaded/host pose - NOT a move this joiner made. Walk
-                // re-reporting every settled object's pose to the host was D-c (the joiner's
-                // stale index teleporting the host's fresh furniture). So on the client, an
-                // object unknown to both _sent and _candidate is adopted straight into the
-                // sent-baseline with no ObjMoveRequest. Only genuine subsequent movement (a
-                // pose that later diverges from this baseline) flows through the settle gate.
-                if (!knownSent && IsClientRole && !_candidate.ContainsKey(key))
-                {
-                    _sent[key] = new Pose { P = p, R = r, Valid = true };
-                    continue;
-                }
-                // An explicit completed mutation is already settled by vanilla. Keep the
-                // two-sample gate for ordinary recovery polling.
-                if (forceHeal || immediate || (_candidate.TryGetValue(key, out var cand) && cand.Same(p, r)))
-                {
-                    if (changes == null)
-                        changes = new List<Entry>();
-                    // Do not advance the sent baseline until this entry is actually
-                    // queued; otherwise the 65th move in a batch is lost forever.
-                    if (changes.Count >= 64)
-                        continue;
-                    _sent[key] = new Pose { P = p, R = r, Valid = true };
-                    _candidate.Remove(key);
-                    changes.Add(new Entry { Key = key, Type = TypeIdOf(obj, kind), Pos = p, Rot = r });
-                }
-                else
-                {
-                    _candidate[key] = new Pose { P = p, R = r, Valid = true };
-                }
+            bool knownSent = _sent.TryGetValue(key, out var sent);
+            // Only the host emits periodic authoritative heals. A client must not turn a
+            // heal into a request for every placed object.
+            bool forceHeal = _scanHeal && !IsClientRole;
+            if (knownSent && sent.Same(p, r) && !forceHeal)
+            {
+                _candidate.Remove(key);
+                return;
+            }
+            // FRESH-JOINER ADOPTION (client only): the first time we see an object after
+            // Reset, its pose is the loaded/host pose - NOT a move this joiner made. Walk
+            // re-reporting every settled object's pose to the host was D-c (the joiner's
+            // stale index teleporting the host's fresh furniture). So on the client, an
+            // object unknown to both _sent and _candidate is adopted straight into the
+            // sent-baseline with no ObjMoveRequest. Only genuine subsequent movement (a
+            // pose that later diverges from this baseline) flows through the settle gate.
+            if (!knownSent && IsClientRole && !_candidate.ContainsKey(key))
+            {
+                _sent[key] = new Pose { P = p, R = r, Valid = true };
+                return;
+            }
+            // An explicit completed mutation is already settled by vanilla. Keep the
+            // two-sample gate for ordinary recovery polling.
+            if (forceHeal || _scanImmediate || (_candidate.TryGetValue(key, out var cand) && cand.Same(p, r)))
+            {
+                if (_scanChanges == null)
+                    _scanChanges = new List<Entry>();
+                // Do not advance the sent baseline until this entry is actually queued;
+                // otherwise the 65th move in a batch is lost forever.
+                if (_scanChanges.Count >= 64)
+                    return;
+                _sent[key] = new Pose { P = p, R = r, Valid = true };
+                _candidate.Remove(key);
+                _scanChanges.Add(new Entry { Key = key, Type = TypeIdOf(obj, kind), Pos = p, Rot = r });
+            }
+            else
+            {
+                _candidate[key] = new Pose { P = p, R = r, Valid = true };
             }
         }
 
@@ -273,7 +295,7 @@ namespace CardShopCoop.Sync
                         {
                             _miOpenerSetUI?.Invoke(io, null);
                         }
-                        catch { }
+                        catch (System.Exception caught) { Swallow.Log(caught); }
                     }
                     _sent[e.Key] = new Pose { P = e.Pos, R = e.Rot, Valid = true };
                     _candidate.Remove(e.Key);

@@ -5,6 +5,129 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.2.0
+**Boxes and furniture now stay in sync through pickups, throws, placement, and joining, and cards no longer vanish when a guest sets them out to sell or is holding them.**
+
+- **Fixed: a guest manning a register could get stuck after a sale — the money drawer stayed
+  open, the received/total/change screen never cleared, and the guest could not interact or
+  open the pause menu.** The guest now runs the game's own register completion, the host
+  validates every action and asks the guest to reset if the two disagree, and the drawer,
+  payment screen and card reader are released properly.
+- **Fixed: money a player had already taken out during checkout was invisible to a client who
+  took over that register, and the finish could be refused.** Every change click is now
+  mirrored to the other player and the live change state rides the register snapshot, so the
+  money on the table and the change total match for everyone.
+- Fixed: a player standing near another player's register could scan items or take change there.
+- Fixed: a register could be left with frozen coins or a floating card reader after a sale.
+
+- **Fixed: a card a guest placed on a display could be deleted by a later sync instead of
+  returning to the binder.** A card leaves your collection the moment you pick it up, so until
+  the host confirms it is on the display, the card in your hand or on the shelf is the only copy.
+  The display sync used to trust any snapshot that said the slot was empty and would destroy that
+  copy. Placement now waits for an explicit answer from the host: if the host has the card the
+  slot is confirmed, and if the host could not accept the placement the card is returned to the
+  binder instead of disappearing.
+- **Fixed: opening a graded-card return box while already holding cards could lose cards.** The
+  game's box open adds every returned card to your hand without checking the hand limit, which
+  could overflow it or throw partway through. Any card that does not fit is now put safely into
+  the shared binder (and mirrors to the other player) rather than being dropped or left in a box
+  that then despawns.
+- **Fixed: a saved hand that already overflowed could silently lose the extra cards on load.**
+  Cards beyond the hand limit are now returned to the binder before the game trims the list.
+- Joining players now see market and price values re-sync after the world finishes loading,
+  instead of briefly seeing stale values.
+
+- Guests can sell boxed furniture, and the host removes the same authoritative furniture for both
+  players.
+- Guests can box up placed furniture without creating a guest-only copy; the host owns that box
+  lifecycle too. Boxes opened for furniture placement stay hidden from other players until
+  placement is complete, and a thrown furniture box no longer reappears with its lid open.
+- Boxes held by one player are hidden and protected from pickup by everyone else, and box ownership
+  and movement travel as a single authoritative value instead of several separate flags that could
+  disagree. This fixes rare cases where a box could stay invisible, remain stuck in move mode,
+  appear owned by the wrong player after a throw, a drop, or a disconnect, or fail to sync at all
+  for a guest joining a shop that is already open; box updates are now always applied in order, so
+  a catch-up after a stall can't silently drop a box's last move or removal.
+- Box pickup, drop, and furniture box-up changes reach the other player immediately instead of
+  waiting for the polling interval, so remote players see furniture boxes disappear as soon as
+  someone picks them up, and throws reproduce the game's launch impulse on the receiving side
+  instead of dropping at the thrower's feet.
+- When one player pushes a box, the other player's copy now slides along in real time instead of
+  jumping ahead, and the box settles back into normal physics as soon as the push ends.
+- Item boxes placed with Q can be picked up normally by the other player after they are set down,
+  and Q-mode box movement follows the holder's camera smoothly on both sides.
+- Opening or closing an item box updates on the other player's screen too, including boxes that
+  are already open when the other player joins, and delivery-box contents stay synchronized when
+  either player restocks from a box or moves items into one.
+- Opening or taking items from a loose box no longer lets a delayed update restore items the other
+  player already took; the count stays consistent regardless of who edits first.
+- Furniture placement previews show the furniture being placed instead of a stray delivery box,
+  match the game's normal placement preview (alignment, multi-part rendering, layers, and
+  transparency), and no longer rescan the whole shop or leak temporary materials on every move.
+- Invalid, stale, busy, or last-cashier-counter sale requests are rejected without creating money.
+- Newly purchased furniture now appears on clients immediately when the host places it for the
+  first time, instead of appearing only after the host moves it again.
+- New characters no longer appear nude, and the game's own starting outfit is kept; an unsaved or
+  nude model is repaired to a clothed preset when NSFW is off. A new "Allow NSFW" toggle in the
+  co-op window's SETTINGS tab controls whether nude appearances are allowed at all.
+- When the NSFW toggle is off, any bare wardrobe slot on another player is filled with that
+  slot's default item instead of their whole outfit being randomized, and the Nude wardrobe
+  option is hidden so you cannot accidentally make your own character nude.
+- A delivery box a worker is carrying now stays in the worker's hands on the other player's
+  screen instead of being dragged along the floor, and it returns to a normal loose box when the
+  worker sets it down.
+- Buying several pieces of furniture no longer spawns extra delivery boxes; each purchase now
+  shows exactly one.
+- Opening and placing a furniture box is more reliable: a rare case where the placement could get
+  stuck while the box stayed hidden, or leave a duplicate box behind, is fixed.
+- Giving a worker a bonus now updates the bonus button and amount immediately for the player who
+  pressed it.
+- Items taken off a shelf now reach the other player immediately instead of waiting for the next
+  scheduled sync.
+- The co-op window has a new SETTINGS tab with switches for the diagnostic logs (box sync and
+  per-frame timing), which save to the config file and take effect right away.
+- Fixed an unreadable header in the character panel: "MY CHARACTER" and the other info labels
+  were dark text on a dark background.
+- When a play-table game finishes, guests now see the green "+$" payment popup above the
+  customer who earned it, including when the guest kicks customers off a table, instead of the
+  popup appearing only for the host.
+- The guest's trade and sell-in screen now follows the same flow as single-player. Pressing
+  Accept no longer snaps the window shut: the game waits for the host's answer and then shows
+  the customer's real reaction - the accepted message with a Done button, or the haggling /
+  refusal line with the new asking price - so a guest can accept, counter-offer, or walk away
+  exactly like the host can. Money and cards still change once, on the host. If a player
+  disconnects mid-trade, the host immediately releases that customer and the guest's screen is
+  closed cleanly instead of being left open.
+- **Fixed: an item you picked up could be placed or opened before the host confirmed the pickup,
+  and a delayed or rejected transfer could leave two copies of the same item.** A pickup is now
+  held and protected from the moment you take it, and an answer the game is slow to deliver is
+  retried until the host confirms it instead of being treated as accepted after a timeout. This
+  covers taking an item off a shelf and immediately using it, and adding or removing items while
+  the other player is editing the same box.
+- **Fixed: opening or closing a loose box without picking it up did not update the lid on the
+  other player's screen.** A guest can now open, close, add to, and take from a loose box, and the
+  lid and contents stay consistent for both players.
+- **Fixed: after stopping and starting a session, hiring or interacting with a worker and changing
+  shop settings (decorations, equipment, game-event fees, cashiers, and table numbers) could
+  silently stop working.** The affected systems now reconnect on every session.
+- **Fixed: a card placed on a display that the host never confirmed could stay on the shelf
+  forever without a word.** The card is now kept safely on the display and you are told it is still
+  waiting for the host, instead of the shelf quietly disagreeing; if the host explicitly rejects
+  the placement, the card is returned to the binder.
+- **Fixed: opening a graded-card return box could fail with a misleading "save drift" message.**
+  Failures now explain the real reason, including when the other player is holding the box or is
+  missing a card content pack.
+- The SETTINGS tab gained **latency testing** sliders that add artificial delay and jitter to
+  incoming network traffic, so connection problems can be reproduced on purpose.
+- **Item transfers are now confirmed by a single answer from the host.** A pickup or placement is
+  retried until the host's answer actually arrives, but the host applies it only once and gives a
+  single deciding answer: it either goes through or the item is returned exactly once, so a slow
+  connection cannot apply a transfer twice or leave an item caught between the two players.
+
+Both players must update.
+
+---
+
 ## 1.1.0
 **A safer, fuller co-op session with the game's real register and a more reliable network.**
 Both players must update.

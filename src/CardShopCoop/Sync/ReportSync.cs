@@ -29,7 +29,7 @@ namespace CardShopCoop.Sync
     /// past-list, reset day collect) that keeps the phone's report history aligned with
     /// the host's - and is what hands the joiner his movement back.
     /// </summary>
-    public class ReportSync
+    public class ReportSync : TickableCoopModule
     {
         /// <summary>True while ClientApplyState writes host data, so our patches never
         /// mistake a sync write for local play.</summary>
@@ -37,8 +37,6 @@ namespace CardShopCoop.Sync
 
         public Action<INetMessage> BroadcastState; // set by CoopCore: host -> clients
 
-        private const float Interval = 2f;
-        private const float HealEvery = 15f;
         private const int ReviewTail = 15; // enough to bridge a missed heal; reviews are rare
 
         // host: set by patches (static, patches can't see the instance), drained by HostTick
@@ -75,9 +73,7 @@ namespace CardShopCoop.Sync
         private static readonly System.Reflection.FieldInfo FiCashMode =
             ReflectionSurface.RequiredField(typeof(InteractionPlayerController), "m_IsCashCounterMode");
 
-        private float _timer;
-        private int _lastHash;
-        private float _heal;
+        private readonly SnapshotGate _gate = new SnapshotGate(2f, 15f, -4.1f);
         private int _reviewSeq; // client: m_CustomerReviewCount high-water mark (dedup key)
 
         // NEVER CSingleton<>.Instance for these: the open-screen broadcast can land
@@ -88,13 +84,29 @@ namespace CardShopCoop.Sync
         private static EndOfDayReportScreen _screen;
         private static InteractionPlayerController _ipc;
 
-        public void Reset()
+        public override string Name => "report";
+
+        protected override void OnHostTick(in SyncFrame frame) => HostTick(frame.Dt, frame.InGame);
+
+        public override void Dispose()
         {
-            _timer = -4.1f; // staggered phase vs the other snapshot engines
-            _lastHash = 0;
-            _heal = 0f;
+            base.Dispose();
+            ApplyingRemote = false;
+            s_openPending = false;
+            s_openSnapshot = default(GameReportDataCollect);
+            s_reviewsDirty = false;
+            s_clientOpenReport = default(GameReportDataCollect);
+            s_haveOpenReport = false;
+            _screen = null;
+            _ipc = null;
+        }
+
+        public override void Reset()
+        {
+            _gate.Reset(-4.1f);
             _reviewSeq = -1;
             s_openPending = false;
+            s_openSnapshot = default(GameReportDataCollect);
             s_reviewsDirty = false;
             // last session's recap must not ride along: a stale copy here would be filed
             // into the NEXT save's phone history the first time the joiner closes a report
@@ -104,10 +116,9 @@ namespace CardShopCoop.Sync
             _ipc = null;
         }
 
-        public void ForceResend()
+        public override void ForceResend()
         {
-            _lastHash = 0;
-            _heal = HealEvery; // next tick broadcasts even if the hash collides
+            _gate.Force();
         }
 
         // ---------------- patches ----------------
@@ -170,7 +181,7 @@ namespace CardShopCoop.Sync
                 if (!EndOfDayReportScreen.IsActive())
                     return;
             }
-            catch { return; }
+            catch (System.Exception e) { Swallow.Log(e); return; }
             s_openSnapshot = CPlayerData.m_GameReportDataCollect; // value copy
             s_openPending = true;
         }
@@ -197,7 +208,7 @@ namespace CardShopCoop.Sync
             {
                 lerping = FiIsLerping != null && (bool)FiIsLerping.GetValue(__instance);
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             if (lerping)
                 return true; // vanilla behavior: fast-forward the count-up
             // Vanilla's other branch runs OnPressGoNextDay() whenever GetHasDayEnded() is
@@ -244,36 +255,28 @@ namespace CardShopCoop.Sync
             {
                 s_openPending = false;
                 var snap = s_openSnapshot;
-                try
+                Guarded("host", () =>
                 {
                     BroadcastState(BuildState(snap, openScreen: true));
-                    _heal = 0f;
-                }
-                catch (Exception e) { CoopPlugin.Log.LogWarning("ReportSync open: " + e.Message); }
+                });
                 return;
             }
 
-            _timer += dt;
-            if (_timer < Interval)
+            if (!_gate.Due(dt))
                 return;
-            _timer -= Interval;
-            try
+            Guarded("host", () =>
             {
                 if (s_reviewsDirty)
                 {
                     s_reviewsDirty = false;
-                    _lastHash = 0; // bust the gate: ship the new review this tick
+                    _gate.Force(); // bust the gate: ship the new review this tick
                 }
                 int hash = HashState();
-                _heal += Interval;
-                if (hash == _lastHash && _heal < HealEvery)
+                if (!_gate.ShouldSend(hash))
                     return;
-                _lastHash = hash;
-                _heal = 0f;
                 var live = CPlayerData.m_GameReportDataCollect;
                 BroadcastState(BuildState(live, openScreen: false));
-            }
-            catch (Exception e) { CoopPlugin.Log.LogWarning("ReportSync host: " + e.Message); }
+            });
         }
 
         private static int HashState()
@@ -369,9 +372,8 @@ namespace CardShopCoop.Sync
             ApplyingRemote = true;
             try
             {
-                ClientApplyInner(message);
+                Guarded("apply", () => ClientApplyInner(message));
             }
-            catch (Exception e) { CoopPlugin.Log.LogWarning("ReportSync apply: " + e.Message); }
             finally { ApplyingRemote = false; }
         }
 
@@ -477,7 +479,7 @@ namespace CardShopCoop.Sync
                         if (FiPhoneMode != null && (bool)FiPhoneMode.GetValue(pc))
                             return;
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                     // vanilla ShowGoNextDayScreen exits register mode before opening. The
                     // bare OnExitCashCounterMode clears the IPC flag but leaves the counter's
                     // m_IsMannedByPlayer and the co-op claim set, and on a joiner the recap
@@ -488,12 +490,12 @@ namespace CardShopCoop.Sync
                         if (FiCashMode != null && (bool)FiCashMode.GetValue(pc))
                             pc.OnExitCashCounterMode();
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                     try
                     {
                         Sync.RegisterSync.ForceExitManned();
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                 }
                 // SaveGameData inside OpenScreen is already no-op'd for joiners by
                 // GamePatches.SaveGuardPrefix; everything else in there is pure UI
@@ -546,7 +548,7 @@ namespace CardShopCoop.Sync
                 {
                     SoundManager.SetEnableSound_CoinIncrease(false);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
 
                 // Re-assert the report this screen actually displayed so a host that
                 // already moved on (and healed a reset report over us) can't make us
@@ -576,12 +578,12 @@ namespace CardShopCoop.Sync
                 {
                     FiHoldingMouseDown?.SetValue(_screen, false);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
                 try
                 {
                     FiMouseDownTime?.SetValue(_screen, 0f);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("ReportSync close screen: " + e.Message); }
         }

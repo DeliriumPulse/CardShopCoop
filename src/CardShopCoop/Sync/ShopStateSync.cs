@@ -19,7 +19,7 @@ namespace CardShopCoop.Sync
     /// the host's vanilla path does the one and only charge, and the state broadcast is
     /// the echo that updates the joiner's phone/signs.
     /// </summary>
-    public class ShopStateSync
+    public class ShopStateSync : TickableCoopModule
     {
         // ShopOp sub-ops (first byte of the payload)
         private const byte OpPayBill = 1;    // + byte: 0=all, else (byte)EBillType
@@ -61,9 +61,7 @@ namespace CardShopCoop.Sync
         public Action<INetMessage> SendOp;         // set by CoopCore: client -> host
         public Action<INetMessage> BroadcastState; // set by CoopCore: host -> clients
 
-        private float _timer;
-        private int _lastHash;
-        private float _heal;
+        private readonly SnapshotGate _gate = new SnapshotGate(1f, 15f, -1.9f);
         private double _lastRoomRepaint;
         private RentBillScreen _billScreen;                        // phone screen, often inactive
         private InteractableOpenCloseSign _openSign;               // world object by the door
@@ -85,11 +83,14 @@ namespace CardShopCoop.Sync
             _instance = this;
         }
 
-        public void Reset()
+        public override string Name => nameof(ShopStateSync);
+
+        public override void Start() => _instance = this;
+        protected override void OnHostTick(in SyncFrame frame) => HostTick(frame.Dt, frame.InGame);
+
+        public override void Reset()
         {
-            _timer = -1.9f; // staggered phase vs the other snapshot engines
-            _lastHash = 0;
-            _heal = 0f;
+            _gate.Reset(-1.9f);
             _billScreen = null;
             _openSign = null;
             _warehouseSign = null;
@@ -97,10 +98,17 @@ namespace CardShopCoop.Sync
             _shelfMgr = null;
         }
 
-        public void ForceResend()
+        public override void ForceResend()
         {
-            _lastHash = 0;
-            _heal = 15f; // next tick broadcasts even if the hash collides
+            _gate.Force();
+        }
+
+        public override void Dispose()
+        {
+            base.Dispose();
+            if (ReferenceEquals(_instance, this))
+                _instance = null;
+            ApplyingRemote = false;
         }
 
         // ---------------- cached lookups ----------------
@@ -275,11 +283,9 @@ namespace CardShopCoop.Sync
         {
             if (!inGame || BroadcastState == null)
                 return;
-            _timer += dt;
-            if (_timer < 1f)
+            if (!_gate.Due(dt))
                 return;
-            _timer -= 1f;
-            try
+            Guarded("host", () =>
             {
                 // tiny fixed-size snapshot: hash-gate so the wire stays quiet while
                 // nothing changes; the slow heal repairs any client that missed one
@@ -301,14 +307,10 @@ namespace CardShopCoop.Sync
                 if (tutList != null)
                     foreach (var td in tutList)
                         hash = hash * 31 + ((int)td.tutorialTaskCondition * 397) + (int)(td.value * 100f);
-                _heal += 1f;
-                if (hash == _lastHash && _heal < 15f)
+                if (!_gate.ShouldSend(hash))
                     return;
-                _lastHash = hash;
-                _heal = 0f;
                 BroadcastState(BuildStateMessage());
-            }
-            catch (Exception e) { CoopPlugin.Log.LogWarning("ShopStateSync host: " + e.Message); }
+            });
         }
 
         private static ShopStateMessage BuildStateMessage()
@@ -474,7 +476,7 @@ namespace CardShopCoop.Sync
                 if (_shelfMgr != null)
                     _shelfMgr.SaveInteractableObjectData();
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
         }
 
         private void HostToggleSign(byte which)
@@ -503,9 +505,8 @@ namespace CardShopCoop.Sync
             ApplyingRemote = true;
             try
             {
-                ClientApplyInner(message);
+                Guarded("apply", () => ClientApplyInner(message));
             }
-            catch (Exception e) { CoopPlugin.Log.LogWarning("ShopStateSync apply: " + e.Message); }
             finally { ApplyingRemote = false; }
         }
 
@@ -570,12 +571,12 @@ namespace CardShopCoop.Sync
                 {
                     MiBillEvaluateUI?.Invoke(_billScreen, null);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
                 try
                 {
                     MiBillNotification?.Invoke(_billScreen, null);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
 
             // unlocks: the manager methods are pure world changes (blocker off, door
@@ -623,7 +624,7 @@ namespace CardShopCoop.Sync
                     {
                         MiOpenSignMesh?.Invoke(sign, null);
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                 }
             }
             if (CPlayerData.m_IsWarehouseDoorClosed != wantWarehouseClosed)
@@ -636,7 +637,7 @@ namespace CardShopCoop.Sync
                     {
                         MiWarehouseSignMesh?.Invoke(sign, null);
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                 }
                 else if (urm != null)
                     urm.EvaluateWarehouseRoomOpenClose(); // entry gate still must move

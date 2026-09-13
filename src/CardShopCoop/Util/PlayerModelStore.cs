@@ -54,7 +54,7 @@ namespace CardShopCoop.Util
                     if (File.Exists(temp))
                         File.Delete(temp);
                 }
-                catch { }
+                catch (System.Exception caught) { Swallow.Log(caught); }
             }
         }
     }

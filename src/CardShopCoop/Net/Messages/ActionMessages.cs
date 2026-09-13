@@ -41,6 +41,7 @@ namespace CardShopCoop.Net.Messages
         public int ObjectKey;
         // Host is 0; clients use their host connection id. This survives host relay.
         public int SourceId;
+        public bool IsBox;
         public Vector3 Pos;
         public Quaternion Rot;
         public bool Valid;
@@ -49,23 +50,6 @@ namespace CardShopCoop.Net.Messages
             get
             {
                 return MsgType.MovePreview;
-            }
-        }
-    }
-
-    [NetworkMessage(MsgType.BoxMovePreview, Delivery = Delivery.Transient)]
-    public sealed class BoxMovePreviewMessage : INetMessage
-    {
-        public byte Phase; // 0 = start, 1 = update, 2 = stop
-        public int BoxId;
-        public int SourceId;
-        public Vector3 Pos;
-        public float Yaw;
-        public MsgType Type
-        {
-            get
-            {
-                return MsgType.BoxMovePreview;
             }
         }
     }

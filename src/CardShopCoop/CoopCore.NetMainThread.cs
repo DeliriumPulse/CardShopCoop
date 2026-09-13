@@ -51,7 +51,7 @@ namespace CardShopCoop
         {
             if (m.Type != MsgType.CardDeltaBatch)
                 return 1;
-            int n = m.Message is CardDeltaBatchMessage batch ? batch.Deltas.Count : 0;
+            int n = m.Message is CardDeltaBatchMessage batch ? batch.Deltas?.Count ?? 0 : 0;
             if (n < 1)
                 return 1;
             return n > CardDeltaBatchMax ? CardDeltaBatchMax : n;
@@ -97,96 +97,6 @@ namespace CardShopCoop
                 return false;
             var tmp = sel.GetComponent<TMPro.TMP_InputField>();
             return tmp != null && tmp.isFocused;
-        }
-
-        private static bool IsRetryableDispatch(MsgType type)
-        {
-            switch (type)
-            {
-                case MsgType.ShelfRequest:
-                case MsgType.CardShelfRequest:
-                case MsgType.ObjMoveRequest:
-                case MsgType.BoxRequest:
-                case MsgType.BoxRemoved:
-                case MsgType.ItemPriceContrib:
-                case MsgType.LicenseUnlock:
-                case MsgType.StaffOp:
-                case MsgType.ShopOp:
-                case MsgType.SettingsOp:
-                case MsgType.ContainerOp:
-                case MsgType.GradingOp:
-                case MsgType.TradeOp:
-                case MsgType.CardBoxOp:
-                case MsgType.FurnBoxOp:
-                case MsgType.RegisterOp:
-                case MsgType.TvOp:
-                case MsgType.EconContrib:
-                case MsgType.PurchaseRequest:
-                case MsgType.SprayHit:
-                case MsgType.GradedRemove:
-                case MsgType.CardDelta:
-                case MsgType.CardDeltaBatch:
-                    return true;
-                default:
-                    return false;
-            }
-        }
-
-        private void RequestDispatchHeal(MsgType type)
-        {
-            // These calls only set a module's next-send flag; they do not walk game state,
-            // so a failed dispatch cannot blow the frame budget a second time.
-            switch (type)
-            {
-                case MsgType.ShelfRequest:
-                    _cardShelves.ForceNextTick();
-                    break;
-                case MsgType.CardShelfRequest:
-                    _cardShelves.ForceNextTick();
-                    break;
-                case MsgType.ObjMoveRequest:
-                    _objMoves.ForceNextTick();
-                    break;
-                case MsgType.BoxRequest:
-                    _boxes.ForceBroadcastNextTick();
-                    break;
-                case MsgType.RegisterOp:
-                    _register.ForceResend();
-                    break;
-                case MsgType.StaffOp:
-                    _staff.ForceResend();
-                    break;
-                case MsgType.ShopOp:
-                    _shopState.ForceResend();
-                    break;
-                case MsgType.SettingsOp:
-                    _settings.ForceResend();
-                    break;
-                case MsgType.ContainerOp:
-                    _containers.ForceResend();
-                    break;
-                case MsgType.GradingOp:
-                    _grading.ForceResend();
-                    break;
-                case MsgType.TradeOp:
-                    _trades.ForceResend();
-                    break;
-                case MsgType.CardBoxOp:
-                    _cardBoxes.ForceResend();
-                    break;
-                case MsgType.FurnBoxOp:
-                    _furnBoxes.ForceResend();
-                    break;
-                case MsgType.TvOp:
-                    _tv.ForceResend();
-                    break;
-                default:
-                    // Economy, purchase, and one-shot card operations are healed by the
-                    // normal state cadence; never replay them after bounded failure.
-                    _coinHeal = 999f;
-                    _progressHeal = 999f;
-                    break;
-            }
         }
 
     }

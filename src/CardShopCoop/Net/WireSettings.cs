@@ -17,7 +17,9 @@ namespace CardShopCoop.Net
             {
                 Culture = CultureInfo.InvariantCulture,
                 Formatting = Formatting.None,
-                NullValueHandling = NullValueHandling.Include,
+                // Preserve constructor-initialised collection defaults when an untrusted peer
+                // explicitly sends null. Nullable scalars are handled by their DTO defaults.
+                NullValueHandling = NullValueHandling.Ignore,
                 ContractResolver = new WireContractResolver(),
                 MissingMemberHandling = MissingMemberHandling.Error,
                 MaxDepth = 128,
@@ -30,7 +32,6 @@ namespace CardShopCoop.Net
             settings.Converters.Add(new Vector3Converter());
             settings.Converters.Add(new QuaternionConverter());
             settings.Converters.Add(new WorldEntryConverter());
-            settings.Converters.Add(new BoxEntryConverter());
             settings.Converters.Add(new ObjMoveEntryConverter());
             settings.Converters.Add(new PopulationStateConverter());
             settings.Converters.Add(new PlayerStateConverter());
@@ -102,7 +103,11 @@ namespace CardShopCoop.Net
             if (r.TokenType != JsonToken.StartArray)
                 throw new JsonSerializationException("Expected vector array");
             while (r.Read() && r.TokenType != JsonToken.EndArray)
+            {
+                if (a.Count >= count)
+                    throw new JsonSerializationException("Too many vector components");
                 a.Add(r.Value);
+            }
             if (a.Count != count)
                 throw new JsonSerializationException("Wrong vector component count");
             return a;
@@ -131,7 +136,11 @@ namespace CardShopCoop.Net
             if (r.TokenType != JsonToken.StartArray)
                 throw new JsonSerializationException("Expected quaternion array");
             while (r.Read() && r.TokenType != JsonToken.EndArray)
+            {
+                if (a.Count >= 4)
+                    throw new JsonSerializationException("Too many quaternion components");
                 a.Add(r.Value);
+            }
             if (a.Count != 4)
                 throw new JsonSerializationException("Wrong quaternion component count");
             return new Quaternion(Convert.ToSingle(a[0], CultureInfo.InvariantCulture), Convert.ToSingle(a[1], CultureInfo.InvariantCulture), Convert.ToSingle(a[2], CultureInfo.InvariantCulture), Convert.ToSingle(a[3], CultureInfo.InvariantCulture));

@@ -60,7 +60,7 @@ namespace CardShopCoop.Sync
     ///    are genuinely unrepairable in place; the clean reset is a rejoin, which transfers the
     ///    host's grading store again.
     /// </summary>
-    public class GradingSync
+    public class GradingSync : TickableCoopModule
     {
         /// <summary>The live module instance, for the static Harmony patches.</summary>
         public static GradingSync Instance;
@@ -122,7 +122,7 @@ namespace CardShopCoop.Sync
                 return t == null ? null
                     : Util.ReflectionSurface.OptionalMethod(t, "Prefix", new[] { typeof(GradedCardSubmitSelectScreen) });
             }
-            catch { return null; }
+            catch (System.Exception e) { Swallow.Log(e); return null; }
         }
 
         /// <summary>One-shot latch for the fail-open notice in <see cref="GoVetoesSubmit"/>.</summary>
@@ -179,9 +179,7 @@ namespace CardShopCoop.Sync
             }
         }
 
-        private float _timer;
-        private int _lastHash;
-        private float _heal;
+        private readonly SnapshotGate _gate = new SnapshotGate(1.5f, 15f, -6.8f);
         private GradeCardWebsiteUIScreen _website; // cached lookup (client UI refresh)
 
         // NEVER CSingleton<InventoryBase>.Instance: touched while no real manager
@@ -203,6 +201,10 @@ namespace CardShopCoop.Sync
             Instance = this;
         }
 
+        public override string Name => "grading";
+
+        protected override void OnHostTick(in SyncFrame frame) => HostTick(frame.Dt, frame.InGame);
+
         /// <summary>Disable static Harmony hooks before session state is torn down.</summary>
         public static void ClearLive()
         {
@@ -215,19 +217,16 @@ namespace CardShopCoop.Sync
             Instance = instance;
         }
 
-        public void Reset()
+        public override void Reset()
         {
-            _timer = -6.8f; // staggered phase vs the other snapshot engines
-            _lastHash = 0;
-            _heal = 0f;
+            _gate.Reset(-6.8f);
             _website = null;
             _inv = null;
         }
 
-        public void ForceResend()
+        public override void ForceResend()
         {
-            _lastHash = 0;
-            _heal = 999f; // beats the hash gate even if the real hash is 0
+            _gate.Force();
         }
 
         // ---------------- patches ----------------
@@ -475,7 +474,7 @@ namespace CardShopCoop.Sync
                         && !float.IsNaN(onScreen) && !float.IsInfinity(onScreen) && onScreen > 0f)
                         total = onScreen;
                 }
-                catch { } // any reflection hiccup falls through to the vanilla-flat total
+                catch (System.Exception e) { Swallow.Log(e); } // any reflection hiccup falls through to the vanilla-flat total
             }
             if (CPlayerData.m_CoinAmountDouble < (double)total)
             {
@@ -560,13 +559,13 @@ namespace CardShopCoop.Sync
             {
                 screen.m_GradeCardWebsiteUIScreen?.UpdateSubmissionProgressPanelUI();
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             try
             {
                 CSingleton<InteractionPlayerController>.Instance
                     ?.m_CollectionBinderFlipAnimCtrl?.SetCanUpdateSort(canSort: true);
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
 
             if (CoopCore.Instance != null)
             {
@@ -600,24 +599,18 @@ namespace CardShopCoop.Sync
         {
             if (!inGame)
                 return;
-            _timer += dt;
-            if (_timer < 1.5f)
+            if (!_gate.Due(dt))
                 return;
-            _timer -= 1.5f;
-            try
+            Guarded("host", () =>
             {
                 var list = CPlayerData.m_GradeCardInProgressList;
                 if (list == null)
                     return;
                 int hash = ComputeHash(list);
-                _heal += 1.5f;
-                if (hash == _lastHash && _heal < 15f)
+                if (!_gate.ShouldSend(hash))
                     return;
-                _lastHash = hash;
-                _heal = 0f;
                 BroadcastState?.Invoke(BuildState(list));
-            }
-            catch (Exception e) { CoopPlugin.Log.LogWarning("GradingSync host: " + e.Message); }
+            });
         }
 
         /// <summary>Host: a joiner submitted cards for grading. Replicates the body of
@@ -898,7 +891,7 @@ namespace CardShopCoop.Sync
                         if (Mathf.Abs(vanillaFlat - clientFee) > 0.01f)
                             CoopPlugin.Log.LogInfo($"GradingSync: GO fee forwarded - charging guest's on-screen bill {clientFee} (vanilla-flat recompute would have been {vanillaFlat})");
                     }
-                    catch { } // diagnostic only; never blocks the charge
+                    catch (System.Exception e) { Swallow.Log(e); } // diagnostic only; never blocks the charge
                 }
                 else
                 {
@@ -997,7 +990,7 @@ namespace CardShopCoop.Sync
                     if (_website != null && _website.gameObject.activeInHierarchy)
                         _website.UpdateSubmissionProgressPanelUI();
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
             catch (Exception e)
             {
@@ -1019,9 +1012,8 @@ namespace CardShopCoop.Sync
             ApplyingRemote = true;
             try
             {
-                ClientApplyInner(message);
+                Guarded("apply", () => ClientApplyInner(message));
             }
-            catch (Exception e) { CoopPlugin.Log.LogWarning("GradingSync apply: " + e.Message); }
             finally { ApplyingRemote = false; }
         }
 
@@ -1067,7 +1059,7 @@ namespace CardShopCoop.Sync
                         if (svc != null)
                             set.m_DayPassed = Mathf.Clamp(set.m_DayPassed, 0, Mathf.Max(0, svc.m_ServiceDays - 1));
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                 }
                 // Read bound = MaxSubmitSlots, the same number BuildState uses. An 8 here would
                 // STOP READING mid-set on any Grading Overhaul job longer than eight cards and
@@ -1096,7 +1088,7 @@ namespace CardShopCoop.Sync
                 if (_website != null && _website.gameObject.activeInHierarchy)
                     _website.UpdateSubmissionProgressPanelUI();
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
         }
 
         // ---------------- wire / hash ----------------

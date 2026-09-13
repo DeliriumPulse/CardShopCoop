@@ -110,7 +110,7 @@ namespace CardShopCoop.Sync
                     {
                         live = fld.FieldType.GetField("instance", F)?.GetValue(null);
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                     if (live != null)
                     {
                         if (saved != null)
@@ -178,7 +178,7 @@ namespace CardShopCoop.Sync
                 object who = t.GetField("m_PlayerName", F)?.GetValue(saved);
                 return Describe(day is int d ? d : (int?)null, who as string);
             }
-            catch { return null; }
+            catch (System.Exception e) { Swallow.Log(e); return null; }
         }
 
         /// <summary>Identity scanned straight out of the save JSON - the slot-file path, where
@@ -237,7 +237,7 @@ namespace CardShopCoop.Sync
 
                 return Describe(day, who);
             }
-            catch { return null; }
+            catch (System.Exception e) { Swallow.Log(e); return null; }
         }
 
         /// <summary>Format the two fields, tolerating either being unavailable. Null when
@@ -275,7 +275,7 @@ namespace CardShopCoop.Sync
                     return true;
                 return (int)f.GetValue(saved) == expectedSaveIndex;
             }
-            catch { return true; }
+            catch (System.Exception e) { Swallow.Log(e); return true; }
         }
 
         /// <summary>Host: flush the live game into the THROWAWAY snapshot slot (never the host's
@@ -299,14 +299,14 @@ namespace CardShopCoop.Sync
                 if (File.Exists(path))
                     File.Delete(path);
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             try
             {
                 string gd = Application.persistentDataPath + "/savedGames_Release" + HostSnapshotSlot + ".gd";
                 if (File.Exists(gd))
                     File.Delete(gd);
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             int prevSlot = gm.m_CurrentSaveLoadSlotSelectedIndex;
             // FRESHNESS CLOCK. The two deletes above swallow their failures on purpose (an
             // antivirus or cloud-sync client can hold the file open for a moment, and a
@@ -374,7 +374,7 @@ namespace CardShopCoop.Sync
                 {
                     id = DescribeWorldJson(new UTF8Encoding(false).GetString(bytes));
                 }
-                catch { } // a log line is never worth failing a join over
+                catch (System.Exception e) { Swallow.Log(e); } // a log line is never worth failing a join over
                 CoopPlugin.Log.LogInfo("coop: shipping world from slot file" +
                     (id != null ? " - " + id : "") + $" ({bytes.Length / 1024} KB)");
                 return bytes;

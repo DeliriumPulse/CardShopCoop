@@ -25,7 +25,7 @@ namespace CardShopCoop
                 }
                 return h;
             }
-            catch { return 0; }
+            catch (System.Exception e) { Swallow.Log(e); return 0; }
         }
 
         // ---- EPL virtual catalog bridge ----
@@ -65,7 +65,7 @@ namespace CardShopCoop
                 var l = a == null ? null : _eplItemLibProp?.GetValue(a);
                 return (l == null ? null : _eplRestockProp?.GetValue(l) as System.Collections.ICollection)?.Count ?? 0;
             }
-            catch { return 0; }
+            catch (System.Exception e) { Swallow.Log(e); return 0; }
         }
 
         /// <summary>Full catalog size as the GAME sees it: raw vanilla rows plus EPL's
@@ -77,7 +77,7 @@ namespace CardShopCoop
             {
                 raw = Inv().m_StockItemData_SO.m_RestockDataList.Count;
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             return raw + EplExtraCount();
         }
 
@@ -89,7 +89,7 @@ namespace CardShopCoop
             {
                 return InventoryBase.GetRestockData(i);
             }
-            catch { return null; }
+            catch (System.Exception e) { Swallow.Log(e); return null; }
         }
 
         /// <summary>Find OUR restock entry for a partner's (itemType, boxSize) identity.
@@ -130,7 +130,7 @@ namespace CardShopCoop
                             return i;
                     }
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             return -1;
         }
 

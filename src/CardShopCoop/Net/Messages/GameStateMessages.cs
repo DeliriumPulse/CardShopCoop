@@ -66,6 +66,12 @@ namespace CardShopCoop.Net.Messages
         public List<MarketCardEntry> GenCardMarketPriceListMegabot = new List<MarketCardEntry>();
         public List<MarketCardEntry> GenCardMarketPriceListFantasyRPG = new List<MarketCardEntry>();
         public List<MarketCardEntry> GenCardMarketPriceListCatJob = new List<MarketCardEntry>();
+        // Card market multiplier table (GetMarketPrice reads it for GRADED cards). Generated
+        // locally with Unity Random on the client by RestockManager.Init, so it must be
+        // overwritten by the host's copy or graded binder prices diverge.
+        public List<float> GenGradedCardPriceMultiplierList = new List<float>();
+        // Modded-expansion card market changes (see MarketModdedCardEntry).
+        public List<MarketModdedCardEntry> ModdedCards = new List<MarketModdedCardEntry>();
         public List<float> SetGameEventPriceList = new List<float>();
         public List<float> GeneratedGameEventPriceList = new List<float>();
         public List<float> GameEventPricePercentChangeList = new List<float>();
@@ -94,6 +100,21 @@ namespace CardShopCoop.Net.Messages
     {
         public short Percent;
         public float GeneratedMarketPrice;
+    }
+
+    /// <summary>One modded-expansion card market change. The host hooks the
+    /// game's AddCardPricePercentChange / SetCardGeneratedMarketPrice (which EPL prefixes,
+    /// not replaces) and the client replays the same calls, so EPL's own prefix stores it
+    /// locally - no EPL types or save-data access here.</summary>
+    public sealed class MarketModdedCardEntry
+    {
+        public ECardExpansionType Expansion;
+        public int Index;
+        public bool IsDestiny;
+        public bool HasPercent;
+        public float Percent;   // absolute pricePercentChangeList; client converts to a delta
+        public float Base;      // absolute generated base, applied only when HasBase
+        public bool HasBase;
     }
 
     /// <summary>One non-zero sparse base-price row (index is an EItemType, raw wire id space).</summary>
@@ -361,6 +382,11 @@ namespace CardShopCoop.Net.Messages
         public bool HostBusy;
         public byte ResultSeq;
         public string Result = "";
+        /// <summary>Counter the latest result belongs to (255 = none). The guest uses this to
+        /// drive its open CustomerTradeCardScreen to the host-confirmed outcome.</summary>
+        public byte ResultCounter = 255;
+        /// <summary>TradeServe.Outcome*: what the host decided for ResultCounter.</summary>
+        public byte ResultOutcome;
         public List<TradeOfferEntry> Offers = new List<TradeOfferEntry>();
 
         public MsgType Type

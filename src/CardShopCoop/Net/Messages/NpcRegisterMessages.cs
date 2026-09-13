@@ -48,6 +48,25 @@ namespace CardShopCoop.Net.Messages
 
     }
 
+    [NetworkMessage(MsgType.NpcMoneyPopup, Policy = MessagePolicy.ClientOnly)]
+    public sealed class NpcMoneyPopupMessage : INetMessage
+    {
+        public ushort Index;
+        public int Identity;
+        public float Amount;
+        public float OffsetUp;
+
+        public MsgType Type
+        {
+            get
+            {
+                return MsgType.NpcMoneyPopup;
+            }
+        }
+
+
+    }
+
     /// <summary>One NPC snapshot within an NpcState batch. Flags is the raw wire byte
     /// (the game's NpcFlags is a private nested enum in NpcSync).</summary>
     public sealed class NpcEntry
@@ -63,6 +82,8 @@ namespace CardShopCoop.Net.Messages
         public byte Flags;
         public int ActionSequence;
         public byte ActionKind;
+        public bool HoldBig;
+        public int HoldItemType;
     }
 
     // ---- RegisterState --------------------------------------------------------
@@ -103,6 +124,7 @@ namespace CardShopCoop.Net.Messages
     //     (ushort customerIndex, int customerGeneration, string characterName,
     //      byte state, bool isCard, double paidAmount, double totalScanned,
     //      float customerTotalScanned,
+    //      double currentMoneyChange, bool changeReady, bool changeStarted, bool tooMuchChange,
     //      byte itemCount, (EItemType, float price) x itemCount, bool scanned x itemCount,
     //      byte cardCount, (CardData, float price) x cardCount, bool scanned x cardCount).
 
@@ -136,6 +158,12 @@ namespace CardShopCoop.Net.Messages
         public double PaidAmount;
         public double TotalScanned;
         public float CustomerTotalScanned;
+        // Live checkout change state, so a client that takes over (or reconstructs) mid-change
+        // sees the money already on the table and computes the same readiness as the host.
+        public double CurrentMoneyChange;
+        public bool ChangeReady;
+        public bool ChangeStarted;
+        public bool TooMuchChange;
         public System.Collections.Generic.List<EItemType> ItemTypes = new System.Collections.Generic.List<EItemType>();
         public System.Collections.Generic.List<float> ItemPrices = new System.Collections.Generic.List<float>();
         public System.Collections.Generic.List<bool> ItemScanned = new System.Collections.Generic.List<bool>();
@@ -144,12 +172,33 @@ namespace CardShopCoop.Net.Messages
         public System.Collections.Generic.List<bool> CardScanned = new System.Collections.Generic.List<bool>();
     }
 
-    // ---- RegisterOp -----------------------------------------------------------
-    // client -> host (reliable). The manning player's register action; replayed on
-    // the host through vanilla public methods. Mirrors RegisterSync.HostApplyOp and
-    // the client-side emitters: [byte index][byte op][op-specific payload].
+    // host -> client (reliable). The host could not apply the manning player's op because
+    // its authoritative register state disagrees; the client must drop its optimistic local
+    // state for that counter and rebuild from the next authoritative cart.
+    [NetworkMessage(MsgType.RegisterRejected, Policy = MessagePolicy.ClientOnly)]
+    public sealed class RegisterRejectedMessage : INetMessage
+    {
+        public byte Index;
 
-    [NetworkMessage(MsgType.RegisterOp, Policy = MessagePolicy.HostOnly)]
+        public MsgType Type
+        {
+            get
+            {
+                return MsgType.RegisterRejected;
+            }
+        }
+    }
+
+    // ---- RegisterOp -----------------------------------------------------------
+    // Both ways (reliable), reusing one DTO.
+    //  - client -> host: the manning player's register action; replayed on the host through
+    //    vanilla public methods (RegisterSync.HostApplyOp).
+    //  - host -> clients: an applied OpGiveChange, replayed visually so every client sees the
+    //    money on the table (RegisterSync.ClientApplyChange). The cart's CurrentMoneyChange/
+    //    ChangeReady scalars are the catch-up/ordering backstop.
+    // Mirrors the client-side emitters: [byte index][byte op][op-specific payload].
+
+    [NetworkMessage(MsgType.RegisterOp, Policy = MessagePolicy.Any)]
     public sealed class RegisterOpMessage : INetMessage
     {
         public byte Index;

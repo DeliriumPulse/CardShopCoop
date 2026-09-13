@@ -175,7 +175,7 @@ namespace CardShopCoop.Net
                                       StringComparison.OrdinalIgnoreCase))
                         return true;
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
 
             // (b) Not loaded YET? Force a partial bind. DO NOT "SIMPLIFY" THIS AWAY: our
             //     Awake can easily run before the game first touches Steamworks, so (a)
@@ -187,7 +187,7 @@ namespace CardShopCoop.Net
                 if (Type.GetType("Steamworks.SteamAPI, com.rlabrecque.steamworks.net", false) != null)
                     return true;
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
 
             return false;
         }
@@ -243,7 +243,7 @@ namespace CardShopCoop.Net
                             break;
                         }
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
             return _gameAsm;
         }
@@ -326,7 +326,7 @@ namespace CardShopCoop.Net
                 types = asm.GetTypes();
             }
             catch (ReflectionTypeLoadException e) { types = e.Types; }
-            catch { return false; }
+            catch (System.Exception e) { Swallow.Log(e); return false; }
             if (types == null)
                 return false;
             foreach (var t in types)
@@ -338,7 +338,7 @@ namespace CardShopCoop.Net
                     if (t.Name.IndexOf("Gamecore", StringComparison.OrdinalIgnoreCase) >= 0)
                         return true;
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
             return false;
         }

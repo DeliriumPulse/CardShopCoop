@@ -455,7 +455,7 @@ namespace CardShopCoop.Util
             {
                 return f() ?? new List<string>();
             }
-            catch { return new List<string>(); }
+            catch (System.Exception e) { Swallow.Log(e); return new List<string>(); }
         }
 
         private static void Log(string s)
@@ -464,7 +464,7 @@ namespace CardShopCoop.Util
             {
                 CoopPlugin.Log.LogInfo("EnumMap: " + s);
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
         }
 
         private static void LogWarn(string s)
@@ -473,7 +473,7 @@ namespace CardShopCoop.Util
             {
                 CoopPlugin.Log.LogWarning("EnumMap: " + s);
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
         }
     }
 }

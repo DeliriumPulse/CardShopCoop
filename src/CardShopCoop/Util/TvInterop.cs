@@ -78,7 +78,7 @@ namespace CardShopCoop.Util
                 object v = Get(field);
                 return v == null ? fallback : (TVal)v;
             }
-            catch { return fallback; }
+            catch (System.Exception e) { Swallow.Log(e); return fallback; }
         }
 
         private static Component Master()
@@ -90,7 +90,7 @@ namespace CardShopCoop.Util
                     return list[0] as Component;
                 return UnityEngine.Object.FindObjectOfType(T) as Component;
             }
-            catch { return null; }
+            catch (System.Exception e) { Swallow.Log(e); return null; }
         }
 
         public static string StreamUrl => Get<string>(FiStreamUrl);
@@ -358,7 +358,7 @@ namespace CardShopCoop.Util
             {
                 return (TVal)ReflectionSurface.OptionalProperty(target.GetType(), name).GetValue(target, null);
             }
-            catch { return default(TVal); }
+            catch (System.Exception e) { Swallow.Log(e); return default(TVal); }
         }
 
         private static void SetProperty(object target, string name, object value)

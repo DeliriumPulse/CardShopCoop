@@ -75,10 +75,10 @@ jobs:
         if: ${{ !contains(github.ref_name, '-') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ github.ref_name }}" dist/*.zip --repo DeliriumPulse/CardShopCoop --title "${{ github.ref_name }}" --generate-notes
+        run: gh release create "${{ github.ref_name }}" dist/*.zip --repo "${{ github.repository }}" --title "${{ github.ref_name }}" --generate-notes
 
       - name: Create prerelease GitHub release
         if: ${{ contains(github.ref_name, '-') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ github.ref_name }}" dist/*.zip --repo DeliriumPulse/CardShopCoop --title "${{ github.ref_name }}" --generate-notes --prerelease
+        run: gh release create "${{ github.ref_name }}" dist/*.zip --repo "${{ github.repository }}" --title "${{ github.ref_name }}" --generate-notes --prerelease

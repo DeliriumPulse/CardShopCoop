@@ -95,6 +95,8 @@ namespace CardShopCoop.Patches
             // ShowTextPopup. Relay at that boundary so no extra Random calls are needed.
             Try(h, typeof(PricePopupSpawner), "ShowTextPopup",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(NpcSpeechPostfix)));
+            Try(h, typeof(PricePopupSpawner), "ShowPricePopup",
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(NpcMoneyPopupPostfix)));
 
             // No local workers on the client either.
             Try(h, typeof(WorkerManager), "ActivateWorker",
@@ -129,6 +131,24 @@ namespace CardShopCoop.Patches
             Try(h, typeof(InteractionPlayerController), "ShowGoNextDayScreen",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(GoNextDayScreenBlockPrefix)));
 
+            // Keep a taken item from being placed into a shelf, box, or machine before the host
+            // confirms the transfer.
+            Try(h, typeof(InteractionPlayerController), "EvaluatePutItemOnShelf",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(ReservedPutItemPrefix)));
+            // Keep a reserved handheld item from opening a card pack before confirmation; the
+            // card-box branch clears the whole hand.
+            Try(h, typeof(InteractionPlayerController), "EvaluateOpenCardPack",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(ReservedOpenCardPackPrefix)));
+            // Prevent the spray path from applying a partial action to a reserved item.
+            Try(h, typeof(InteractionPlayerController), "IsHoldingSpray",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(ReservedSprayPrefix)));
+            // Keep vanilla's hand removal from consuming a reserved item.
+            Try(h, typeof(InteractionPlayerController), "RemoveHoldItem",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(ReservedRemoveHoldItemPrefix)));
+            // Keep vanilla cleanup from disabling a reserved item while it awaits the host.
+            Try(h, typeof(Item), "DisableItem",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(ReservedDisableItemPrefix)));
+
             // Alternate switch implementations and mods may call LightManager directly;
             // route those client requests through the host as well.
             Try(h, typeof(LightManager), "ToggleShopLight",
@@ -153,6 +173,13 @@ namespace CardShopCoop.Patches
             // refresh event itself, so mirroring the call keeps tags in step on both sides.
             Try(h, typeof(CPlayerData), "SetCardPrice",
                 prefix: null, postfix: new HarmonyMethod(typeof(GamePatches), nameof(SetCardPricePostfix)));
+
+            // Item pricing: SetItemPrice is the shared writer for the player's price screen,
+            // worker repricing, EPL Demand, and our own apply of a joiner's contribution. The
+            // host flags a pending broadcast; a joiner's local edit already forwards through
+            // the CEventPlayer_ItemPriceChanged path below.
+            Try(h, typeof(CPlayerData), "SetItemPrice",
+                prefix: null, postfix: new HarmonyMethod(typeof(GamePatches), nameof(ItemPriceSetPostfix)));
 
             Try(h, typeof(RestockItemScreen), "EvaluateCartCheckout",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(RestockCheckoutPrefix)));
@@ -193,17 +220,10 @@ namespace CardShopCoop.Patches
             Try(h, typeof(ShelfManager), "SpawnInteractableObjectInPackageBox",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(FurnitureSpawnPostfix)));
 
-            // Furniture SELL is host-only for now (money-printer guard). On the guest,
-            // InteractionPlayerController.ConfirmSellFurniture credits the SHARED wallet via
-            // CEventPlayer_AddCoin(price/2) - which our DayEndBlockPrefix forwards to the host
-            // as a real coin gain - then destroys only the GUEST-side box. The host never sees
-            // that box (FurnBoxSync finds no match), so the real furniture survives while the
-            // wallet is credited = a repeatable printer. ConfirmSellFurniture only sees
-            // m_CurrentHoldingBoxShelf (whatever boxed furniture the guest is holding) and can't
-            // tell a host-placed shelf from a guest-bought-but-unplaced one, so we block ALL
-            // guest furniture sells; the toast explains. Host selling is untouched (Role check).
+            // Guest furniture sales are forwarded to the host, which resolves the boxed object,
+            // credits the shared wallet once, and destroys the authoritative furniture.
             Try(h, typeof(InteractionPlayerController), "ConfirmSellFurniture",
-                prefix: new HarmonyMethod(typeof(GamePatches), nameof(SellFurnitureBlockPrefix)));
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(SellFurniturePrefix)));
 
             // Deco placement is forwarded to the host after the local pending placement is
             // recorded, so the guest's inventory can be restored if authoritative placement
@@ -213,7 +233,8 @@ namespace CardShopCoop.Patches
             Try(h, typeof(InteractableObject), "PlaceMovedObject",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(DecoPlacedPostfix)));
             Try(h, typeof(InteractableObject), "BoxUpObject",
-                prefix: new HarmonyMethod(typeof(GamePatches), nameof(DecoBoxUpPrefix)));
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(DecoBoxUpPrefix)),
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
 
             // Handheld deodorant spray: the guest's hold-spray loop only ever hits the
             // LOCAL customer list - inert puppets on a client - so a guest could never
@@ -233,16 +254,16 @@ namespace CardShopCoop.Patches
             Try(h, typeof(ShelfManager), "DisableMoveObjectPreviewMode",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(DisablePreviewGuardPrefix)));
 
-            // Furniture placement is authoritative only after it settles, but the visual
-            // placement ghost is safe to stream independently because receivers render a
-            // detached cosmetic mesh rather than moving their real mirrored object.
+            // Furniture placement (R/opening a furniture box) is authoritative only after it
+            // settles, but its visual placement ghost is safe to stream independently because
+            // receivers render a detached cosmetic mesh rather than moving their real mirror.
+            // Q is deliberately excluded: InteractablePackagingBox.StartMoveObject is the
+            // box's held-but-in-place mode, not furniture placement.
             Try(h, typeof(InteractableObject), "StartMoveObject",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(MovePreviewStartPostfix)));
-            // These overrides call base.StartMoveObject, so patching them too would emit a
-            // duplicate Stop/Start sequence for one drag. Packaging boxes are different: their
-            // override owns the complete move setup and never calls the base implementation.
-            Try(h, typeof(InteractablePackagingBox), "StartMoveObject",
-                postfix: new HarmonyMethod(typeof(GamePatches), nameof(MovePreviewStartPostfix)));
+            // Do not patch InteractablePackagingBox.StartMoveObject: that override is Q mode
+            // (held-but-in-place box movement), not furniture placement. Furniture placement
+            // starts the boxed InteractableObject above when the player opens the box.
             Try(h, typeof(ShelfManager), "SetMoveObjectPreviewModelValidState",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(MovePreviewValidPostfix)));
             Try(h, typeof(ShelfManager), "DisableMoveObjectPreviewMode",
@@ -268,11 +289,11 @@ namespace CardShopCoop.Patches
             // change, so the next co-op frame reads authoritative state.
             Try(h, typeof(InteractableObject), "PlaceMovedObject",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
-            Try(h, typeof(InteractablePackagingBox_Item), "StartHoldBox",
+            Try(h, typeof(InteractablePackagingBox), "StartHoldBox",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
-            Try(h, typeof(InteractablePackagingBox_Item), "ThrowBox",
-                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
-            Try(h, typeof(InteractablePackagingBox_Item), "DropBox",
+            Try(h, typeof(InteractablePackagingBox), "ThrowBox",
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ThrowMutationPostfix)));
+            Try(h, typeof(InteractablePackagingBox), "DropBox",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
             // While held, the game's visible box root follows the hand but its
             // Rigidbody can remain at the old spawn pose. Align the shared base
@@ -289,29 +310,44 @@ namespace CardShopCoop.Patches
             Try(h, typeof(InteractablePackagingBox_Item), "RemoveItemFromShelf",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
             Try(h, typeof(InteractablePackagingBox_Item), "SetOpenCloseBox",
-                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(BoxOpenClosePostfix)));
             Try(h, typeof(ShelfCompartment), "AddBox",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
             Try(h, typeof(ShelfCompartment), "RemoveBox",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
             Try(h, typeof(ShelfCompartment), "AddItem",
-                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(AddItemPrefix)),
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(AddItemPostfix)));
             Try(h, typeof(ShelfCompartment), "RemoveItem",
-                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(RemoveItemPrefix)),
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(RemoveItemPostfix)));
+            // Player pickups decrement m_ItemAmount and remove from m_StoredItemList directly
+            // instead of routing through RemoveItem.
+            Try(h, typeof(ShelfCompartment), "TakeItemToHand",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(TakeItemToHandPrefix)),
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(TakeItemToHandPostfix)));
             Try(h, typeof(ShelfCompartment), "SpawnItem",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
             // Removing a shelf label (right-click on the tag, when the compartment is empty)
             // only clears m_ItemType - none of the Add/Remove/Spawn paths above fire, so
             // without this hook the label change waited for the slow poll (and the far side
             // kept its label). Nudge the world sync immediately.
-            Try(h, typeof(ShelfCompartment), "RemoveLabel",
-                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
+            Try(h, typeof(ShelfCompartment), "SetCompartmentItemType",
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(SetCompartmentItemTypePostfix)));
             Try(h, typeof(InteractableCardCompartment), "SetCardOnShelf",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
             Try(h, typeof(InteractableCardCompartment), "RemoveCardFromShelf",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
             Try(h, typeof(InteractableCardCompartment), "DisableAllCard",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
+
+            // A display card leaves the shared collection when the player picks it up from the
+            // binder - long before it reaches a shelf - so the local card3d is the only copy until
+            // the host confirms the placement. Mark the placement so CardShelfSync never silently
+            // adopts over it and never destroys it before the host has explicitly answered.
+            Try(h, typeof(InteractableCardCompartment), "OnMouseButtonUp",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(CardPlacementPrefix)),
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(CardPlacementPostfix)));
 
             // Product licenses are shared: bought by either player, unlocked for both.
             // Identity travels as (itemType + box size), never a restock-list index -
@@ -338,21 +374,11 @@ namespace CardShopCoop.Patches
             Try(h, typeof(PauseScreen), "OpenScreen",
                 prefix: null, postfix: new HarmonyMethod(typeof(GamePatches), nameof(PauseNoFreezePostfix)));
 
-            // Domain sync modules register their own patch sets (each guarded internally).
-            TryModule("staff", Sync.StaffSync.ApplyPatches, h);
-            TryModule("shopstate", Sync.ShopStateSync.ApplyPatches, h);
-            TryModule("settings", Sync.SettingsSync.ApplyPatches, h);
-            TryModule("market", Sync.MarketSync.ApplyPatches, h);
-            TryModule("report", Sync.ReportSync.ApplyPatches, h);
-            TryModule("containers", Sync.ContainerSync.ApplyPatches, h);
-            TryModule("tournament", Sync.TournamentSync.ApplyPatches, h);
-            TryModule("grading", Sync.GradingSync.ApplyPatches, h);
-            TryModule("trades", Sync.TradeServe.ApplyPatches, h);
-            TryModule("register", Sync.RegisterSync.ApplyPatches, h);
-            TryModule("playtables", Sync.PlayTableSync.ApplyPatches, h);
-            TryModule("cardboxes", Sync.CardBoxSync.ApplyPatches, h);
-            TryModule("furnboxes", Sync.FurnBoxSync.ApplyPatches, h);
-            TryModule("tv", Sync.TvSync.ApplyPatches, h);
+            // Domain sync modules register their patch sets from the single module catalog.
+            var patches = CoopCore.PatchCatalog;
+            if (patches != null)
+                for (int i = 0; i < patches.Length; i++)
+                    TryModule(patches[i].Name, patches[i].Apply, h);
         }
 
         private static void TryModule(string name, Action<Harmony> apply, Harmony h)
@@ -385,14 +411,14 @@ namespace CardShopCoop.Patches
                 if (card != null)
                     CoopCore.Instance?.ForwardCardDelta(card, reduceAmount, isAdd: false);
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
         }
 
         public static bool BoxDestroyedPrefix(InteractablePackagingBox_Item __instance)
         {
-            if (!BoxSync.ApplyingRemote
+            if (!BoxShared.ApplyingRemote
                 && !ContainerSync.ConsumeSuppressedStorageDestroy(__instance))
-                BoxSync.LocalBoxDestroyed?.Invoke(__instance);
+                BoxShared.LocalBoxDestroyed?.Invoke(__instance);
             return true;
         }
 
@@ -434,11 +460,124 @@ namespace CardShopCoop.Patches
                 CoopCore.RequestImmediateObjectSync();
         }
 
+        public struct ShelfMutationState
+        {
+            public int Count; public int Type; public Item Item;
+        }
+        public static void AddItemPrefix(ShelfCompartment __instance, Item item, out ShelfMutationState __state)
+        {
+            __state = new ShelfMutationState
+            {
+                Count = __instance == null ? -1 : __instance.GetItemCount(),
+                Type = item == null ? -1 : (int)item.GetItemType(),
+                Item = item
+            };
+        }
+
+        public static void AddItemPostfix(ShelfCompartment __instance, ShelfMutationState __state)
+        {
+            if (CoopCore.Instance?.World?.ApplyingRemote == true || __instance == null || __state.Count < 0 || __state.Item == null)
+                return;
+            CoopCore.Instance?.World?.LocalCompartmentMutation(__instance, __state.Count,
+                __state.Type, 1);
+        }
+
+        public static void SetCompartmentItemTypePostfix(ShelfCompartment __instance)
+        {
+            if (CoopCore.Instance?.World?.ApplyingRemote == true || __instance == null
+                || (CoopCore.Role == CoopRole.Client && CoopCore.ClientReloading))
+                return;
+            // AddItem emits the item transfer itself; its resulting type assignment is not a
+            // second world mutation. Empty-label/type edits have no AddItem event and do emit.
+            if (__instance.GetItemCount() > 0)
+                return;
+            CoopCore.Instance?.World?.LocalCompartmentMutation(__instance,
+                __instance.GetItemCount(), -1, 0);
+        }
+
+        public static void TakeItemToHandPrefix(ShelfCompartment __instance, out int __state)
+        {
+            __state = __instance == null ? -1 : __instance.GetItemCount();
+        }
+
+        /// <summary>A local item take: the content delta is on a ShelfCompartment (open box or
+        /// shelf), not the box object, so a box take is invisible to the box engine until the
+        /// round-robin reaches the box. Mark the owning box dirty so the take is reported (and
+        /// escrowed) on the next tick instead of after a player-action window.</summary>
+        public static void TakeItemToHandPostfix(ShelfCompartment __instance, Item __result, int __state)
+        {
+            if (CoopCore.Instance?.World?.ApplyingRemote == true || __instance == null || __result == null)
+                return;
+            HandEscrow.NoteTakenItem(__result);
+            CoopCore.Instance?.World?.QueueTake(__instance, __state, __result);
+            CoopCore.Instance?.Boxes?.MarkClientCompartmentDirty(__instance);
+        }
+
+        public static void RemoveItemPrefix(ShelfCompartment __instance, Item item, out ShelfMutationState __state)
+        {
+            __state = new ShelfMutationState
+            {
+                Count = __instance == null ? -1 : __instance.GetItemCount(),
+                Type = item == null ? -1 : (int)item.GetItemType(),
+                Item = item
+            };
+        }
+
+        public static void RemoveItemPostfix(ShelfCompartment __instance, ShelfMutationState __state)
+        {
+            if (CoopCore.Instance?.World?.ApplyingRemote == true || __instance == null || __state.Count < 0)
+                return;
+            if (CoopCore.Role == CoopRole.Host)
+                CoopCore.Instance?.World?.LocalCompartmentMutation(__instance, __state.Count, -1, 0);
+            else if (CoopCore.Instance?.World?.TryGetShelfKey(__instance, out _) == true)
+                CoopCore.Instance?.World?.LocalCompartmentMutation(__instance, __state.Count, __state.Type, -1);
+            else
+                CoopCore.Instance?.Boxes?.MarkClientCompartmentDirty(__instance);
+        }
+
+        /// <summary>Captures whether the card compartment was empty before the click. Vanilla
+        /// refuses a placement into an occupied slot, so only a 0 -> occupied transition is a
+        /// fresh player placement.</summary>
+        public static void CardPlacementPrefix(InteractableCardCompartment __instance, out int __state)
+        {
+            __state = __instance != null ? __instance.m_StoredCardList.Count : -1;
+        }
+
+        public static void CardPlacementPostfix(InteractableCardCompartment __instance, int __state)
+        {
+            if (__state != 0 || __instance == null || __instance.m_StoredCardList.Count == 0)
+                return;
+            try
+            {
+                Sync.CardShelfSync.MarkLocalPlacement(__instance);
+            }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("CardPlacementPostfix: " + e.Message); }
+        }
+
+        public static void BoxOpenClosePostfix(InteractablePackagingBox_Item __instance)
+        {
+            if (CoopCore.Role == CoopRole.None || __instance == null)
+                return;
+            CoopCore.Instance?.Boxes?.MarkBoxDirty(__instance);
+            CoopCore.RequestImmediateObjectSync();
+        }
+
+        public static void ThrowMutationPostfix(InteractablePackagingBox __instance)
+        {
+            // A throw is a Held -> Free release carrying the rigidbody's own velocity. The
+            // impulse is not in Rigidbody.velocity until the next FixedUpdate, so mark it and
+            // force a prompt box tick; the engine defers the release report until it is real.
+            BoxPlacement.MarkThrow(__instance);
+            CoopCore.Instance?.Boxes?.MarkBoxDirty(__instance);
+            CoopCore.Instance?.Boxes?.ForceNextTick();
+            ObjectMutationPostfix();
+        }
+
         public static void AlignBoxBodyPrefix(InteractablePackagingBox __instance)
         {
             if (CoopCore.Role == CoopRole.None || __instance == null)
                 return;
-            BoxSync.AlignHeldBody(__instance);
+            BoxPlacement.AlignHeldBody(__instance);
         }
 
         public static bool ApplyingRemoteLicense;
@@ -570,7 +709,7 @@ namespace CardShopCoop.Patches
             {
                 FiOobTimer?.SetValue(__instance, 0f);
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
         }
 
         private static bool s_warnedNoCardBases;
@@ -670,7 +809,7 @@ namespace CardShopCoop.Patches
                 if (sm == null || sm.m_MoveObjectPreviewModel == null)
                     return false;
             }
-            catch { return false; }
+            catch (System.Exception e) { Swallow.Log(e); return false; }
             return true; // real interactive move: run the vanilla teardown
         }
 
@@ -702,22 +841,16 @@ namespace CardShopCoop.Patches
             return false;
         }
 
-        /// <summary>Client only: block the guest from selling any boxed furniture. The vanilla
-        /// ConfirmSellFurniture would fire CEventPlayer_AddCoin(price/2) into the SHARED wallet
-        /// (forwarded to the host as a real gain) and then destroy only the guest-side box, which
-        /// the host never mirrors - so the furniture survives while the wallet is paid = a
-        /// repeatable money printer. Returning false BEFORE the coin event stops the printer.
-        /// We can't distinguish a host-placed shelf from a guest-bought-unplaced one here (the
-        /// method only sees m_CurrentHoldingBoxShelf), so this blocks all guest furniture sells;
-        /// the toast tells the guest to ask the host. Host is unaffected (Role check). Same
-        /// block+toast idiom as RenamerBlockPrefix.</summary>
-        public static bool SellFurnitureBlockPrefix()
+        /// <summary>Host keeps vanilla selling. A guest sale is handled by FurnitureBoxOps before
+        /// vanilla can emit its local shared-wallet coin event.</summary>
+        public static bool SellFurniturePrefix(InteractionPlayerController __instance)
         {
             if (CoopCore.Role != CoopRole.Client)
                 return true;
-            if (CoopCore.Instance != null)
+            if (!FurnitureBoxOps.ClientSell(__instance)
+                && CoopCore.Instance != null)
             {
-                CoopCore.Instance.RegisterLine = "selling furniture is host-only for now - ask the host";
+                CoopCore.Instance.RegisterLine = "couldn't sell furniture - try again";
                 CoopCore.Instance.RegisterLineTimer = 3f;
             }
             return false;
@@ -873,6 +1006,16 @@ namespace CardShopCoop.Patches
                     CoopCore.Instance?.ForwardCardPrice(cardData, priceSet);
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("SetCardPricePostfix forward failed: " + e.Message); }
+        }
+
+        /// <summary>Host: an item price entry changed (player, worker, EPL Demand, or a
+        /// joiner's contribution we just applied); the price sync broadcasts on the next
+        /// tick. Deliberately NOT gated on ApplyingRemotePrice - a contribution applied on
+        /// the host must still reach the other clients.</summary>
+        public static void ItemPriceSetPostfix(EItemType itemType, float price)
+        {
+            if (CoopCore.Role == CoopRole.Host)
+                CoopCore.Instance?.NoteItemPriceChanged(itemType, price);
         }
 
         /// <summary>True while we're applying a card delta that came over the network,
@@ -1061,9 +1204,48 @@ namespace CardShopCoop.Patches
                 }
             if (!shown)
                 return;
-            if (Sync.NpcSync.TryGetCustomerSpeechSource(followTransform,
+            if (Sync.NpcSync.TryGetCustomerIdentity(followTransform,
                 out ushort index, out int identity))
                 CoopCore.Instance?.ForwardNpcSpeech(index, identity, text, offsetUp);
+        }
+
+        public static bool ReservedPutItemPrefix(InteractionPlayerController __instance)
+        {
+            return !HandEscrow.IsFrontReserved(__instance);
+        }
+
+        public static bool ReservedOpenCardPackPrefix(InteractionPlayerController __instance)
+        {
+            return !HandEscrow.HasReservedHeld(__instance);
+        }
+
+        public static bool ReservedSprayPrefix(InteractionPlayerController __instance, ref bool __result)
+        {
+            if (!HandEscrow.IsFrontReserved(__instance))
+                return true;
+            __result = false;
+            return false;
+        }
+
+        public static bool ReservedRemoveHoldItemPrefix(Item currentItem)
+        {
+            return !HandEscrow.IsReserved(currentItem);
+        }
+
+        public static bool ReservedDisableItemPrefix(Item __instance)
+        {
+            return !HandEscrow.IsReserved(__instance) || !HandEscrow.IsInLocalHand(__instance);
+        }
+
+        public static void NpcMoneyPopupPostfix(PricePopupSpawner __instance, float price,
+            float offsetUp, Transform followTransform)
+        {
+            if (CoopCore.Role != CoopRole.Host || __instance == null || price <= 0f
+                || followTransform == null)
+                return;
+            if (!Sync.NpcSync.TryGetCustomerIdentity(followTransform, out ushort index, out int identity))
+                return;
+            CoopCore.Instance?.ForwardNpcMoneyPopup(index, identity, price, offsetUp);
         }
 
         /// <summary>Client only: the joiner never opens his own end-of-day recap. Vanilla
@@ -1098,7 +1280,7 @@ namespace CardShopCoop.Patches
             // boxes it there, and only then moves the BOX Transform to spawnPos. Unity does
             // not reliably move a non-kinematic Rigidbody when its Transform is assigned this
             // way. Align the real body before any population/furniture snapshot can observe it.
-            FurnBoxSync.AlignJustSpawnedBox(objType, spawnPos, spawnRot);
+            FurnitureBoxOps.AlignJustSpawnedBox(objType, spawnPos, spawnRot);
             if (CoopCore.Role == CoopRole.Host)
                 CoopCore.Instance?.NotifyHostStructureChanged();
         }

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.IO;
 
 namespace CardShopCoop.Net
@@ -35,13 +36,10 @@ namespace CardShopCoop.Net
         RelayTag = 31,         // host -> clients: another client's emote/activity [senderId + kind]
         ObjMoveDelta = 32,     // host -> client: authoritative placed-object transforms
         ObjMoveRequest = 33,   // client -> host: joiner moved a shelf/counter/decoration
-        BoxState = 34,         // host -> client: full loose-box population snapshot
-        BoxRequest = 35,       // client -> host: joiner's box edits (dispense/carry/trash)
         ShopName = 37,         // host -> client: the shop's name
         ItemPriceContrib = 38, // client -> host: joiner set an item price
         LightState = 39,       // host -> client: full LightTimeData (sky phase, timers)
         PopState = 40,         // host -> client: placed-object population roster (all kinds)
-        BoxRemoved = 42,       // client -> host: joiner trashed a loose box (destroy officially)
         LicenseUnlock = 43,    // both ways: a product license was purchased (itemType+size identity)
         LicenseState = 44,     // host -> client: full unlocked-license set (identity-keyed)
         StaffOp = 45,          // client -> host: hire/fire/manage a worker
@@ -60,13 +58,9 @@ namespace CardShopCoop.Net
         TradeOp = 58,          // client -> host: joiner accepts/declines a counter trade/sell-in
         TradeState = 59,       // host -> client: live trade/sell-in offer at a counter
         TableState = 60,       // host -> client: play-table card layout digest (visuals)
-        CardBoxOp = 61,        // client -> host: joiner collects/moves a graded-returns card box
-        CardBoxState = 62,     // host -> client: card packaging box population (graded returns)
         EnumSync = 63,         // host -> client: the host's enum_values.json (card-ID registry)
         Toast = 64,            // host -> client: one-line on-screen notice
         CatalogDigest = 65,    // client -> host: restock catalog identities (mismatch diagnosis)
-        FurnBoxOp = 66,        // client -> host: furniture-box carry/place/destroy ops
-        FurnBoxState = 67,     // host -> client: furniture delivery box population
         GradedRemove = 68,     // both ways: a graded card left the shared album (RemoveGradedCard)
         SprayHit = 69,         // client -> host: handheld deodorant hold-spray (pos+range+potency), replay against host customers
         CardDeltaBatch = 70,   // both ways: [int count][count x CardDelta payload] - one frame for a whole frame's card changes
@@ -78,8 +72,7 @@ namespace CardShopCoop.Net
         RegisterCart = 72,     // host -> client: authoritative cart, prices, phase, and scanned slots
         RegisterOp = 73,       // client -> host: the manning player's register action (scan / payment / change / finish)
         StaffInteract = 74,    // host -> client: worker interaction lease grant/release/denial
-        ContainerBoxTake = 75, // host -> client: empty-box take result (storage index + BoxSync id, 0 = rejected)
-        CardBoxCollectResult = 76, // host -> client: graded-box collect accepted/rejected
+        ContainerBoxTake = 75, // host -> client: empty-box take result (storage index + box id, 0 = rejected)
         NpcSpeech = 77,      // host -> client: customer speech bubble
         TvState = 78,        // host -> client: shared RTCGO stream state
         TvOp = 79,           // client -> host: RTCGO stream control request
@@ -91,7 +84,18 @@ namespace CardShopCoop.Net
         PlayerIntent = 85,       // client -> host: single-shot interaction intent
         EconDelta = 86,          // host -> clients: replay a vanilla money/XP HUD delta
         MovePreview = 87,        // peers: transient furniture placement preview
-        BoxMovePreview = 88,     // peers: transient item-box placement preview
+        BoxUpdate = 89,          // client -> host: one box possession update (claim/change/release/remove)
+        BoxSnapshot = 90,        // host -> clients: authoritative box state list (all families)
+        BoxCollect = 91,         // client -> host: open a graded card box (host mints the cards)
+        BoxCollectResult = 92,   // host -> client: collect rejected (restore the mirror)
+        FurnitureBoxOp = 93,     // client -> host: place / sell / box-up a furniture object
+        JoinResyncRequest = 94,  // client -> host: guest finished loading; resend authoritative state
+        BoxMotion = 95,        // client -> host: transient motion of a box the local player is pushing
+        BoxMotionState = 96,   // host -> clients: relayed/authoritative motion of a pushed box
+        NpcMoneyPopup = 97,   // host -> client: green money popup above a customer
+        BoxTransferResult = 98, // host -> sender: how much of a loose-box item delta was accepted
+        ShelfTransferResult = 99, // host -> sender: how much of a shelf item delta was accepted
+        RegisterRejected = 100, // host -> client: a register op was rejected; reset that counter
     }
 
     /// <summary>One received message, already reassembled and decoded from the wire.
@@ -117,6 +121,30 @@ namespace CardShopCoop.Net
         // substantial change behind an existing message requires a minor bump.
         // 1.2.3 therefore becomes 102 (major * 100 + minor).
         public static readonly int WireVersion = DeriveWireVersion(CoopPlugin.Version);
+        private const int DecodeWarningCooldownMs = 2000;
+        private static readonly ConcurrentDictionary<MsgType, int> LastDecodeWarning
+            = new ConcurrentDictionary<MsgType, int>();
+
+        internal static void LogDecodeWarning(MsgType type, string warning)
+        {
+            int now = Environment.TickCount;
+            while (true)
+            {
+                if (LastDecodeWarning.TryGetValue(type, out int last))
+                {
+                    if (unchecked(now - last) < DecodeWarningCooldownMs)
+                        return;
+                    if (!LastDecodeWarning.TryUpdate(type, now, last))
+                        continue;
+                }
+                else if (!LastDecodeWarning.TryAdd(type, now))
+                {
+                    continue;
+                }
+                break;
+            }
+            CoopPlugin.Log?.LogWarning(warning);
+        }
 
         private static int DeriveWireVersion(string version)
         {
@@ -165,7 +193,7 @@ namespace CardShopCoop.Net
             // Decode centrally. A malformed or unknown DTO is DROPPED (return false) so a
             // single bad frame can never unwind a transport pump thread - the same fail-safe
             // the transport used to get from the switch's per-message try/catch. Unknown
-            // message types are logged once per type by MessageRegistry.
+            // message types and malformed payloads are rate-limited per type.
             try
             {
                 message.Message = MessageRegistry.Deserialize(message.Type, payload);
@@ -173,7 +201,8 @@ namespace CardShopCoop.Net
             catch (Exception e)
             {
                 MsgType type = (MsgType)frame[offset + FrameHeaderSize];
-                CoopPlugin.Log?.LogWarning($"discarding malformed {type} frame: {e.GetType().Name}: {e.Message}");
+                if (MessageRegistry.IsKnown(type))
+                    LogDecodeWarning(type, $"discarding malformed {type} frame: {e.GetType().Name}: {e.Message}");
                 return false;
             }
             return true;

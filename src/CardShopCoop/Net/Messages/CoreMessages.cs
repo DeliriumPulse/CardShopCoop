@@ -19,7 +19,9 @@ namespace CardShopCoop.Net.Messages
 
     public sealed class RosterEntry
     {
-        public byte Id;
+        // int, not byte: host connection ids are unbounded and only wrap at int overflow.
+        // A byte here silently collided once a long session passed 255 total connections.
+        public int Id;
         public string Name;
         public ulong SteamId;
     }
@@ -153,7 +155,7 @@ namespace CardShopCoop.Net.Messages
     [NetworkMessage(MsgType.RelayTag)]
     public sealed class RelayTagMessage : INetMessage
     {
-        public byte SenderId;
+        public int SenderId;
         public byte Kind;
         public EItemType Extra;
         public MsgType Type
@@ -170,6 +172,8 @@ namespace CardShopCoop.Net.Messages
     {
         public Vector3 Position;
         public float Yaw;
+        public Vector3 CameraPosition;
+        public Quaternion CameraRotation;
         public float Speed;
         public byte Hold;
         public System.Collections.Generic.List<int> HoldTypes;
@@ -186,7 +190,7 @@ namespace CardShopCoop.Net.Messages
     [NetworkMessage(MsgType.RelayState, Delivery = Delivery.Transient)]
     public sealed class RelayStateMessage : INetMessage
     {
-        public byte SenderId;
+        public int SenderId;
         public PlayerStateMessage State = new PlayerStateMessage();
         public MsgType Type
         {
@@ -231,7 +235,8 @@ namespace CardShopCoop.Net.Messages
     public sealed class PlayerModelEntry
     {
         // 0 is the host; client ids are the host's canonical connection ids.
-        public byte Id;
+        // int, not byte, so ids past 255 cannot wrap onto an existing player.
+        public int Id;
         public bool Female;
         public int ModelIndex;
         public string CustomizationJson;

@@ -21,7 +21,7 @@ namespace CardShopCoop.Sync
     /// buttons are blocked with a "the host schedules tournaments" toast instead of
     /// being forwarded. Prize shelf CONTENTS are synced elsewhere (CardShelfSync).
     /// </summary>
-    public class TournamentSync
+    public class TournamentSync : TickableCoopModule
     {
         /// <summary>TournamentPrizeShelf.m_ScreenMesh (the shelf's little tournament display) is
         /// absent from the Game Pass Assembly-CSharp, which made a direct field access fail to
@@ -39,9 +39,8 @@ namespace CardShopCoop.Sync
         /// no patch mistakes the authoritative copy for a local scheduling action.</summary>
         public static bool ApplyingRemote;
 
-        private float _timer;
-        private int _lastHash;      // host: last broadcast / client: last applied
-        private float _heal;
+        private readonly SnapshotGate _gate = new SnapshotGate(1.5f, 15f, -6.1f);
+        private int _clientHash;
 
         // NEVER CSingleton<CustomerManager>.Instance: touched while no real manager
         // exists (client reload loading screen, host mid-session save load) the getter
@@ -57,18 +56,27 @@ namespace CardShopCoop.Sync
             return _cm;
         }
 
-        public void Reset()
+        public override string Name => "tournament";
+
+        protected override void OnHostTick(in SyncFrame frame) => HostTick(frame.Dt, frame.InGame);
+
+        public override void Dispose()
         {
-            _timer = -6.1f; // staggered phase vs the other snapshot engines
-            _lastHash = 0;
-            _heal = 0f;
+            base.Dispose();
+            ApplyingRemote = false;
             _cm = null;
         }
 
-        public void ForceResend()
+        public override void Reset()
         {
-            _lastHash = 0;
-            _heal = 999f; // beats the hash gate even if the real hash is 0
+            _gate.Reset(-6.1f);
+            _clientHash = 0;
+            _cm = null;
+        }
+
+        public override void ForceResend()
+        {
+            _gate.Force();
         }
 
         // ---------------- patches ----------------
@@ -126,24 +134,18 @@ namespace CardShopCoop.Sync
         {
             if (!inGame)
                 return;
-            _timer += dt;
-            if (_timer < 1.5f)
+            if (!_gate.Due(dt))
                 return;
-            _timer -= 1.5f;
-            try
+            Guarded("host", () =>
             {
                 var td = CPlayerData.m_TournamentData;
                 if (td == null)
                     return;
                 int hash = ComputeHash(td);
-                _heal += 1.5f;
-                if (hash == _lastHash && _heal < 15f)
+                if (!_gate.ShouldSend(hash))
                     return;
-                _lastHash = hash;
-                _heal = 0f;
                 BroadcastState?.Invoke(BuildState(td));
-            }
-            catch (Exception e) { CoopPlugin.Log.LogWarning("TournamentSync host: " + e.Message); }
+            });
         }
 
         // No HostApplyOp / SendOp: the joiner never sends tournament ops - scheduling
@@ -156,9 +158,8 @@ namespace CardShopCoop.Sync
             ApplyingRemote = true;
             try
             {
-                ClientApplyInner(message);
+                Guarded("apply", () => ClientApplyInner(message));
             }
-            catch (Exception e) { CoopPlugin.Log.LogWarning("TournamentSync apply: " + e.Message); }
             finally { ApplyingRemote = false; }
         }
 
@@ -248,9 +249,9 @@ namespace CardShopCoop.Sync
                 hash = hash * 31 + e.OMW;
                 hash = hash * 31 + e.OOMW;
             }
-            if (hash == _lastHash)
+            if (hash == _clientHash)
                 return;
-            _lastHash = hash;
+            _clientHash = hash;
 
             RefreshBoards(td, digest, wasDay != td.m_IsTournamentDay || wasOver != td.m_IsTournamentDayOver);
         }

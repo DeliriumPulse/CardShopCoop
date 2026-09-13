@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using BepInEx.Configuration;
 using CardShopCoop.Net;
 // NO `using Steamworks;` HERE, AND NEVER AGAIN - see the same note in CoopCore.cs. OnGUI
 // is the worst possible place for a type-load fault (DrawNone runs every frame on the main
@@ -23,16 +24,22 @@ namespace CardShopCoop.UI
         private string _nameField;
         private string _lanIps;
         private string _lanIpsOther;
-        private bool _revealIp;
+        private readonly CopyButton _ipCopy = new CopyButton();
         private string _inviteField = "";
-        private bool _inviteCopied;
-        private string _inviteSeen;
-        private bool _passwordCopied;
-        private string _passwordSeen;
+        private readonly CopyButton _inviteCopy = new CopyButton();
+        private readonly CopyButton _passwordCopy = new CopyButton();
         private string _lanPwField = "";
         private bool _characterOpen = true;
-        private bool _characterTab;
+        private enum CoopTab
+        {
+            Session,
+            Character,
+            Settings,
+        }
+        private CoopTab _tab = CoopTab.Session;
+        private Vector2 _sessionScroll;
         private Vector2 _characterScroll;
+        private Vector2 _settingsScroll;
         private bool _characterSnapshotReady;
         private bool _characterFemale;
         private readonly List<string> _presetNames = new List<string>();
@@ -80,6 +87,14 @@ namespace CardShopCoop.UI
         private string _joinPwField = "";
         private ulong _pwPromptLobby; // 0 = no password prompt open
         private const int PageSize = 6;
+        private const float MaxWindowHeight = 720f;
+        // Keep the complete window clear of the screen edges so a resize cannot push the
+        // footer off-screen. The window's own height is set from this, not from its children.
+        private const float WindowScreenMargin = 16f;
+        // The scroll viewport measured on the last Repaint. WindowFn seeds the shared min-height
+        // wrapper from it so the session's last panel can fill the tab, without guessing the
+        // header/tabs/footer size.
+        private float _viewportHeight;
 
         // OnGUI runs 2+ times per frame; GUIStyle construction and string interpolation there
         // is steady per-frame garbage. Styles/textures live in CoopTheme (built once, cached);
@@ -89,6 +104,8 @@ namespace CardShopCoop.UI
         private string _enumRestoreMsg; // outcome line under the enum-lend notice
         private string _hostTimeSeen, _hostTimeText; private GUIContent _hostTimeGc;
         private string _registerSeen, _registerText; private GUIContent _registerGc;
+        private KeyCode _toggleKeySeen = KeyCode.None;
+        private string _toggleHint;
 
         /// <summary>Lower = more likely the real home-LAN address.</summary>
         private static int IpRank(string ip)
@@ -144,18 +161,15 @@ namespace CardShopCoop.UI
             }
             if (core.RegisterLine.Length > 0)
             {
-                if (core.RegisterLine.Length > 0)
+                if (core.RegisterLine != _registerSeen)
                 {
-                    if (core.RegisterLine != _registerSeen)
-                    {
-                        _registerSeen = core.RegisterLine;
-                        _registerText = $"<size=18><color=#8ef58a>{core.RegisterLine}</color></size>";
-                        _registerGc = new GUIContent(_registerText);
-                    }
-                    Vector2 sz = CoopTheme.PillSize(CoopTheme.HudPillBig, _registerGc, 740f);
-                    GUI.Label(new Rect((Screen.width - sz.x) / 2f, Screen.height * 0.63f, sz.x, sz.y),
-                        _registerGc, CoopTheme.HudPillBig);
+                    _registerSeen = core.RegisterLine;
+                    _registerText = $"<size=18><color=#8ef58a>{core.RegisterLine}</color></size>";
+                    _registerGc = new GUIContent(_registerText);
                 }
+                Vector2 sz = CoopTheme.PillSize(CoopTheme.HudPillBig, _registerGc, 740f);
+                GUI.Label(new Rect((Screen.width - sz.x) / 2f, Screen.height * 0.63f, sz.x, sz.y),
+                    _registerGc, CoopTheme.HudPillBig);
             }
             if (!Visible)
             {
@@ -163,8 +177,21 @@ namespace CardShopCoop.UI
                 return;
             }
 
+            // The window sets its own height here rather than deriving it from its children: cap
+            // it at MaxWindowHeight and at the room the game window actually has, then hand that
+            // to GUILayout.Window. The content panel below simply expands into what is left, so
+            // the full window (header, tabs, content, footer) always fits after Alt+Enter.
+            _win.width = Mathf.Min(400f, Mathf.Max(1f, Screen.width - 32f));
+            _win.height = TargetWindowHeight();
+            _win.x = Mathf.Clamp(_win.x, 0f, Mathf.Max(0f, Screen.width - _win.width));
+            _win.y = Mathf.Clamp(_win.y, 0f, Mathf.Max(0f, Screen.height - _win.height));
             CoopTheme.DrawWindowShadow(_win); // soft drop shadow behind the window (screen space)
-            _win = GUILayout.Window(867530, _win, id => WindowFn(core, net), "", CoopTheme.Window);
+            _win = GUILayout.Window(867530, _win, id => WindowFn(core, net), "", CoopTheme.Window,
+                GUILayout.Width(_win.width), GUILayout.Height(_win.height));
+            // Clamp again after layout: the layout option should already hold the size, but the
+            // pre-call clamp only had the previous frame's height.
+            _win.x = Mathf.Clamp(_win.x, 0f, Mathf.Max(0f, Screen.width - _win.width));
+            _win.y = Mathf.Clamp(_win.y, 0f, Mathf.Max(0f, Screen.height - _win.height));
         }
 
         private void WindowFn(CoopCore core, ICoopTransport net)
@@ -175,6 +202,31 @@ namespace CardShopCoop.UI
             CoopTheme.DrawConnectionIndicator(new Rect(_win.width - 30f, 9f, 12f, 12f),
                 GetConnectionState(core, net));
 
+            // A role change can leave the CHARACTER tab selected while it is no longer
+            // available (disconnect); normalize before drawing so the highlight, the selected
+            // content, and the scroll offset all agree.
+            if (_tab == CoopTab.Character && CoopCore.Role == CoopRole.None)
+                _tab = CoopTab.Session;
+
+            DrawTabs(core);
+            core.SetCharacterPreview(_tab == CoopTab.Character && CoopCore.Role != CoopRole.None);
+
+            // The window height is set on GUILayout.Window itself, so nothing here measures the
+            // header, tabs or footer. The content panel expands into whatever the window has
+            // left, and the single scroll view fills the panel. Every tab shares this one scroll
+            // view (nested scroll views are a layout hazard) with a separate offset per tab;
+            // zero-padding keeps the overflow calculation exact, so the vertical bar only
+            // appears when the content actually overflows.
+            GUILayout.BeginVertical(CoopTheme.ContentPanel, GUILayout.ExpandHeight(true));
+            Vector2 scroll = _tab == CoopTab.Character ? _characterScroll
+                : _tab == CoopTab.Settings ? _settingsScroll : _sessionScroll;
+            scroll = GUILayout.BeginScrollView(scroll, CoopTheme.ScrollView, GUILayout.ExpandHeight(true));
+            // Everything in the scroll view shares this minimum-height wrapper, seeded from the
+            // viewport measured on the previous Repaint. A short tab therefore fills the space
+            // (its last panel can expand) while a tall one grows past it and scrolls. The PROBLEM
+            // banner is inside it too, so a wrapped error counts as content instead of forcing a
+            // scrollbar on its own.
+            GUILayout.BeginVertical(CoopTheme.ScrollContent, GUILayout.MinHeight(_viewportHeight));
             if (core.ErrorLine.Length > 0)
             {
                 GUILayout.BeginHorizontal();
@@ -182,21 +234,41 @@ namespace CardShopCoop.UI
                 GUILayout.FlexibleSpace();
                 GUILayout.EndHorizontal();
                 GUILayout.Label(core.ErrorLine, CoopTheme.LabelDanger);
+                GUILayout.Space(4f);
             }
-
-            DrawTabs(core);
-            core.SetCharacterPreview(_characterTab && CoopCore.Role != CoopRole.None);
-            GUILayout.BeginVertical(CoopTheme.ContentPanel);
-            if (_characterTab && CoopCore.Role != CoopRole.None)
-            {
+            if (_tab == CoopTab.Character && CoopCore.Role != CoopRole.None)
                 DrawCharacterSelector(core);
-                GUILayout.EndVertical();
-                string characterFocused = GUI.GetNameOfFocusedControl();
-                TextFieldFocused = characterFocused != null && characterFocused.StartsWith("coop_");
-                GUI.DragWindow(new Rect(0f, 0f, 10000f, 20f));
-                return;
+            else if (_tab == CoopTab.Settings)
+                DrawSettings(core);
+            else
+                DrawSession(core, net);
+            GUILayout.EndVertical();
+            GUILayout.EndScrollView();
+            // Remember the viewport the scroll view actually received so the next pass can size
+            // the wrapper above. Measured on Repaint: during Layout the rect is not usable yet.
+            // Guarded so a bogus value can never inflate the content into a permanent scrollbar.
+            if (Event.current.type == EventType.Repaint)
+            {
+                float measured = GUILayoutUtility.GetLastRect().height;
+                if (measured > 0f && measured <= _win.height)
+                    _viewportHeight = measured;
             }
+            if (_tab == CoopTab.Character)
+                _characterScroll = scroll;
+            else if (_tab == CoopTab.Settings)
+                _settingsScroll = scroll;
+            else
+                _sessionScroll = scroll;
+            GUILayout.EndVertical();
 
+            FinishWindow();
+        }
+
+        /// <summary>The SESSION tab body: custom-card-database notices, the role-specific
+        /// host/join/status panels, and the graded-adopt prompt. The shared min-height wrapper in
+        /// WindowFn lets the last panel expand to fill the tab container.</summary>
+        private void DrawSession(CoopCore core, ICoopTransport net)
+        {
             // The restore OUTCOME lives out here, NOT inside the lend block below. A successful
             // restore (and the no-backup branch, which also clears the marker) makes
             // EnumLendState() return null, so a message drawn inside that block would be drawn
@@ -254,29 +326,115 @@ namespace CardShopCoop.UI
             // one call: the Steam host path returns early from DrawHost, and Role None simply has
             // no offers to draw.
             DrawGradedAdopt(core);
+        }
 
+        /// <summary>Shared footer for every tab: latch text-field focus, show the
+        /// toggle-key hint below the content panel, and keep the header draggable.</summary>
+        private void FinishWindow()
+        {
             string focused = GUI.GetNameOfFocusedControl();
             TextFieldFocused = focused != null && focused.StartsWith("coop_");
-
-            GUILayout.EndVertical();
-
+            GUILayout.BeginHorizontal();
+            GUILayout.FlexibleSpace();
+            GUILayout.Label(ToggleHintText(), CoopTheme.LabelDim);
+            GUILayout.FlexibleSpace();
+            GUILayout.EndHorizontal();
             GUI.DragWindow(new Rect(0f, 0f, 10000f, 20f));
+        }
+
+        /// <summary>Cached "Press &lt;key&gt; to toggle this window" line; rebuilt only when
+        /// the configured key changes because OnGUI runs multiple times per frame.</summary>
+        private string ToggleHintText()
+        {
+            KeyCode key = CoopPlugin.UiToggleKey != null ? CoopPlugin.UiToggleKey.Value : KeyCode.None;
+            if (_toggleHint == null || key != _toggleKeySeen)
+            {
+                _toggleKeySeen = key;
+                _toggleHint = key == KeyCode.None
+                    ? "Press the toggle key to toggle this window"
+                    : $"Press {key} to toggle this window";
+            }
+            return _toggleHint;
+        }
+
+        /// <summary>The complete outer window height: capped at <see cref="MaxWindowHeight"/>
+        /// and at the space the game window actually has, so the whole window (header, tabs,
+        /// content and footer) always fits after the game switches display mode.</summary>
+        private static float TargetWindowHeight()
+        {
+            // Never larger than the screen, and never a cap smaller than the floor we hand to
+            // Clamp; on any real resolution the screen term comfortably dominates.
+            float max = Mathf.Max(1f, Mathf.Min(MaxWindowHeight, Screen.height - WindowScreenMargin));
+            float min = Mathf.Min(320f, max);
+            return Mathf.Clamp(Screen.height * 0.72f, min, max);
         }
 
         private void DrawTabs(CoopCore core)
         {
             GUILayout.BeginHorizontal();
-            GUI.enabled = _characterTab;
-            if (GUILayout.Button("SESSION", _characterTab ? CoopTheme.Tab : CoopTheme.TabSelected,
-                GUILayout.Width(92f)))
-                _characterTab = false;
-            GUI.enabled = CoopCore.Role != CoopRole.None && !_characterTab;
-            if (GUILayout.Button("CHARACTER", _characterTab ? CoopTheme.TabSelected : CoopTheme.Tab,
-                GUILayout.Width(108f)))
-                _characterTab = true;
+            GUI.enabled = _tab != CoopTab.Session;
+            if (GUILayout.Button("SESSION", _tab == CoopTab.Session ? CoopTheme.TabSelected : CoopTheme.Tab,
+                GUILayout.Width(88f)))
+                _tab = CoopTab.Session;
+            GUI.enabled = CoopCore.Role != CoopRole.None && _tab != CoopTab.Character;
+            if (GUILayout.Button("CHARACTER", _tab == CoopTab.Character ? CoopTheme.TabSelected : CoopTheme.Tab,
+                GUILayout.Width(104f)))
+                _tab = CoopTab.Character;
+            GUI.enabled = _tab != CoopTab.Settings;
+            if (GUILayout.Button("SETTINGS", _tab == CoopTab.Settings ? CoopTheme.TabSelected : CoopTheme.Tab,
+                GUILayout.Width(96f)))
+                _tab = CoopTab.Settings;
             GUI.enabled = true;
             GUILayout.FlexibleSpace();
             GUILayout.EndHorizontal();
+        }
+
+        /// <summary>The SETTINGS tab: appearance, live logging switches, and the artificial
+        /// latency test sliders. Every control writes straight to its ConfigEntry, which
+        /// persists to disk, so the tab is a front-end for the config file rather than a
+        /// second source of truth.</summary>
+        private void DrawSettings(CoopCore core)
+        {
+            GUILayout.Label("APPEARANCE", CoopTheme.SectionHeader);
+            bool allowNsfw = GUILayout.Toggle(CoopPlugin.AllowNsfw.Value,
+                CoopPlugin.AllowNsfw.Value ? "NSFW allowed" : "NSFW hidden", CoopTheme.Toggle);
+            if (allowNsfw != CoopPlugin.AllowNsfw.Value)
+                core.SetNsfwAllowed(allowNsfw);
+            GUILayout.Space(8f);
+
+            GUILayout.Label("LOGGING", CoopTheme.SectionHeader);
+            DrawConfigToggle(CoopPlugin.BoxSyncDebug, "Verbose box-sync logging (BoxSyncDebug)");
+            DrawConfigToggle(CoopPlugin.PerfDebug, "Per-frame stage timing (PerfDebug)");
+            GUILayout.Space(8f);
+
+            GUILayout.Label("LATENCY TESTING", CoopTheme.SectionHeader);
+            DrawConfigIntSlider(CoopPlugin.ArtificialLagMs, 0, 2000, "Artificial lag");
+            DrawConfigIntSlider(CoopPlugin.ArtificialJitterMs, 0, 1000, "Jitter");
+            GUILayout.Space(8f);
+
+            GUILayout.Label("Settings are saved to BepInEx/config/com.zwhit.cardshopcoop.cfg.", CoopTheme.LabelDim);
+        }
+
+        private static void DrawConfigToggle(ConfigEntry<bool> entry, string label)
+        {
+            if (entry == null)
+                return;
+            bool value = GUILayout.Toggle(entry.Value, " " + label, CoopTheme.Toggle);
+            if (value != entry.Value)
+                entry.Value = value; // ConfigEntry writes the file itself
+        }
+
+        private static void DrawConfigIntSlider(ConfigEntry<int> entry, int min, int max, string label)
+        {
+            if (entry == null)
+                return;
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(label, CoopTheme.LabelDim, GUILayout.Width(130f));
+            int value = Mathf.RoundToInt(GUILayout.HorizontalSlider(entry.Value, min, max));
+            GUILayout.Label(value + " ms", CoopTheme.LabelDim, GUILayout.Width(56f));
+            GUILayout.EndHorizontal();
+            if (value != entry.Value)
+                entry.Value = value; // ConfigEntry writes the file itself
         }
 
         private static int GetConnectionState(CoopCore core, ICoopTransport net)
@@ -313,9 +471,6 @@ namespace CardShopCoop.UI
             if (!_characterSnapshotReady)
                 return;
 
-            float editorHeight = Mathf.Clamp(Screen.height - 190f, 260f, 560f);
-            _characterScroll = GUILayout.BeginScrollView(_characterScroll, false, true,
-                GUILayout.Height(editorHeight));
             GUILayout.BeginVertical(CoopTheme.SectionBox);
             GUILayout.BeginHorizontal();
             CoopTheme.Chip("MY CHARACTER", CoopTheme.ChipInfo);
@@ -353,7 +508,6 @@ namespace CardShopCoop.UI
                 DrawWardrobeControls(core);
             }
             GUILayout.EndVertical();
-            GUILayout.EndScrollView();
             GUILayout.Space(4f);
         }
 
@@ -391,8 +545,15 @@ namespace CardShopCoop.UI
 
             for (int slot = 0; slot < _characterCustomizer.ApparelTables.Count; slot++)
             {
-                var options = new List<string> { "Nude" };
-                var names = new List<string> { "" };
+                var options = new List<string>();
+                var names = new List<string>();
+                // The Nude slot is only offered while NSFW is allowed; otherwise the model
+                // is guaranteed clothed, so the empty option must not be selectable.
+                if (CoopPlugin.AllowNsfw.Value)
+                {
+                    options.Add("Nude");
+                    names.Add("");
+                }
                 var table = _characterCustomizer.ApparelTables[slot];
                 if (table != null && table.Items != null)
                     foreach (var item in table.Items)
@@ -404,7 +565,7 @@ namespace CardShopCoop.UI
                 _apparelNames.Add(names);
                 string current = slot < data.ApparelNames.Count ? data.ApparelNames[slot] : "";
                 int selected = names.IndexOf(current);
-                _apparelSelections.Add(string.IsNullOrEmpty(current) ? 0 : (selected < 1 ? 0 : selected));
+                _apparelSelections.Add(selected < 0 ? 0 : selected);
                 _apparelMaterials.Add(slot < data.ApparelMaterials.Count ? Mathf.Max(0, data.ApparelMaterials[slot]) : 0);
                 _apparelColors.Add(ReadApparelTint(data, slot));
             }
@@ -431,17 +592,23 @@ namespace CardShopCoop.UI
                     () => ApplyHair(core, slot));
             for (int slot = 0; slot < _apparelOptions.Count; slot++)
             {
+                // With NSFW off a slot with no real items offers nothing selectable.
+                if (_apparelOptions[slot].Count == 0)
+                    continue;
                 string label = _characterCustomizer.ApparelTables[slot] != null
                     && !string.IsNullOrEmpty(_characterCustomizer.ApparelTables[slot].Label)
                     ? _characterCustomizer.ApparelTables[slot].Label : "Apparel " + (slot + 1);
                 DrawCycleColorRow(label, _apparelOptions[slot], _apparelSelections, slot,
                     _apparelColors[slot], 1, slot, color => { _apparelColors[slot] = color; core.SetLocalApparelTint(slot, color); },
                     () => ApplyApparel(core, slot));
-                if (_apparelSelections[slot] > 0)
+                string selectedApparel = _apparelNames[slot][_apparelSelections[slot]];
+                if (!string.IsNullOrEmpty(selectedApparel))
                 {
                     var table = _characterCustomizer.ApparelTables[slot];
-                    int itemIndex = _apparelSelections[slot] - 1;
-                    int materialCount = table != null && itemIndex < table.Items.Count
+                    // When the Nude slot is offered it occupies index 0, so the item index
+                    // is offset by one; with NSFW off the list starts at the first real item.
+                    int itemIndex = _apparelSelections[slot] - (CoopPlugin.AllowNsfw.Value ? 1 : 0);
+                    int materialCount = table != null && itemIndex >= 0 && itemIndex < table.Items.Count
                         && table.Items[itemIndex].Materials != null ? table.Items[itemIndex].Materials.Count : 0;
                     if (materialCount > 1)
                         DrawNumberRow("Material", materialCount, _apparelMaterials, slot,
@@ -679,11 +846,11 @@ namespace CardShopCoop.UI
         {
             if (_characterCustomizer == null)
                 return;
-            if (_apparelSelections[slot] == 0)
+            string name = _apparelNames[slot][_apparelSelections[slot]];
+            if (string.IsNullOrEmpty(name))
                 core.ClearLocalApparel(slot);
             else
             {
-                string name = _apparelNames[slot][_apparelSelections[slot]];
                 int material = Mathf.Max(0, _apparelMaterials[slot]);
                 _characterCustomizer.setApparelByName(name, slot, material);
                 core.CommitLocalCustomization();
@@ -828,8 +995,9 @@ namespace CardShopCoop.UI
 
             CoopTheme.Divider();
 
-            // JOIN section
-            GUILayout.BeginVertical(CoopTheme.SectionBox);
+            // JOIN section - the last panel on the idle session view, so it expands to fill the
+            // tab container (DrawSession's MinHeight wrapper supplies the leftover space).
+            GUILayout.BeginVertical(CoopTheme.SectionBox, GUILayout.ExpandHeight(true));
             GUILayout.Label("JOIN A FRIEND", CoopTheme.SectionHeader);
             // Lobby browser + invite hint are Steam-only. On a Steamworks-less build point
             // the player at the thing that DOES work here (the IP field two rows down)
@@ -917,6 +1085,10 @@ namespace CardShopCoop.UI
 
         private void DrawHost(CoopCore core, ICoopTransport net)
         {
+            // The host status is the last (and only) panel on this session view, so it expands
+            // to fill the tab container via DrawSession's MinHeight wrapper.
+            GUILayout.BeginVertical(CoopTheme.SectionBox, GUILayout.ExpandHeight(true));
+            GUILayout.Label("HOSTING", CoopTheme.SectionHeader);
             if (core.IsSteamSession)
             {
                 GUILayout.Label("Hosting through Steam - no IPs needed.", CoopTheme.Label);
@@ -924,49 +1096,42 @@ namespace CardShopCoop.UI
                     core.OpenSteamInvite();
                 int scount = net?.ConnectionCount ?? 0;
                 GUILayout.Label(scount == 0 ? "Waiting for your invite to be accepted..." : PlayersLine(core), CoopTheme.Label);
-                if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")", CoopTheme.ButtonSecondary))
-                    core.SendEmote();
-                if (GUILayout.Button("Stop hosting", CoopTheme.ButtonDanger))
-                    core.Disconnect();
-                return;
-            }
-            if (_lanIps == null)
-            {
-                var ips = LocalIPv4s();
-                // home-router addresses first; virtual/VPN adapters are unreachable
-                ips.Sort((a, b) => IpRank(a).CompareTo(IpRank(b)));
-                _lanIps = ips.Count > 0 ? ips[0] : "(no LAN address found)";
-                _lanIpsOther = ips.Count > 1 ? string.Join("  ", ips.GetRange(1, ips.Count - 1)) : "";
-            }
-            GUILayout.Label("Give this to the other PC:", CoopTheme.Label);
-            if (!_revealIp)
-            {
-                if (GUILayout.Button("click to show IP  (hidden for streams)", CoopTheme.ButtonSecondary))
-                    _revealIp = true;
             }
             else
             {
-                GUILayout.Label($"<b><size=16>{_lanIps}</size></b>  (port {CoopPlugin.Port.Value})", CoopTheme.Label);
-                if (_lanIpsOther.Length > 0)
-                    GUILayout.Label($"<size=10>Other addresses: {_lanIpsOther}</size>", CoopTheme.LabelDim);
+                if (_lanIps == null)
+                {
+                    var ips = LocalIPv4s();
+                    // home-router addresses first; virtual/VPN adapters are unreachable
+                    ips.Sort((a, b) => IpRank(a).CompareTo(IpRank(b)));
+                    _lanIps = ips.Count > 0 ? ips[0] : "(no LAN address found)";
+                    _lanIpsOther = ips.Count > 1 ? string.Join("  ", ips.GetRange(1, ips.Count - 1)) : "";
+                }
+                // The address is the one thing that can leak a home connection on stream, so it
+                // is never printed: the copy button puts the whole connection block on the
+                // clipboard instead (the clipboard is not on camera). The session password below
+                // is still shown because it alone opens nothing and a friend typing the address
+                // by hand needs to read it.
+                _ipCopy.Draw("Copy IP address", IpClipboardText(), CoopTheme.ButtonSecondary);
+                DrawInvite(core);
+                int count = net?.ConnectionCount ?? 0;
+                GUILayout.Label(count == 0 ? "Waiting for a player..." : PlayersLine(core), CoopTheme.Label);
             }
-            DrawInvite(core);
-            int count = net?.ConnectionCount ?? 0;
-            GUILayout.Label(count == 0 ? "Waiting for a player..." : PlayersLine(core), CoopTheme.Label);
             if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")", CoopTheme.ButtonSecondary))
                 core.SendEmote();
             if (GUILayout.Button("Stop hosting", CoopTheme.ButtonDanger))
                 core.Disconnect();
+            GUILayout.EndVertical();
         }
 
-        /// <summary>The invite-code block in the LAN host panel: one copy button, one honest
-        /// status line, and one dim line about the router. Only ever drawn for a LAN session -
+        /// <summary>The invite-code block in the LAN host panel: the status + copy row, the
+        /// session-password row, and the router notes. Only ever drawn for a LAN session -
         /// DrawHost returns before this for Steam, where the overlay invite already does the
         /// job and an address-bearing code would just be a second way to do the same thing.
         ///
-        /// The code EMBEDS the address, so it obeys the same stream-safety rule as the IP two
-        /// rows up: the text is printed only once the player has clicked to reveal. Copying is
-        /// always allowed - the clipboard isn't on camera.</summary>
+        /// The code EMBEDS the address, so the raw text is never printed: copying is always
+        /// allowed (the clipboard isn't on camera) and the address itself is copy-only in
+        /// DrawHost rather than shown on screen.</summary>
         private void DrawInvite(CoopCore core)
         {
             // LATCH FIRST, BEFORE THE EARLY RETURN. Everything below - including whether this
@@ -986,55 +1151,33 @@ namespace CardShopCoop.UI
                 return;
 
             string code = _invCode;
-            // A new code (new session, or the worker just finished) is a code nobody has
-            // copied yet - without this the button would still read "Copied!" for the next
-            // person's code.
-            if (!ReferenceEquals(code, _inviteSeen))
-            {
-                _inviteSeen = code;
-                _inviteCopied = false;
-            }
 
+            float copyButtonWidth = CopyButtonWidth();
+            // Both copy rows share this height (the button's box plus its margins) so the text
+            // can be centred against the button instead of sitting at the top of the row.
+            float copyRowHeight = CoopTheme.ButtonSecondary.fixedHeight + CoopTheme.ButtonSecondary.margin.vertical;
             GUILayout.BeginHorizontal();
-            GUI.enabled = code != null;
-            if (GUILayout.Button(_inviteCopied ? "Copied!" : "Copy invite code", CoopTheme.ButtonSecondary, GUILayout.Width(150f)))
-            {
-                GUIUtility.systemCopyBuffer = code;
-                _inviteCopied = true;
-            }
-            GUI.enabled = true;
-            GUILayout.Label(InviteStatusText(_invState), CoopTheme.LabelDim);
+            GUILayout.Label(InviteStatusText(_invState), CoopTheme.LabelDimMiddle, GUILayout.Height(copyRowHeight));
             GUILayout.FlexibleSpace();
+            GUI.enabled = code != null;
+            _inviteCopy.Draw("Copy invite code", code, CoopTheme.ButtonSecondary,
+                GUILayout.Width(copyButtonWidth));
+            GUI.enabled = true;
             GUILayout.EndHorizontal();
 
-            if (_revealIp && code != null)
-                GUILayout.Label($"<size=11>{code}</size>", CoopTheme.LabelWrap);
-
-            // THE SESSION PASSWORD, printed even while the IP is hidden - and that is not an
-            // oversight in the stream-safety rule but the shape of it. The rule protects the
-            // ADDRESS, because an address is what lets a stranger reach this PC at all; the
-            // password on its own opens nothing, and a friend typing the IP by hand needs to be
-            // read it. It sits here, under the code, because that is where it already lives:
-            // anyone who used the code has supplied it without knowing it exists.
+            // THE SESSION PASSWORD is still printed while the connection details are hidden,
+            // and that is the shape of the stream-safety rule rather than an oversight: it
+            // protects the ADDRESS, because an address is what lets a stranger reach this PC at
+            // all, while the password on its own opens nothing and a friend typing the IP by
+            // hand needs to read it. Anyone who used the invite code already supplied it.
             if (!string.IsNullOrEmpty(_invPassword))
             {
-                if (_invPassword != _passwordSeen)
-                {
-                    _passwordSeen = _invPassword;
-                    _passwordCopied = false;
-                }
                 GUILayout.BeginHorizontal();
-                GUILayout.Label($"<size=11>session password: <b>{_invPassword}</b></size>", CoopTheme.LabelDim,
-                    GUILayout.ExpandWidth(true));
-                if (GUILayout.Button(_passwordCopied ? "Copied!" : "Copy password", CoopTheme.ButtonSecondary,
-                    GUILayout.Width(108f)))
-                {
-                    GUIUtility.systemCopyBuffer = _invPassword;
-                    _passwordCopied = true;
-                }
+                GUILayout.Label($"<size=11>session password: <b>{_invPassword}</b></size>", CoopTheme.LabelDimMiddle,
+                    GUILayout.ExpandWidth(true), GUILayout.Height(copyRowHeight));
+                _passwordCopy.Draw("Copy password", _invPassword, CoopTheme.ButtonSecondary,
+                    GUILayout.Width(copyButtonWidth));
                 GUILayout.EndHorizontal();
-                GUILayout.Label("<size=11>(already inside the invite code - only needed if they type your IP by hand)</size>",
-                    CoopTheme.LabelDimWrap);
             }
 
             // Say plainly what a LAN-only code is and isn't. It is NOT a failure - it is the
@@ -1063,16 +1206,35 @@ namespace CardShopCoop.UI
                 GUILayout.Label($"<size=10>router declined - forward port {CoopPlugin.Port.Value} manually, or let the other player host</size>", CoopTheme.LabelDimWrap);
         }
 
+        /// <summary>The plain-text connection block the Copy IP button puts on the clipboard:
+        /// the primary address + port, then any other local addresses. This is the text the
+        /// panel used to render, kept copyable so the address is never shown on screen.</summary>
+        private string IpClipboardText()
+        {
+            string text = $"{_lanIps}  (port {CoopPlugin.Port.Value})";
+            if (!string.IsNullOrEmpty(_lanIpsOther))
+                text += $"\nOther addresses: {_lanIpsOther}";
+            return text;
+        }
+
+        private static float CopyButtonWidth()
+        {
+            return Mathf.Max(
+                CoopTheme.ButtonSecondary.CalcSize(new GUIContent("Copy invite code")).x,
+                CoopTheme.ButtonSecondary.CalcSize(new GUIContent("Copy password")).x,
+                CoopTheme.ButtonSecondary.CalcSize(new GUIContent("Copied!")).x);
+        }
+
         private static string InviteStatusText(InviteState state)
         {
             switch (state)
             {
                 case InviteState.Resolving:
-                    return "<size=11>resolving public address...</size>";
+                    return "Preparing code...";
                 case InviteState.Ready:
-                    return "<size=11>code ready (internet)</size>";
+                    return "Code ready";
                 case InviteState.LanOnly:
-                    return "<size=11>LAN-only code</size>";
+                    return "Code ready";
                 default:
                     return "";
             }
@@ -1080,11 +1242,16 @@ namespace CardShopCoop.UI
 
         private void DrawClient(CoopCore core)
         {
+            // The client status is the last (and only) panel on this session view, so it expands
+            // to fill the tab container via DrawSession's MinHeight wrapper.
+            GUILayout.BeginVertical(CoopTheme.SectionBox, GUILayout.ExpandHeight(true));
+            GUILayout.Label("IN SESSION", CoopTheme.SectionHeader);
             GUILayout.Label(PlayersLine(core), CoopTheme.Label);
             if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")", CoopTheme.ButtonSecondary))
                 core.SendEmote();
             if (GUILayout.Button("Leave session", CoopTheme.ButtonDanger))
                 core.Disconnect();
+            GUILayout.EndVertical();
         }
 
         /// <summary>The graded-album repair offer, drawn only while a one-sided difference is
@@ -1264,7 +1431,7 @@ namespace CardShopCoop.UI
                     }
                 }
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             if (result.Count == 0)
                 result.Add("(no LAN address found)");
             return result;

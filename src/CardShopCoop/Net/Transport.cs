@@ -19,6 +19,8 @@ namespace CardShopCoop.Net
     public class Transport : ICoopTransport
     {
         private const int MaxFrame = Msg.MaxFrameSize; // save files are ~4 MB; hard cap for sanity
+        private const int IncomingCap = 10000;
+        private bool _incomingOverflowWarned;
 
         public ConcurrentQueue<InMsg> Incoming { get; } = new ConcurrentQueue<InMsg>();
         public ConcurrentQueue<int> Disconnects { get; } = new ConcurrentQueue<int>();
@@ -91,6 +93,7 @@ namespace CardShopCoop.Net
         public void StartHost(int port)
         {
             Stop();
+            _incomingOverflowWarned = false;
             _running = true;
             _listener = new TcpListener(IPAddress.Any, port);
             _listener.Start();
@@ -124,7 +127,7 @@ namespace CardShopCoop.Net
                     {
                         tcp.Close();
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                     break;
                 }
                 ConfigureSocket(tcp);
@@ -137,7 +140,7 @@ namespace CardShopCoop.Net
                         {
                             tcp.Close();
                         }
-                        catch { }
+                        catch (System.Exception e) { Swallow.Log(e); }
                         break;
                     }
                     conn.Id = _nextConnId++;
@@ -160,6 +163,7 @@ namespace CardShopCoop.Net
         public int StartClient(string ip, int port, int timeoutMs = 6000)
         {
             Stop();
+            _incomingOverflowWarned = false;
             _running = true;
             var tcp = new TcpClient();
             var ar = tcp.BeginConnect(ip, port, null, null);
@@ -268,8 +272,16 @@ namespace CardShopCoop.Net
                     conn.LastRecvTicksUtc = DateTime.UtcNow.Ticks;
                     if (!Msg.TryDecodeFrame(frame, 0, frame.Length, conn.Id, MaxFrame, out var message))
                     {
-                        CoopPlugin.Log.LogWarning("CoopRead" + conn.Id + ": discarded malformed message frame");
                         continue;
+                    }
+                    while (Incoming.Count >= IncomingCap && Incoming.TryDequeue(out _))
+                    {
+                        if (!_incomingOverflowWarned)
+                        {
+                            _incomingOverflowWarned = true;
+                            CoopPlugin.Log.LogWarning("Transport: incoming queue cap reached; dropping oldest messages");
+                        }
+                        break;
                     }
                     Incoming.Enqueue(message);
                 }
@@ -294,7 +306,7 @@ namespace CardShopCoop.Net
 
         private static bool IsMalformedFrame(Exception e)
         {
-            return e is IOException && string.Equals(e.Message, "Bad message frame", StringComparison.Ordinal);
+            return e is IOException && e.Message.StartsWith("Bad frame length ", StringComparison.Ordinal);
         }
 
         /// <summary>Never blocks the caller: enqueues for the connection's writer thread.
@@ -376,22 +388,22 @@ namespace CardShopCoop.Net
             {
                 conn.SendSignal.Set();
             }
-            catch { } // wake the writer so it can exit
+            catch (System.Exception e) { Swallow.Log(e); } // wake the writer so it can exit
             try
             {
                 conn.KeepaliveSignal.Set();
             }
-            catch { } // wake keepalive during teardown
+            catch (System.Exception e) { Swallow.Log(e); } // wake keepalive during teardown
             try
             {
                 conn.Stream?.Close();
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             try
             {
                 conn.Tcp?.Close();
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             Disconnects.Enqueue(connId);
         }
 
@@ -403,7 +415,7 @@ namespace CardShopCoop.Net
             {
                 _listener?.Stop();
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             _listener = null;
             List<int> ids;
             lock (_connsLock)

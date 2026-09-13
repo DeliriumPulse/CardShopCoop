@@ -40,7 +40,7 @@ namespace CardShopCoop
                 }
                 return "custom-card database is the HOST's copy (co-op sync) - solo modded saves may not load; restore via the co-op window";
             }
-            catch { return null; }
+            catch (System.Exception e) { Swallow.Log(e); return null; }
         }
 
         /// <summary>FIX C: our own runtime registry lines, never throwing into the handshake.
@@ -129,7 +129,7 @@ namespace CardShopCoop
                         lines.Add(s);
                 }
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             return lines;
         }
 

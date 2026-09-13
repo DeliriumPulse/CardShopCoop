@@ -29,6 +29,8 @@ BepInEx 5 plugin, Unity 2021.3 Mono, no game assets redistributed.
 - **Live world**: customers and workers mirrored as motion-smoothed puppets
   (snapshot-interpolated, not jittery extrapolation), full day/night cycle and lighting
   sync, avatars with real carried items (boxes with product, card fans, binders).
+- **Allow NSFW**: when off, the Nude wardrobe option is hidden and fully nude players
+  appear in the game's random clothed customer look; when on, nude appearances are allowed.
 - **Mod-stack aware**: plugin-set and card-ID-registry parity checks at join with
   readable rejections, automatic `enum_values.json` sync (backup + install + "restart
   and rejoin"), product-catalog diffing with plain-language warnings, refunds when an

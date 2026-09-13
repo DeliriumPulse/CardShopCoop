@@ -2,6 +2,8 @@ src/CardShopCoop/bin/
 src/CardShopCoop/obj/
 tools/Decomp/bin/
 tools/Decomp/obj/
+tools/Launcher/bin/
+tools/Launcher/obj/
 decompiled/
 Directory.Build.user.props
 backup/

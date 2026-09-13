@@ -1,7 +1,7 @@
 <Project>
   <PropertyGroup>
     <!-- Single source of truth for the plugin's public/release version. -->
-    <CardShopCoopVersion>1.1.0</CardShopCoopVersion>
+    <CardShopCoopVersion>1.2.0</CardShopCoopVersion>
     <Deploy>false</Deploy>
     <GamePath Condition="'$(GamePath)' == '' and '$(CARDSHOP_GAMEPATH)' != ''">$(CARDSHOP_GAMEPATH)</GamePath>
     <GamePath Condition="'$(GamePath)' == '' and $([MSBuild]::IsOSPlatform('Windows'))">D:\SteamLibrary\steamapps\common\TCG Card Shop Simulator</GamePath>

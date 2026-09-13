@@ -20,8 +20,10 @@ namespace CardShopCoop.Sync
     /// here is free scalars, so those forward as postfixes (instant local apply, the
     /// echo confirms).
     /// </summary>
-    public class SettingsSync
+    public class SettingsSync : TickableCoopModule
     {
+        public override string Name => "settings";
+
         // SettingsOp sub-ops (first byte of every op payload)
         private const byte OpBuyDeco = 1;      // client->host: byte category(0 wall/1 floor/2 ceiling), int index
         private const byte OpEquipDeco = 2;    // client->host: six ints (wall, wallB, floor, floorB, ceiling, ceilingB)
@@ -43,10 +45,7 @@ namespace CardShopCoop.Sync
         public Action<INetMessage> SendOp;         // set by CoopCore: client->host
         public Action<INetMessage> BroadcastState; // set by CoopCore: host->clients
 
-        private float _timer;
-        private int _lastHash;
-        private float _heal;
-        private bool _hasHash;
+        private readonly SnapshotGate _gate = new SnapshotGate(1.5f, 15f, -2.6f, hasHashInitially: false);
 
         // NEVER CSingleton<>.Instance for these: touched while no real manager exists
         // (client reload loading screen, host mid-session save load - ?. does NOT
@@ -85,22 +84,28 @@ namespace CardShopCoop.Sync
             Instance = this;
         }
 
-        public void Reset()
+        public override void Start() => Instance = this;
+
+        protected override void OnHostTick(in SyncFrame frame) => HostTick(frame.Dt, frame.InGame);
+
+        public override void Reset()
         {
-            _timer = -2.6f; // staggered phase vs the other snapshot engines
-            _lastHash = 0;
-            _heal = 0f;
-            _hasHash = false;
+            _gate.Reset(-2.6f);
             ApplyingRemote = false;
             _sm = null;
             _inv = null;
         }
 
-        public void ForceResend()
+        public override void ForceResend()
         {
-            _lastHash = 0;
-            _heal = 15f;
-            _hasHash = false;
+            _gate.Force();
+        }
+
+        public override void Dispose()
+        {
+            base.Dispose();
+            if (ReferenceEquals(Instance, this))
+                Instance = null;
         }
 
         // ---------------- host ----------------
@@ -109,29 +114,22 @@ namespace CardShopCoop.Sync
         {
             if (!inGame)
                 return;
-            _timer += dt;
-            if (_timer < 1.5f)
+            if (!_gate.Due(dt))
                 return;
-            _timer -= 1.5f;
-            try
+            Guarded("host", () =>
             {
                 int hash = HashState();
-                _heal += 1.5f;
-                if (_hasHash && hash == _lastHash && _heal < 15f)
+                if (!_gate.ShouldSend(hash))
                     return;
-                _lastHash = hash;
-                _hasHash = true;
-                _heal = 0f;
                 var msg = BuildStateMessage();
                 BroadcastState?.Invoke(msg);
-            }
-            catch (Exception e) { CoopPlugin.Log.LogWarning("SettingsSync host: " + e.Message); }
+            });
         }
 
         public void HostApplyOp(SettingsOpMessage message)
         {
             byte op = message.Op;
-            try
+            Guarded("apply", () =>
             {
                 switch (op)
                 {
@@ -236,8 +234,7 @@ namespace CardShopCoop.Sync
                         CoopPlugin.Log.LogWarning("SettingsSync: unknown sub-op " + op);
                         break;
                 }
-            }
-            catch (Exception e) { CoopPlugin.Log.LogWarning($"SettingsSync op {op}: " + e.Message); }
+            });
             // no explicit echo: the change lands in the very next hash-gated broadcast
         }
 
@@ -288,77 +285,79 @@ namespace CardShopCoop.Sync
             ApplyingRemote = true;
             try
             {
-                // deco ownership (host list sizes rule; extra local entries keep their state)
-                ApplyBoolList(message.WallUnlocked, CPlayerData.m_UnlockedDecoWallList, CPlayerData.SetUnlockDecoWall);
-                ApplyBoolList(message.FloorUnlocked, CPlayerData.m_UnlockedDecoFloorList, CPlayerData.SetUnlockDecoFloor);
-                ApplyBoolList(message.CeilingUnlocked, CPlayerData.m_UnlockedDecoCeilingList, CPlayerData.SetUnlockDecoCeiling);
-
-                int w = message.EquippedWallIndex;
-                int wB = message.EquippedWallIndexB;
-                int f = message.EquippedFloorIndex;
-                int fB = message.EquippedFloorIndexB;
-                int c = message.EquippedCeilingIndex;
-                int cB = message.EquippedCeilingIndexB;
-                ApplyEquips(w, wB, f, fB, c, cB);
-
-                CPlayerData.m_GameEventFormat = (EGameEventFormat)message.GameEventFormat;
-                CPlayerData.m_PendingGameEventFormat = (EGameEventFormat)message.PendingGameEventFormat;
-                // host ids -> ours (see the DTO). A game event on an expansion only the
-                // host has resolves to ECardExpansionType.None, which reads exactly like
-                // "no expansion picked yet" - the joiner's own packs are untouched
-                CPlayerData.m_GameEventExpansionType = message.GameEventExpansion;
-                CPlayerData.m_PendingGameEventExpansionType = message.PendingGameEventExpansion;
-                int feeCount = message.GameEventPrices.Count;
-                for (int i = 0; i < feeCount; i++)
+                Guarded("apply", () =>
                 {
-                    float fee = message.GameEventPrices[i];
-                    if (i < CPlayerData.m_SetGameEventPriceList.Count)
-                        CPlayerData.m_SetGameEventPriceList[i] = fee;
-                }
+                    // deco ownership (host list sizes rule; extra local entries keep their state)
+                    ApplyBoolList(message.WallUnlocked, CPlayerData.m_UnlockedDecoWallList, CPlayerData.SetUnlockDecoWall);
+                    ApplyBoolList(message.FloorUnlocked, CPlayerData.m_UnlockedDecoFloorList, CPlayerData.SetUnlockDecoFloor);
+                    ApplyBoolList(message.CeilingUnlocked, CPlayerData.m_UnlockedDecoCeilingList, CPlayerData.SetUnlockDecoCeiling);
 
-                var counters = Sm()?.m_CashierCounterList;
-                int cn = message.CashierFlags.Count;
-                for (int i = 0; i < cn; i++)
-                {
-                    byte flags = message.CashierFlags[i];
-                    if (counters == null || i >= counters.Count || counters[i] == null)
-                        continue;
-                    bool checkout = (flags & 1) != 0;
-                    bool trade = (flags & 2) != 0;
-                    // setters refresh the counter's own signage, so only call on change
-                    if (counters[i].CanCheckout() != checkout)
-                        counters[i].SetCanCheckout(checkout);
-                    if (counters[i].CanTradeCard() != trade)
-                        counters[i].SetCanTradeCard(trade);
-                }
+                    int w = message.EquippedWallIndex;
+                    int wB = message.EquippedWallIndexB;
+                    int f = message.EquippedFloorIndex;
+                    int fB = message.EquippedFloorIndexB;
+                    int c = message.EquippedCeilingIndex;
+                    int cB = message.EquippedCeilingIndexB;
+                    ApplyEquips(w, wB, f, fB, c, cB);
 
-                var tables = Sm()?.m_PlayTableList;
-                int tn = message.TableNumbers.Count;
-                for (int i = 0; i < tn; i++)
-                {
-                    int number = message.TableNumbers[i];
-                    if (tables == null || i >= tables.Count || tables[i] == null)
-                        continue;
-                    if (tables[i].GetTournamentPlayTableNumber() != number)
-                        tables[i].SetTournamentPlayTableNumber(number);
-                }
-                var stock = CPlayerData.m_DecorationInventoryList;
-                if (stock != null)
-                {
-                    for (int i = 0; i < stock.Count; i++)
-                        stock[i] = 0;
-                    if (message.DecoStock != null)
-                        for (int i = 0; i < message.DecoStock.Count; i++)
-                        {
-                            int local;
-                            var e = message.DecoStock[i];
-                            if (Util.EnumMap.TryFromWire(Util.EnumKind.DecoObject, e.DecoType, out local)
-                                && local >= 0 && local < stock.Count)
-                                stock[local] = Mathf.Max(0, e.Count);
-                        }
-                }
+                    CPlayerData.m_GameEventFormat = (EGameEventFormat)message.GameEventFormat;
+                    CPlayerData.m_PendingGameEventFormat = (EGameEventFormat)message.PendingGameEventFormat;
+                    // host ids -> ours (see the DTO). A game event on an expansion only the
+                    // host has resolves to ECardExpansionType.None, which reads exactly like
+                    // "no expansion picked yet" - the joiner's own packs are untouched
+                    CPlayerData.m_GameEventExpansionType = message.GameEventExpansion;
+                    CPlayerData.m_PendingGameEventExpansionType = message.PendingGameEventExpansion;
+                    int feeCount = message.GameEventPrices.Count;
+                    for (int i = 0; i < feeCount; i++)
+                    {
+                        float fee = message.GameEventPrices[i];
+                        if (i < CPlayerData.m_SetGameEventPriceList.Count)
+                            CPlayerData.m_SetGameEventPriceList[i] = fee;
+                    }
+
+                    var counters = Sm()?.m_CashierCounterList;
+                    int cn = message.CashierFlags.Count;
+                    for (int i = 0; i < cn; i++)
+                    {
+                        byte flags = message.CashierFlags[i];
+                        if (counters == null || i >= counters.Count || counters[i] == null)
+                            continue;
+                        bool checkout = (flags & 1) != 0;
+                        bool trade = (flags & 2) != 0;
+                        // setters refresh the counter's own signage, so only call on change
+                        if (counters[i].CanCheckout() != checkout)
+                            counters[i].SetCanCheckout(checkout);
+                        if (counters[i].CanTradeCard() != trade)
+                            counters[i].SetCanTradeCard(trade);
+                    }
+
+                    var tables = Sm()?.m_PlayTableList;
+                    int tn = message.TableNumbers.Count;
+                    for (int i = 0; i < tn; i++)
+                    {
+                        int number = message.TableNumbers[i];
+                        if (tables == null || i >= tables.Count || tables[i] == null)
+                            continue;
+                        if (tables[i].GetTournamentPlayTableNumber() != number)
+                            tables[i].SetTournamentPlayTableNumber(number);
+                    }
+                    var stock = CPlayerData.m_DecorationInventoryList;
+                    if (stock != null)
+                    {
+                        for (int i = 0; i < stock.Count; i++)
+                            stock[i] = 0;
+                        if (message.DecoStock != null)
+                            for (int i = 0; i < message.DecoStock.Count; i++)
+                            {
+                                int local;
+                                var e = message.DecoStock[i];
+                                if (Util.EnumMap.TryFromWire(Util.EnumKind.DecoObject, e.DecoType, out local)
+                                    && local >= 0 && local < stock.Count)
+                                    stock[local] = Mathf.Max(0, e.Count);
+                            }
+                    }
+                });
             }
-            catch (Exception e) { CoopPlugin.Log.LogWarning("SettingsSync apply: " + e.Message); }
             finally { ApplyingRemote = false; }
             if (decoBefore != DecoStateHash())
                 RefreshOpenDecoUI();
@@ -433,7 +432,7 @@ namespace CardShopCoop.Sync
                 {
                     ShopCustomizationManager.ChangeWallMaterial(wall, isShopLotB: false);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
             if (wallB != CPlayerData.m_EquippedWallDecoIndexB && wallB >= 0 && wallB < so.m_WallDecoDataList.Count)
             {
@@ -442,7 +441,7 @@ namespace CardShopCoop.Sync
                 {
                     ShopCustomizationManager.ChangeWallMaterial(wallB, isShopLotB: true);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
             if (floor != CPlayerData.m_EquippedFloorDecoIndex && floor >= 0 && floor < so.m_FloorDecoDataList.Count)
             {
@@ -451,7 +450,7 @@ namespace CardShopCoop.Sync
                 {
                     ShopCustomizationManager.ChangeFloorMaterial(floor, isShopLotB: false);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
             if (floorB != CPlayerData.m_EquippedFloorDecoIndexB && floorB >= 0 && floorB < so.m_FloorDecoDataList.Count)
             {
@@ -460,7 +459,7 @@ namespace CardShopCoop.Sync
                 {
                     ShopCustomizationManager.ChangeFloorMaterial(floorB, isShopLotB: true);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
             if (ceiling != CPlayerData.m_EquippedCeilingDecoIndex && ceiling >= 0 && ceiling < so.m_CeilingDecoDataList.Count)
             {
@@ -469,7 +468,7 @@ namespace CardShopCoop.Sync
                 {
                     ShopCustomizationManager.ChangeCeilingMaterial(ceiling, isShopLotB: false);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
             if (ceilingB != CPlayerData.m_EquippedCeilingDecoIndexB && ceilingB >= 0 && ceilingB < so.m_CeilingDecoDataList.Count)
             {
@@ -478,7 +477,7 @@ namespace CardShopCoop.Sync
                 {
                     ShopCustomizationManager.ChangeCeilingMaterial(ceilingB, isShopLotB: true);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
         }
 
@@ -693,7 +692,7 @@ namespace CardShopCoop.Sync
             {
                 cat = (int)FiBuyCategory.GetValue(__instance);
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             if (cat < 0 || cat > 2)
                 return true; // item-deco pages use the other handler
             // local funds check is cosmetic (the wallet mirror is authoritative-ish);

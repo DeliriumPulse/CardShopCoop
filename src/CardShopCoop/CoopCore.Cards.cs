@@ -546,7 +546,7 @@ namespace CardShopCoop
             {
                 before = CPlayerData.GetCardPrice(card);
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             try
             {
                 CPlayerData.SetCardPrice(card, price);

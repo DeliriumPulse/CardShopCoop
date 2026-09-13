@@ -26,7 +26,7 @@ namespace CardShopCoop.Sync
     /// (on change + a slow heal), into the client's CPlayerData mirrors so the joiner's
     /// phone shows the truth and salary-derived numbers (bills) agree.
     /// </summary>
-    public class StaffSync
+    public class StaffSync : TickableCoopModule
     {
         private const byte OpHire = 1;
         private const byte OpUpdate = 2;
@@ -34,8 +34,6 @@ namespace CardShopCoop.Sync
         private const byte OpFire = 4;
         private const byte OpBeginInteract = 5;
         private const byte OpEndInteract = 6;
-        private const float SendInterval = 1.0f;
-        private const float HealInterval = 15f;
         private const int MaxWorkers = 32;
 
         /// <summary>Patches are static but ops need the wired instance; CoopCore
@@ -77,10 +75,7 @@ namespace CardShopCoop.Sync
         private WorkerManager _wm;
         private HireWorkerScreen _hireScreen;
         private bool _hireScreenSearched; // the screen may legitimately not exist yet
-        private float _timer;
-        private int _lastHash;
-        private float _heal;
-        private bool _force;
+        private readonly SnapshotGate _gate = new SnapshotGate(1.0f, 15f, -0.7f);
         private readonly List<Entry> _buf = new List<Entry>(MaxWorkers);
         private readonly Dictionary<int, int> _workerLeaseOwner = new Dictionary<int, int>();
         private static readonly Dictionary<int, bool> ClientWorkerBusy = new Dictionary<int, bool>();
@@ -93,6 +88,12 @@ namespace CardShopCoop.Sync
         {
             Instance = this;
         }
+
+        public override void Start() => Instance = this;
+
+        public override string Name => nameof(StaffSync);
+
+        protected override void OnHostTick(in SyncFrame frame) => HostTick(frame.Dt, frame.InGame);
 
         private struct Entry
         {
@@ -116,26 +117,29 @@ namespace CardShopCoop.Sync
             public List<int> ExpList;
         }
 
-        public void Reset()
+        public override void Reset()
         {
             _wm = null;
             _hireScreen = null;
             _hireScreenSearched = false;
-            _timer = -0.7f; // staggered phase vs the other snapshot engines
-            _lastHash = 0;
-            _heal = 0f;
-            _force = false;
+            _gate.Reset(-0.7f);
             _workerLeaseOwner.Clear();
             ClientWorkerBusy.Clear();
             ClientWorkerLease.Clear();
             _allowClientWorkerOpen = false;
         }
 
-        public void ForceResend()
+        public override void ForceResend()
         {
-            _lastHash = 0;
-            _heal = 0f;
-            _force = true;
+            _gate.Force();
+        }
+
+        public override void Dispose()
+        {
+            base.Dispose();
+            if (ReferenceEquals(Instance, this))
+                Instance = null;
+            ApplyingRemote = false;
         }
 
         private WorkerManager Wm()
@@ -227,7 +231,7 @@ namespace CardShopCoop.Sync
             {
                 return field?.GetValue(instance) as Worker;
             }
-            catch { return null; }
+            catch (System.Exception e) { Swallow.Log(e); return null; }
         }
 
         private static void SendUpdate(Worker worker)
@@ -302,7 +306,7 @@ namespace CardShopCoop.Sync
                 worker.OnPressStopInteract();
                 __instance.CloseScreen();
             }
-            catch { }
+            catch (System.Exception caught) { Swallow.Log(caught); }
             return false;
         }
 
@@ -408,30 +412,33 @@ namespace CardShopCoop.Sync
         public void HostApplyOp(StaffOpMessage message, int connId)
         {
             byte op = message.Op;
-            switch (op)
+            Guarded("apply", () =>
             {
-                case OpHire:
-                    HostHire(message.Index);
-                    break;
-                case OpUpdate:
-                    HostUpdate(message, connId);
-                    break;
-                case OpBonus:
-                    HostBonus(message.Index, connId);
-                    break;
-                case OpFire:
-                    HostFire(message.Index, connId);
-                    break;
-                case OpBeginInteract:
-                    HostBeginInteraction(message.Index, connId, message.Position);
-                    break;
-                case OpEndInteract:
-                    HostEndInteraction(message.Index, connId);
-                    break;
-                default:
-                    CoopPlugin.Log.LogWarning("StaffSync: unknown op " + op);
-                    break;
-            }
+                switch (op)
+                {
+                    case OpHire:
+                        HostHire(message.Index);
+                        break;
+                    case OpUpdate:
+                        HostUpdate(message, connId);
+                        break;
+                    case OpBonus:
+                        HostBonus(message.Index, connId);
+                        break;
+                    case OpFire:
+                        HostFire(message.Index, connId);
+                        break;
+                    case OpBeginInteract:
+                        HostBeginInteraction(message.Index, connId, message.Position);
+                        break;
+                    case OpEndInteract:
+                        HostEndInteraction(message.Index, connId);
+                        break;
+                    default:
+                        CoopPlugin.Log.LogWarning("StaffSync: unknown op " + op);
+                        break;
+                }
+            });
         }
 
         private bool ValidWorkerIndex(int index)
@@ -475,7 +482,7 @@ namespace CardShopCoop.Sync
                     {
                         FiWorkerTargetRotation?.SetValue(worker, Quaternion.LookRotation(toward, Vector3.up));
                     }
-                    catch { }
+                    catch (System.Exception caught) { Swallow.Log(caught); }
                 }
             }
             worker.m_IsPausingAction = true;
@@ -640,30 +647,23 @@ namespace CardShopCoop.Sync
         {
             if (!inGame)
                 return;
-            _timer += dt;
-            if (_timer < SendInterval)
+            if (!_gate.Due(dt))
                 return;
-            _timer -= SendInterval;
-            try
+            Guarded("host", () =>
             {
                 var wm = Wm();
                 if (wm == null || wm.m_WorkerDataList == null)
                     return;
                 Collect(wm, _buf);
                 int hash = HashEntries(_buf);
-                _heal += SendInterval;
-                if (!_force && hash == _lastHash && _heal < HealInterval)
+                if (!_gate.ShouldSend(hash))
                     return;
-                _force = false;
-                _lastHash = hash;
-                _heal = 0f;
                 var list = _buf; // serialized synchronously by Msg.Build; safe to close over
                 var entries = new List<StaffEntry>(list.Count);
                 for (int i = 0; i < list.Count; i++)
                     entries.Add(ToStaffEntry(list[i]));
                 BroadcastState?.Invoke(new StaffStateMessage { Entries = entries });
-            }
-            catch (Exception e) { CoopPlugin.Log.LogWarning("StaffSync host: " + e.Message); }
+            });
         }
 
         /// <summary>Essentials come from the LIVE Worker when it's active (the save-data
@@ -689,7 +689,7 @@ namespace CardShopCoop.Sync
                     {
                         d = w.GetWorkerSaveData();
                     }
-                    catch { }
+                    catch (System.Exception caught) { Swallow.Log(caught); }
                 }
                 if (d == null && saved != null && i < saved.Count)
                     d = saved[i];
@@ -759,9 +759,8 @@ namespace CardShopCoop.Sync
             ApplyingRemote = true;
             try
             {
-                ClientApplyInner(message);
+                Guarded("apply", () => ClientApplyInner(message));
             }
-            catch (Exception e) { CoopPlugin.Log.LogWarning("StaffSync client: " + e.Message); }
             finally { ApplyingRemote = false; }
         }
 
@@ -770,6 +769,9 @@ namespace CardShopCoop.Sync
             int n = message.Entries.Count;
             bool rosterChanged = false;
             var saved = CPlayerData.m_WorkerSaveDataList;
+            // One scene lookup per state apply, not per worker: the interaction screen caches
+            // the bonus count when it opens, so an open screen must be refreshed from the mirror.
+            var interactScreen = UnityEngine.Object.FindObjectOfType<WorkerInteractUIScreen>(true);
             for (int i = 0; i < n; i++)
             {
                 var e = message.Entries[i];
@@ -812,6 +814,7 @@ namespace CardShopCoop.Sync
                 if (e.ExpList != null)
                     d.expList = e.ExpList;
                 NpcSync.RefreshWorkerUi(i, d);
+                RefreshInteractScreen(interactScreen, i);
             }
             if (rosterChanged)
                 RefreshHirePanels();
@@ -843,7 +846,29 @@ namespace CardShopCoop.Sync
                 {
                     MiPanelEvaluateHired.Invoke(panel, null);
                 }
-                catch { }
+                catch (System.Exception caught) { Swallow.Log(caught); }
+            }
+        }
+
+        /// <summary>The interaction screen caches the bonus count when it opens, so refresh
+        /// its controls when a mirrored worker update lands while the screen is open.</summary>
+        private static void RefreshInteractScreen(WorkerInteractUIScreen screen, int index)
+        {
+            if (screen == null || screen.m_ScreenGrp == null || !screen.m_ScreenGrp.activeSelf)
+                return;
+            var worker = FiInteractWorker.GetValue(screen) as Worker;
+            if (worker == null || worker.m_WorkerIndex != index)
+                return;
+            int count = worker.GetBonusBoostedCount();
+            screen.m_GiveBonusBtn.interactable = count < 3;
+            if (count > 0)
+            {
+                screen.m_BonusAddAmountText.text = "+" + count;
+                screen.m_BonusAddAmountGrp.SetActive(true);
+            }
+            else
+            {
+                screen.m_BonusAddAmountGrp.SetActive(false);
             }
         }
 

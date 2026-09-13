@@ -56,7 +56,7 @@ namespace CardShopCoop.Util
                         _lastFlushTick = now;
                     }
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
         }
 
@@ -68,7 +68,7 @@ namespace CardShopCoop.Util
                 {
                     _writer?.Flush();
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
         }
     }

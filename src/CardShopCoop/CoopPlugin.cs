@@ -37,6 +37,7 @@ namespace CardShopCoop
         public static ConfigEntry<string> PlayerName;
         public static ConfigEntry<float> SendRateHz;
         public static ConfigEntry<bool> AvatarsEnabled;
+        public static ConfigEntry<bool> AllowNsfw;
         public static ConfigEntry<KeyCode> UiToggleKey;
         public static ConfigEntry<KeyCode> EmoteKey;
         public static ConfigEntry<int> ClientWorldSlot;
@@ -46,6 +47,10 @@ namespace CardShopCoop
         public static ConfigEntry<bool> AutoPortForward;
         public static ConfigEntry<bool> AutoLanPassword;
         public static ConfigEntry<GradedAlertMode> GradedDriftAlert;
+        public static ConfigEntry<bool> BoxSyncDebug;
+        public static ConfigEntry<bool> PerfDebug;
+        public static ConfigEntry<int> ArtificialLagMs;
+        public static ConfigEntry<int> ArtificialJitterMs;
 
         private void Awake()
         {
@@ -74,6 +79,8 @@ namespace CardShopCoop
                 SendRateHz.Value = 15f; // migrate configs saved by earlier builds
             AvatarsEnabled = Config.Bind("Player", "AvatarsEnabled", true,
                 "Show the other player as a walking character in your shop.");
+            AllowNsfw = Config.Bind("Player", "AllowNsfw", false,
+                "Allow nude/NSFW character appearances. When off, new characters get a random clothed preset, the Nude wardrobe option is hidden, and fully nude players are shown in the game's random clothed customer look. When on, you may choose Nude and you will see other players who chose it.");
             UiToggleKey = Config.Bind("Keys", "UiToggleKey", KeyCode.F2,
                 "Toggles the co-op window. (F3 is reserved for future co-op options.)");
             if (UiToggleKey.Value == KeyCode.F11)
@@ -94,6 +101,14 @@ namespace CardShopCoop
                 "Hosting via LAN generates a random session password. It is baked into the invite code (so a friend using the code notices nothing), shown in the host panel for a friend typing your IP by hand, and checked exactly like the Steam lobby password. Leave this on: the port your router opens for you is a door into your game, and this is the lock on it.");
             GradedDriftAlert = Config.Bind("Graded", "DriftAlert", GradedAlertMode.Always,
                 "How loudly to announce that your graded albums have drifted apart. THIS CONTROLS THE HOST'S SCREEN. While you are HOSTING it decides both your own on-screen line and the heads-up sent to the joiner. While you are JOINING it does nothing at all: the host's setting alone decides whether you get that heads-up, because the drift is only ever announced from the host's side. Always: announce every check that finds a difference. OncePerSession: say it once per player per session and then stay quiet - including for a later, bigger difference. Never: never put it on screen at all. The log records every check whichever you pick and on both PCs, so a support log stays complete whatever you choose; this only controls the screen, and it never changes what the co-op panel's adopt button offers.");
+            BoxSyncDebug = Config.Bind("Diagnostics", "BoxSyncDebug", false,
+                "Log detailed box-sync activity: each possession report a client sends, each update the host accepts or rejects, and each box the client adopts or spawns. Verbose - enable temporarily (then restart) to diagnose boxes that will not pick up, move, or hide in sync.");
+            PerfDebug = Config.Bind("Diagnostics", "PerfDebug", false,
+                "Log any per-frame sync stage that takes longer than 5 ms (rate-limited to one line per stage per 2 s). Enable temporarily to find lag spikes; it does not change gameplay.");
+            ArtificialLagMs = Config.Bind("Diagnostics", "ArtificialLagMs", 0,
+                "TESTING ONLY. Adds this many milliseconds of latency to every network message you RECEIVE. Set the same value on both PCs for symmetric lag (each hop adds one delay, so a round trip is roughly twice the value). 0 disables it.");
+            ArtificialJitterMs = Config.Bind("Diagnostics", "ArtificialJitterMs", 0,
+                "TESTING ONLY. Randomly varies each received message's artificial latency by up to this many milliseconds, plus or minus, so the connection feels unstable. 0 is a steady delay. Only meaningful while ArtificialLagMs is above 0.");
 
             // PLATFORM LINE FIRST, ABOVE EVERYTHING THAT CAN FAIL. This is the line a Game
             // Pass player (or a support thread) is told to look for, and it is most useful
@@ -155,7 +170,7 @@ namespace CardShopCoop
                 {
                     Destroy(go);
                 }
-                catch { }
+                catch (System.Exception ex) { Swallow.Log(ex); }
             }
 
             if (coreLoaded)

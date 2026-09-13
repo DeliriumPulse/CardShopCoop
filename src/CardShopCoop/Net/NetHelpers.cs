@@ -314,7 +314,7 @@ namespace CardShopCoop.Net
                     {
                         udp?.Close();
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                 }
             }
             return null;
@@ -341,7 +341,7 @@ namespace CardShopCoop.Net
                                 break;
                             }
                     }
-                    catch { /* no DNS, no resolver, no network: the literal below covers it */ }
+                    catch (System.Exception e) { Swallow.Log(e); /* no DNS, no resolver, no network: the literal below covers it */ }
                 })
                 {
                     IsBackground = true,
@@ -433,7 +433,7 @@ namespace CardShopCoop.Net
                     return false;                                  // multicast + reserved
                 return true;
             }
-            catch { return false; }
+            catch (System.Exception e) { Swallow.Log(e); return false; }
         }
 
         /// <summary>Best guess at this PC's LAN address, ranked the same way the host panel
@@ -500,8 +500,9 @@ namespace CardShopCoop.Net
                     return (s.LocalEndPoint as IPEndPoint)?.Address.ToString() ?? LocalIPv4();
                 }
             }
-            catch
+            catch (System.Exception e)
             {
+                Swallow.Log(e);
                 return LocalIPv4();
             }
         }
@@ -647,7 +648,7 @@ namespace CardShopCoop.Net
                 {
                     udp?.Close();
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
             return null;
         }
@@ -730,7 +731,7 @@ namespace CardShopCoop.Net
                     return true;
                 return false;
             }
-            catch { return false; }
+            catch (System.Exception e) { Swallow.Log(e); return false; }
         }
 
         private static string HttpGet(string url)
@@ -809,7 +810,7 @@ namespace CardShopCoop.Net
                             if (SameTrustedTarget(hr))
                                 body = ReadCapped(hr);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
                 CoopPlugin.Log.LogInfo("UPnP " + action + " refused: " + we.Message
                     + (body != null ? " | " + Snip(body) : ""));
                 return false;
@@ -837,7 +838,7 @@ namespace CardShopCoop.Net
             {
                 uri = resp.ResponseUri != null ? resp.ResponseUri.ToString() : null;
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             if (uri != null && IsPrivateHttpUrl(uri))
                 return true;
             CoopPlugin.Log.LogWarning("UPnP: refusing a reply that came from somewhere other than the LAN address we asked - " + (uri ?? "(no URI)"));
@@ -921,7 +922,7 @@ namespace CardShopCoop.Net
                     at = gt + 1;
                 }
             }
-            catch { return null; }
+            catch (System.Exception e) { Swallow.Log(e); return null; }
         }
 
         /// <summary>Value of an HTTP-style header line out of an SSDP response.</summary>
@@ -944,7 +945,7 @@ namespace CardShopCoop.Net
                         return v;
                 }
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             return null;
         }
 

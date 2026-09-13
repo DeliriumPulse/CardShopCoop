@@ -1,4 +1,6 @@
 using System;
+using System.Globalization;
+using System.IO;
 using System.Text;
 using Newtonsoft.Json;
 
@@ -51,6 +53,33 @@ namespace CardShopCoop.Net
         private static byte[] SerializeObject(object value, Type type)
         {
             return Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(value, type, WireSettings.Settings));
+        }
+
+        [ThreadStatic] private static StringWriter _lengthWriter;
+        [ThreadStatic] private static JsonSerializer _lengthSerializer;
+        [ThreadStatic] private static char[] _lengthChars;
+
+        /// <summary>UTF8 payload length of a value without materializing the JSON string or
+        /// byte[] (used for chunk sizing on the hot unreliable NPC stream).</summary>
+        public static int SerializeUtf8Length(object value)
+        {
+            if (value == null)
+                throw new ArgumentNullException("value");
+            if (_lengthWriter == null)
+            {
+                _lengthWriter = new StringWriter(CultureInfo.InvariantCulture);
+                _lengthSerializer = JsonSerializer.Create(WireSettings.Settings);
+            }
+            var sb = _lengthWriter.GetStringBuilder();
+            sb.Length = 0;
+            _lengthSerializer.Serialize(_lengthWriter, value, value.GetType());
+            int n = sb.Length;
+            if (n == 0)
+                return 0;
+            if (_lengthChars == null || _lengthChars.Length < n)
+                _lengthChars = new char[n];
+            sb.CopyTo(0, _lengthChars, 0, n);
+            return Encoding.UTF8.GetByteCount(_lengthChars, 0, n);
         }
 
         public static INetMessage Deserialize(Type type, byte[] payload)

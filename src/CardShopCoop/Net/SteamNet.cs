@@ -346,7 +346,7 @@ namespace CardShopCoop.Net
                 {
                     SteamMatchmaking.LeaveLobby(LobbyId);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
                 LobbyId = CSteamID.Nil;
             }
             _cbSessionReq?.Dispose();
@@ -468,7 +468,7 @@ namespace CardShopCoop.Net
             {
                 return SteamAPI.IsSteamRunning();
             }
-            catch { return false; }
+            catch (System.Exception e) { Swallow.Log(e); return false; }
         }
 
         public void Host(bool isPublic, string lobbyName, bool hasPassword)
@@ -513,7 +513,7 @@ namespace CardShopCoop.Net
                 {
                     SteamMatchmaking.LeaveLobby(LobbyId);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
                 LobbyId = CSteamID.Nil;
             }
             _joining = false;
@@ -682,7 +682,7 @@ namespace CardShopCoop.Net
                 {
                     return SteamAvailable() ? (SteamFriends.GetPersonaName() ?? "") : "";
                 }
-                catch { return ""; }
+                catch (System.Exception e) { Swallow.Log(e); return ""; }
             }
         }
 
@@ -696,7 +696,7 @@ namespace CardShopCoop.Net
                         return 0;
                     return SteamUser.GetSteamID().m_SteamID;
                 }
-                catch { return 0; }
+                catch (System.Exception e) { Swallow.Log(e); return 0; }
             }
         }
 
@@ -713,7 +713,7 @@ namespace CardShopCoop.Net
                     return "";
                 return SteamFriends.GetFriendPersonaName(friend) ?? "";
             }
-            catch { return ""; }
+            catch (System.Exception e) { Swallow.Log(e); return ""; }
         }
 
         public ICoopTransport CreateTransport(bool isHost, INetMessage keepalive)

@@ -8,7 +8,6 @@ using System.Threading;
 using CardShopCoop.Net;
 using CardShopCoop.Net.Messages;
 using CardShopCoop.Sync;
-using Newtonsoft.Json;
 // NO `using Steamworks;` HERE, AND NEVER AGAIN. CoopCore is an always-loaded type: a
 // single Steamworks token in one of its fields or method bodies makes the whole class
 // (and therefore the whole mod) fail to load on the Game Pass build, which ships no
@@ -52,7 +51,7 @@ namespace CardShopCoop
             }
         }
         public static CoopRole Role { get; private set; } = CoopRole.None;
-        private static double _lastImmediateObjectSync;
+        private static int _lastImmediateObjectSyncFrame = -1;
 
         /// <summary>Called by mutation postfixes. The modules still coalesce their own
         /// state into one snapshot; this only removes the normal polling latency.</summary>
@@ -63,21 +62,19 @@ namespace CardShopCoop
                 return;
             // Several vanilla methods can participate in one gameplay action (for example
             // removing an item updates both the compartment and the box). Coalesce those
-            // callbacks into one sync pass; a 100 ms ceiling is still far below the normal
-            // snapshot cadence and avoids repeatedly arming every scanner in one burst.
-            double now = Time.realtimeSinceStartupAsDouble;
-            if (now - _lastImmediateObjectSync < 0.10)
+            // callbacks from one vanilla action into one sync pass. A frame boundary is the
+            // right coalescing unit here: it merges the several internal mutations made by
+            // one pickup/box-up while never delaying a distinct action for 100 ms.
+            if (_lastImmediateObjectSyncFrame == Time.frameCount)
                 return;
-            _lastImmediateObjectSync = now;
+            _lastImmediateObjectSyncFrame = Time.frameCount;
             try
             {
                 core._world.ForceNextTick();
                 core._cardShelves.ForceNextTick();
                 core._objMoves.ForceNextTick();
-                core._boxes.ForceBroadcastNextTick();
+                core._boxEngine?.ForceNextTick();
                 core._population.ForceNextTick();
-                core._cardBoxes.ForceNextTick();
-                core._furnBoxes.ForceNextTick();
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("Immediate sync request: " + e.Message); }
         }
@@ -163,6 +160,8 @@ namespace CardShopCoop
         private readonly Dictionary<int, PlayerModelEntry> _playerModels = new Dictionary<int, PlayerModelEntry>();
         private PlayerModelEntry _localPlayerModel;
         private bool _localPlayerModelReady;
+        private bool _localModelAuto;
+        private float _localModelAutoRetry;
         private Transform _localModelAppliedRoot;
         private bool _characterPreviewActive;
         private PlayerModelEntry _lastCommittedPlayerModel;
@@ -172,11 +171,11 @@ namespace CardShopCoop
         private bool _localModelSavePending;
         private float _localModelSaveTimer;
         private readonly WorldSync _world = new WorldSync();
+        internal WorldSync World => _world;
         private readonly NpcSync _npcs = new NpcSync();
         private readonly CardShelfSync _cardShelves = new CardShelfSync();
         private readonly ObjMoveSync _objMoves = new ObjMoveSync();
         private readonly MovePreviewSync _movePreview = new MovePreviewSync();
-        private readonly BoxSync _boxes = new BoxSync();
         private readonly PopulationSync _population = new PopulationSync();
 
         // domain sync modules (v0.15): each owns one game system end-to-end and talks
@@ -193,9 +192,20 @@ namespace CardShopCoop
         private readonly ContainerSync _containers = new ContainerSync();
         private readonly TournamentSync _tournament = new TournamentSync();
         private readonly TvSync _tv = new TvSync();
-        private readonly CardBoxSync _cardBoxes = new CardBoxSync();
-        private readonly FurnBoxSync _furnBoxes = new FurnBoxSync();
+        private readonly ItemBoxFamily _itemBoxFamily = new ItemBoxFamily();
+        private readonly CardBoxFamily _cardBoxFamily = new CardBoxFamily();
+        private readonly FurnitureBoxFamily _furnBoxFamily = new FurnitureBoxFamily();
+        private BoxEngine _boxEngine;
         private readonly Sync.RegisterSync _register = new Sync.RegisterSync();
+        private Sync.CoopModuleEntry[] _moduleCatalog;
+        private ICoopModule[] _allModules;
+        internal static Sync.CoopModulePatch[] PatchCatalog
+        {
+            get; private set;
+        }
+        private Sync.CoopModuleRegistry _moduleRegistry;
+        private Sync.TickEntry[] _hostTickOrder;
+        private Sync.TickEntry[] _clientTickOrder;
         private string _lastShopNameSent;
         private float _shopNameTimer = -1.0f; // staggered phase (see _lightSyncTimer note)
         private float _npcSweepTimer = -1.3f;
@@ -249,6 +259,9 @@ namespace CardShopCoop
 
         // client-side save + mod-sidecar download
         private MemoryStream _saveBuf;
+        // Compressed transfers are framed below 64 MB; keep decompression and buffering well
+        // below that so a peer cannot force a hostile allocation while remaining above honest saves.
+        private const int MaxWorldTransferBytes = 32 * 1024 * 1024;
         private int _saveExpected = -1;
         private byte[] _pendingSave;
         private MemoryStream _bundleBuf;
@@ -257,9 +270,8 @@ namespace CardShopCoop
         private bool _worldRequested;
 
         // host price sync
-        private float _priceTimer = -0.45f;
-        private int _lastPriceHash;
-        private float _priceHeal;
+        private bool _priceFullPending; // send the whole item-price table (join / session reset)
+        private readonly Dictionary<int, float> _pricePending = new Dictionary<int, float>(); // host: per-change partials
         private readonly List<KeyValuePair<int, float>> _priceBuf = new List<KeyValuePair<int, float>>();
         private readonly HashSet<int> _priceSeenTypes = new HashSet<int>();
 
@@ -272,6 +284,17 @@ namespace CardShopCoop
         // local movement measurement
         private Vector3 _lastPos;
         private bool _hasLastPos;
+
+        // StateSendTick change-gate: send only when the pose/camera/hold actually changed,
+        // with a keepalive so a standing-still player still refreshes.
+        private Vector3 _lastSentPos;
+        private float _lastSentCamYaw;
+        private Vector3 _lastSentCamPos;
+        private Quaternion _lastSentCamRot;
+        private byte _lastSentHold;
+        private int _lastSentHoldSig;
+        private bool _hasSentState;
+        private float _stateKeepalive;
 
         // host economy/progression change detection
         private double _lastCoinSent = double.MinValue;
@@ -293,21 +316,17 @@ namespace CardShopCoop
         private long _diagSent;
         private long _diagRecvStates;
         private float _diagTimer = -7.3f;
-        private float _errLogCooldown;
+        // Per-tag rate-limited error logging lives in one place: Sync.ModuleGuard.
 
         private void Guarded(string stage, Action action)
         {
             try
             {
-                action();
+                Util.PerfProbe.Measure(stage, action);
             }
             catch (Exception e)
             {
-                if (_errLogCooldown <= 0f)
-                {
-                    _errLogCooldown = 5f;
-                    CoopPlugin.Log.LogError($"[{stage}] {e}");
-                }
+                Sync.ModuleGuard.Log(stage, e);
             }
         }
 
@@ -384,6 +403,7 @@ namespace CardShopCoop
         private float _reloadStartedAt;
         private int _reloadStartedFrame;
         private bool _clientWorldArrived;
+        private bool _sessionInGame;
         /// <summary>True for the entire borrowed-world load: the old world may still be
         /// live before the scene changes, and the new world is only partially constructed
         /// afterward. Hold client-side sync until ShelfManager reports completion.</summary>
@@ -396,6 +416,15 @@ namespace CardShopCoop
             = new System.Collections.Generic.List<InMsg>(64);
         private readonly System.Collections.Generic.List<InMsg> _dispatchRetryNextFrame
             = new System.Collections.Generic.List<InMsg>(8);
+        private readonly System.Collections.Generic.List<InMsg> _dispatchHeldTransfers
+            = new System.Collections.Generic.List<InMsg>(1);
+        private bool _dispatchBacklogWarned;
+        private bool _dispatchDeferredWarned;
+        private bool _dispatchRoleDeniedWarned;
+        private bool _dispatchTransferOverflowWarned;
+        private bool _dispatchTransferHardDropWarned;
+        private int _dispatchDeferredFrames;
+        private const int MaxDispatchDeferredFrames = 600;
         private readonly MessageRouter _messageRouter = new MessageRouter();
         private readonly System.Collections.Generic.HashSet<long> _dispatchSeen
             = new System.Collections.Generic.HashSet<long>();
@@ -403,6 +432,7 @@ namespace CardShopCoop
         /// into _dispatchBuf (the coalescer needs the full picture), but applying an unbounded
         /// backlog in one frame is the hitch itself; the remainder keeps its order and waits.</summary>
         private const int DispatchBudget = 256;
+        private const int DispatchBacklogCap = DispatchBudget * 8;
         private const byte MaxDispatchRetries = 3;
         private const int MainThreadActionBudget = 64;
 
@@ -434,7 +464,6 @@ namespace CardShopCoop
             if (Util.PlayerModelStore.TryLoad(out var savedModel))
             {
                 _localPlayerModel = savedModel;
-                _localPlayerModelReady = true;
                 CoopPlugin.Log.LogInfo("loaded local co-op player appearance");
             }
             _messageRouter.Register<PingMessage>((context, message) =>
@@ -481,17 +510,30 @@ namespace CardShopCoop
                 ApplyPlayerModelRequest(context.ConnectionId, message));
             _messageRouter.Register<PlayerModelStateMessage>((context, message) =>
                 ApplyPlayerModelState(message));
-            _messageRouter.Register<EconContributionMessage>((context, message) => ApplyEconomyContribution(context.ConnectionId, message));
+            _messageRouter.Register<EconContributionMessage>((context, message) => ApplyEconomyContribution(context.ConnectionId, message),
+                retryable: true, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
             _messageRouter.Register<EconDeltaMessage>((context, message) =>
                 EconDeltaSync.Apply(message.Kind, message.Value));
             _messageRouter.Register<MovePreviewMessage>((context, message) =>
                 ApplyMovePreview(context.ConnectionId, message));
-            _messageRouter.Register<PurchaseRequestMessage>((context, message) => ApplyPurchaseRequest(context.ConnectionId, message));
+            _messageRouter.Register<PurchaseRequestMessage>((context, message) => ApplyPurchaseRequest(context.ConnectionId, message),
+                retryable: true, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
             _messageRouter.Register<PurchaseResultMessage>((context, message) => ApplyPurchaseResult(message));
-            _messageRouter.Register<SprayHitMessage>((context, message) => ApplySprayHit(message));
-            _messageRouter.Register<GradedRemoveMessage>((context, message) => ApplyGradedRemove(context.ConnectionId, message));
+            _messageRouter.Register<SprayHitMessage>((context, message) => ApplySprayHit(message),
+                retryable: true, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+            _messageRouter.Register<GradedRemoveMessage>((context, message) => ApplyGradedRemove(context.ConnectionId, message),
+                retryable: true, heal: () => CoopPlugin.Log.LogError("Binder heal deferred: GradedRemove requires a full binder resync message, which is a wire change."));
             _ui = new UI.CoopUI();
             _world.OnLocalChanges = OnLocalWorldChanges;
+            _world.SendResult = (result, connId) => Send(connId, result);
+            _world.RequestResync = () =>
+            {
+                CoopPlugin.Log.LogWarning("WorldSync requested authoritative shelf resync");
+                if (Role == CoopRole.Host)
+                    Broadcast(new ShelfDeltaMessage { Entries = _world.BuildFullState() });
+                else if (Role == CoopRole.Client)
+                    Send(1, new JoinResyncRequestMessage());
+            };
             _cardShelves.OnLocalChanges = changes =>
             {
                 if (Role == CoopRole.Host)
@@ -508,20 +550,7 @@ namespace CardShopCoop
             };
             _population.OnHostSnapshot = all =>
                 Broadcast(new PopStateMessage { Entries = all });
-            _boxes.OnHostSnapshot = list =>
-                Broadcast(new BoxStateMessage { Entries = list });
-            _boxes.OnClientChanges = list =>
-                Send(1, new BoxRequestMessage { Entries = list });
-            _boxes.SendPreview = message =>
-            {
-                if (_net == null)
-                    return;
-                if (Role == CoopRole.Host)
-                    _net.BroadcastTransient(message);
-                else if (Role == CoopRole.Client)
-                    _net.SendTransient(1, message);
-            };
-            BoxSync.IsLocallyCarried = box =>
+            ItemBoxFamily.IsLocallyCarried = box =>
             {
                 if (_playerIpc == null || box == null)
                     return false;
@@ -538,69 +567,16 @@ namespace CardShopCoop
                     }
                     return ReferenceEquals(_heldBoxA, box) || ReferenceEquals(_heldBoxB, box);
                 }
-                catch { return false; }
+                catch (System.Exception e) { Swallow.Log(e); return false; }
             };
-            CardBoxSync.IsLocallyCarried = box =>
-            {
-                if (_playerIpc == null || box == null)
-                    return false;
-                try
-                {
-                    // card boxes land in BOTH the generic hold field and the card-box
-                    // field (OnEnterHoldBoxMode); reuse the per-frame cached reads
-                    if (_heldBoxFrame != Time.frameCount)
-                    {
-                        _heldBoxFrame = Time.frameCount;
-                        _heldBoxA = FiHoldItemBox?.GetValue(_playerIpc);
-                        _heldBoxB = FiHoldBox?.GetValue(_playerIpc);
-                        _heldBoxC = FiHoldBoxCard?.GetValue(_playerIpc);
-                    }
-                    return ReferenceEquals(_heldBoxC, box) || ReferenceEquals(_heldBoxB, box);
-                }
-                catch { return false; }
-            };
-            BoxSync.LocalBoxDestroyed = box =>
+            BoxShared.LocalBoxDestroyed = box =>
             {
                 if (IsTearingDown || !InGameLevel() || ClientReloading)
                     return;
                 if (Role == CoopRole.Client)
-                    _boxes.NotifyLocalDestroyed(box);
+                    _boxEngine?.ClientNotifyLocalDestroyed(box);
                 else if (Role == CoopRole.Host)
-                    _boxes.HostNotifyLocalDestroyed();
-            };
-            _boxes.OnLocalRemoved = (idx, type) =>
-                Send(1, new BoxRemovedMessage { Index = idx, ItemType = (EItemType)type });
-            PopulationSync.OnClientStructureChanged = kind =>
-            {
-                if (Role != CoopRole.Client)
-                    return;
-                // The client's placed-object roster just changed (a shelf was removed or
-                // spawned). Every index-keyed mirror's baseline is now keyed against stale
-                // indexes, so read the structure back fresh instead of diffing against
-                // garbage. Repaired objects start with loader defaults; those defaults must
-                // not be reported as guest edits through any index-based mirror.
-                _world.Reset();
-                _objMoves.Reset();
-                if (kind == 2 || kind == 3 || kind == 14)
-                    _cardShelves.InvalidateBaseline();
-                // container stations (card storage, cleansers, pack openers, box storage,
-                // donation boxes) and play tables are index-keyed too; their per-index
-                // mirrors/caches go stale the moment a machine/table of that kind shifts.
-                if (kind >= 9 && kind <= 13)
-                {
-                    _containers.Reset();
-                    _containers.ForceResend();
-                }
-                if (kind == 6)
-                {
-                    _tables.Reset();
-                    _tables.ForceResend();
-                }
-                // Population reconciliation removes/inserts list elements, so every
-                // index-keyed mirror needs an immediate authoritative snapshot rather than
-                // waiting for its normal heal interval.
-                _cardBoxes.ForceResend();
-                _register.ForceResend();
+                    _boxEngine?.HostNotifyLocalDestroyed(box);
             };
             _actCardPriceRetry = CardPriceRetryTick;
             _actFrameCardWork = FlushFrameCardWork;
@@ -626,9 +602,20 @@ namespace CardShopCoop
             _actBoxes = () =>
             {
                 if (Role == CoopRole.Host)
-                    _boxes.HostTick(_dt, _syncActive);
+                    _boxEngine.HostTick(_dt, _syncActive);
                 else if (Role == CoopRole.Client)
-                    _boxes.ClientTick(_dt, _syncActive && !ClientPreloadHold);
+                {
+                    _boxEngine.ClientTick(_dt, _syncActive && !ClientPreloadHold);
+                    HandEscrow.Tick();
+                }
+                // Push motion is symmetric on both roles: the local player's physical push is
+                // pruned then streamed (PushTick), and the smoothed followers (arc + dead-reckon
+                // pushed boxes) advance exactly once per frame here for whichever role is running
+                // (moved out of the client-only digest tick).
+                _pushProbe?.Tick(_dt);
+                _boxEngine.PushTick(_dt, _syncActive);
+                BoxPlacement.TickVanillaPlacement(_dt);
+                BoxPlacement.TickRemoteMotions(_dt);
             };
             _actNpcPuppets = () => _npcs.TickPuppets(_dt, InGameLevel());
             _actNpcSweep = NpcSweepTick;
@@ -645,6 +632,8 @@ namespace CardShopCoop
             _register.SendOp = Send(1);
             _register.BroadcastState = Broadcast;
             _register.BroadcastCart = Broadcast;
+            _register.BroadcastChange = Broadcast;
+            _register.SendToClient = Send;
             _staff.SendOp = Send(1);
             _staff.BroadcastState = Broadcast;
             _staff.SendToClient = Send;
@@ -654,23 +643,26 @@ namespace CardShopCoop
             _settings.SendOp = Send(1);
             _settings.BroadcastState = Broadcast;
             _market.BroadcastState = Broadcast;
+            _market.RequestResync = () =>
+            {
+                if (Role == CoopRole.Client)
+                    Send(1, new JoinResyncRequestMessage());
+                else
+                    _market.ForceResend();
+            };
             _report.BroadcastState = Broadcast;
             _containers.SendOp = Send(1);
             _containers.BroadcastState = Broadcast;
-            _containers.RequestBoxResync = () => _boxes.ForceBroadcastNextTick();
+            _containers.RequestBoxResync = () => _boxEngine?.RequestFullSnapshot();
             _containers.SendToClient = Send;
             _containers.HoldClientBox = TryHoldClientBox;
-            _boxes.OnClientBoxCreated = (box, entry) => _containers.TryAutoHoldTakenBox(box, entry);
             _tournament.BroadcastState = Broadcast;
             _tv.SendOp = Send(1);
             _tv.BroadcastState = Broadcast;
             _tv.PeerCount = () => _net == null ? 0 : _net.ConnectionCount;
-            _cardBoxes.SendOp = Send(1);
-            _cardBoxes.BroadcastState = Broadcast;
-            _cardBoxes.SendToClient = Send;
-            _furnBoxes.SendOp = Send(1);
-            _furnBoxes.BroadcastState = Broadcast;
-            FurnBoxSync.IsLocallyCarried = box =>
+
+            FurnitureBoxOps.SendOp = Send(1);
+            FurnitureBoxOps.IsLocallyCarried = box =>
             {
                 if (_playerIpc == null || box == null)
                     return false;
@@ -687,8 +679,83 @@ namespace CardShopCoop
                     }
                     return ReferenceEquals(_heldBoxB, box);
                 }
-                catch { return false; }
+                catch (System.Exception e) { Swallow.Log(e); return false; }
             };
+
+            _boxEngine = new BoxEngine(new IBoxFamily[]
+            {
+                _itemBoxFamily, _cardBoxFamily, _furnBoxFamily,
+            });
+            _boxEngine.SendSnapshot = snap => Broadcast(snap);
+            _boxEngine.SendUpdate = update => Send(1, update);
+            _boxEngine.SendTransferResult = (result, connId) => Send(connId, result);
+            // Client: an authoritative re-assert is the only way to converge a box whose
+            // content a pending local add had to protect from a stale snapshot.
+            _boxEngine.RequestBoxResync = () => Send(1, new JoinResyncRequestMessage());
+            _boxEngine.OnClientBoxSpawned = box => _containers.TryAutoHoldTakenBox(box);
+            _boxEngine.LocalHeld = () =>
+            {
+                if (_playerIpc == null)
+                    return null;
+                try
+                {
+                    return FiHoldBox?.GetValue(_playerIpc) as InteractablePackagingBox;
+                }
+                catch (System.Exception e) { Swallow.Log(e); return null; }
+            };
+            _boxEngine.LocalPushed = () => _pushProbe != null ? _pushProbe.Pushed : null;
+            // Client -> host: one transient push-motion frame for a locally pushed box.
+            _boxEngine.SendMotion = msg =>
+            {
+                if (_net != null)
+                    _net.SendTransient(1, msg);
+            };
+            // Host -> all except the given conn id (-1 = all): relay the pushed box's motion so
+            // every non-driver peer smooths it. The transient lane is safe: a lost frame is
+            // replaced by the next one.
+            _boxEngine.RelayMotion = (msg, exclude) =>
+            {
+                if (Role != CoopRole.Host || _net == null)
+                    return;
+                foreach (int cid in _net.ConnIds())
+                    if (cid != exclude)
+                        _net.SendTransient(cid, msg);
+            };
+            CardBoxFamily.IsLocallyCarried = box =>
+            {
+                if (_playerIpc == null || box == null)
+                    return false;
+                try
+                {
+                    if (_heldBoxFrame != Time.frameCount)
+                    {
+                        _heldBoxFrame = Time.frameCount;
+                        _heldBoxB = FiHoldBox?.GetValue(_playerIpc);
+                        _heldBoxC = FiHoldBoxCard?.GetValue(_playerIpc);
+                    }
+                    return ReferenceEquals(_heldBoxC, box) || ReferenceEquals(_heldBoxB, box);
+                }
+                catch (System.Exception e) { Swallow.Log(e); return false; }
+            };
+            CardBoxOps.IsLocallyCarried = CardBoxFamily.IsLocallyCarried;
+            CardBoxOps.SendCollect = msg => Send(1, msg);
+            CardBoxOps.SendResult = (connId, msg) => Send(connId, msg);
+            _moduleCatalog = BuildModuleCatalog();
+            var modules = new List<ICoopModule>();
+            var patches = new List<Sync.CoopModulePatch>();
+            for (int i = 0; i < _moduleCatalog.Length; i++)
+            {
+                Sync.CoopModuleEntry entry = _moduleCatalog[i];
+                if ((entry.HostSlot >= 0 || entry.ClientSlot >= 0) &&
+                    !(entry.Module is ITickableCoopModule))
+                    throw new InvalidOperationException("Tick pipeline entry is not tickable: " + entry.Name);
+                if (entry.Module != null)
+                    modules.Add(entry.Module);
+                if (entry.Patches != null)
+                    patches.Add(new Sync.CoopModulePatch(entry.Name, entry.Patches));
+            }
+            _allModules = modules.ToArray();
+            PatchCatalog = patches.ToArray();
             _actModules = ModulesTick;
             SceneManager.sceneLoaded += OnSceneLoaded;
 
@@ -779,7 +846,8 @@ namespace CardShopCoop
             {
                 EnumLendState();
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
+            RegisterDomainRoutes();
         }
 
         public string HostPassword = "";        // required from joiners when non-empty
@@ -832,16 +900,23 @@ namespace CardShopCoop
                 return;
             }
             Role = CoopRole.Client;
-            ActivateLiveModuleHooks();
-            GuestBorrowedWorld = true; // block ALL saves until we're back at the title screen
-            IsSteamSession = true;
-            _joinPassword = password ?? "";
-            LastFailedLobby = lobby;
-            // ORDER IS LOAD-BEARING: the transport must exist before Join(), because the
-            // bridge's lobby-entered callback wires the host connection into it.
-            _net = _steam.CreateTransport(false, new PingMessage());
-            StatusLine = "Joining Steam lobby...";
-            _steam.Join(lobby);
+            try
+            {
+                ActivateLiveModuleHooks();
+                GuestBorrowedWorld = true; // block ALL saves until we're back at the title screen
+                IsSteamSession = true;
+                _joinPassword = password ?? "";
+                LastFailedLobby = lobby;
+                // ORDER IS LOAD-BEARING: the transport must exist before Join(), because the
+                // bridge's lobby-entered callback wires the host connection into it.
+                _net = LagTransport.Wrap(_steam.CreateTransport(false, new PingMessage()));
+                StatusLine = "Joining Steam lobby...";
+                _steam.Join(lobby);
+            }
+            catch (Exception e)
+            {
+                AbortSessionStart("Could not join: " + e.Message);
+            }
         }
 
         /// <summary>Host through Steam: friends-only (invite) or public (lobby browser).</summary>
@@ -872,14 +947,21 @@ namespace CardShopCoop
             // a HOST must never translate: drop any table a previous session left behind
             Util.EnumMap.Clear();
             Role = CoopRole.Host;
-            ActivateLiveModuleHooks();
-            IsSteamSession = true;
-            HostPassword = password ?? "";
-            // ORDER IS LOAD-BEARING: transport first, then Host() - the bridge's
-            // lobby-created callback stamps the new lobby id onto this transport.
-            _net = _steam.CreateTransport(true, new PingMessage());
-            StatusLine = "Creating Steam lobby...";
-            _steam.Host(isPublic, lobbyName, HostPassword.Length > 0);
+            try
+            {
+                ActivateLiveModuleHooks();
+                IsSteamSession = true;
+                HostPassword = password ?? "";
+                // ORDER IS LOAD-BEARING: transport first, then Host() - the bridge's
+                // lobby-created callback stamps the new lobby id onto this transport.
+                _net = LagTransport.Wrap(_steam.CreateTransport(true, new PingMessage()));
+                StatusLine = "Creating Steam lobby...";
+                _steam.Host(isPublic, lobbyName, HostPassword.Length > 0);
+            }
+            catch (Exception e)
+            {
+                AbortSessionStart("Could not host: " + e.Message);
+            }
         }
 
         public void OpenSteamInvite()
@@ -946,7 +1028,7 @@ namespace CardShopCoop
             // extra is the pack's EItemType for kind 1, and the unused -1 for an emote - which is
             // below the modded floor and so passes through the helper untouched. Host-side this
             // write is the identity function either way.
-            var relay = new RelayTagMessage { SenderId = (byte)senderConn, Kind = kind, Extra = (EItemType)extra };
+            var relay = new RelayTagMessage { SenderId = senderConn, Kind = kind, Extra = (EItemType)extra };
             foreach (int cid in _net.ConnIds())
                 if (cid != senderConn)
                     _net.Send(cid, relay);
@@ -964,10 +1046,12 @@ namespace CardShopCoop
                 if (string.IsNullOrEmpty(wireName))
                     wireName = e.Value;
                 _peerSteamIds.TryGetValue(e.Key, out var steamId);
-                roster.Entries.Add(new RosterEntry { Id = (byte)e.Key, Name = wireName, SteamId = steamId });
+                roster.Entries.Add(new RosterEntry { Id = e.Key, Name = wireName, SteamId = steamId });
             }
             Broadcast(roster);
         }
+
+        internal BoxEngine Boxes => _boxEngine;
 
         private int _selfId = -1; // our connId on the host, from Welcome
         internal static int LocalConnectionId
@@ -1012,14 +1096,14 @@ namespace CardShopCoop
             }
             PlayerModelGeneration++;
             _avatars.Clear();
-            _world.Reset();
-            _npcs.Reset();
-            _cardShelves.Reset();
-            _objMoves.Reset();
-            _movePreview.Reset();
-            _boxes.Reset();
-            _population.Reset();
-            ModulesReset();
+            if (_moduleRegistry != null)
+            {
+                _moduleRegistry.ResetState();
+            }
+            else
+            {
+                ResetAllModules();
+            }
             _lightManager = null;
             _clientClockFrozen = false;
             // Unity stops scene-owned coroutines during a load. If that interrupted the
@@ -1125,6 +1209,7 @@ namespace CardShopCoop
         public void CommitLocalCustomization()
         {
             EnsureLocalPlayerModel();
+            _localModelAuto = false;
             RecordLocalModelChange();
             var custom = GetLocalCustomization();
             _localPlayerModel = _avatars.CaptureLocalModel(custom, _localPlayerModel.Female, _localPlayerModel.ModelIndex);
@@ -1138,6 +1223,7 @@ namespace CardShopCoop
         public bool UndoPlayerModel()
         {
             EnsureLocalPlayerModel();
+            _localModelAuto = false;
             if (_playerModelUndo.Count == 0)
                 return false;
             PushHistory(_playerModelRedo, _lastCommittedPlayerModel ?? _localPlayerModel);
@@ -1155,6 +1241,7 @@ namespace CardShopCoop
         public bool RedoPlayerModel()
         {
             EnsureLocalPlayerModel();
+            _localModelAuto = false;
             if (_playerModelRedo.Count == 0)
                 return false;
             PushHistory(_playerModelUndo, _lastCommittedPlayerModel ?? _localPlayerModel);
@@ -1197,15 +1284,14 @@ namespace CardShopCoop
                 }
             if (preset == null)
                 return;
+            var entry = AvatarManager.ModelFromPreset(preset);
+            if (entry == null)
+                return;
             RecordLocalModelChange();
-            bool female = (preset.CharacterName ?? "").StartsWith("Female", StringComparison.OrdinalIgnoreCase);
-            int prefixLength = female ? 6 : 4;
-            int index = 0;
-            if (preset.CharacterName.Length > prefixLength)
-                int.TryParse(preset.CharacterName.Substring(prefixLength), out index);
-            _localPlayerModel.Female = female;
-            _localPlayerModel.ModelIndex = Mathf.Max(0, index);
-            _localPlayerModel.CustomizationJson = JsonConvert.SerializeObject(preset);
+            _localModelAuto = false;
+            _localPlayerModel.Female = entry.Female;
+            _localPlayerModel.ModelIndex = entry.ModelIndex;
+            _localPlayerModel.CustomizationJson = entry.CustomizationJson;
             _localModelAppliedRoot = null;
             GetLocalCustomization();
             _lastCommittedPlayerModel = ClonePlayerModel(_localPlayerModel);
@@ -1259,6 +1345,7 @@ namespace CardShopCoop
         public void SetLocalModelSlider(string propertyName, float value)
         {
             EnsureLocalPlayerModel();
+            _localModelAuto = false;
             RecordLocalModelChange();
             if (!_avatars.SetBlendshape(GetLocalCustomization(), propertyName, value))
                 return;
@@ -1278,7 +1365,21 @@ namespace CardShopCoop
             _localPlayerModel.Female = female;
             _localPlayerModel.ModelIndex = Mathf.Max(0, modelIndex);
             if (genderChanged)
-                _localPlayerModel.CustomizationJson = null;
+            {
+                // A new gender must never start nude: use a random clothed preset of that
+                // gender, or fall back to the initialized default preset.
+                var preset = _avatars.TryCreateRandomPresetModel(female);
+                if (preset != null)
+                {
+                    _localPlayerModel.ModelIndex = preset.ModelIndex;
+                    _localPlayerModel.CustomizationJson = preset.CustomizationJson;
+                }
+                else
+                {
+                    _localPlayerModel.CustomizationJson = null;
+                }
+            }
+            _localModelAuto = false;
             _avatars.ApplyLocalModel(GetLocalCustomization(), _localPlayerModel);
             var editor = _avatars.GetEditorCustomization(_localPlayerModel.Female);
             if (editor != null)
@@ -1289,14 +1390,68 @@ namespace CardShopCoop
             SubmitLocalPlayerModel();
         }
 
+        /// <summary>Live NSFW toggle. Disabling it re-dresses a nude local model and rebuilds
+        /// every remote avatar so the filter applies immediately.</summary>
+        public void SetNsfwAllowed(bool allowed)
+        {
+            if (CoopPlugin.AllowNsfw.Value == allowed)
+                return;
+            CoopPlugin.AllowNsfw.Value = allowed;
+            CoopPlugin.Log.LogInfo("NSFW appearances " + (allowed ? "allowed" : "blocked"));
+            EnsureLocalPlayerModel();
+            if (!allowed && _localPlayerModel != null && AvatarManager.IsNude(_localPlayerModel))
+            {
+                var preset = _avatars.TryCreateRandomPresetModel(_localPlayerModel.Female);
+                if (preset != null)
+                {
+                    RecordLocalModelChange();
+                    _localPlayerModel = preset;
+                    _localModelAuto = false;
+                    _localModelAppliedRoot = null;
+                    _lastCommittedPlayerModel = ClonePlayerModel(_localPlayerModel);
+                    QueueLocalModelSave();
+                    SubmitLocalPlayerModel();
+                }
+                else
+                {
+                    _localModelAuto = true; // retry once preset data is available
+                }
+            }
+            _avatars.RefreshRemoteAvatars();
+            PlayerModelGeneration++;
+        }
+
         private void EnsureLocalPlayerModel()
         {
             if (!_localPlayerModelReady)
             {
-                if (!Util.PlayerModelStore.TryLoad(out _localPlayerModel))
-                    _localPlayerModel = _avatars.CaptureLocalModel(_playerTf);
+                bool loaded = _localPlayerModel != null || Util.PlayerModelStore.TryLoad(out _localPlayerModel);
                 _localPlayerModelReady = true;
+                if (!loaded)
+                {
+                    // A vanilla character can exist before the co-op model store has ever
+                    // been written. Capture it before falling back to a generated preset, or
+                    // first-run co-op would silently randomize an already dressed player.
+                    _localPlayerModel = _playerTf != null
+                        ? _avatars.CaptureLocalModel(_playerTf)
+                        : null;
+                    if (_localPlayerModel != null)
+                        _localModelAuto = NeedsAutoRepair(_localPlayerModel);
+                    else
+                    {
+                        _localPlayerModel = _avatars.CreateDefaultModel();
+                        _localModelAuto = true;
+                    }
+                }
+                else
+                {
+                    _localModelAuto = NeedsAutoRepair(_localPlayerModel);
+                }
             }
+
+            if (_localModelAuto)
+                TryUpgradeAutoModel();
+
             var editor = _avatars.GetEditorCustomization(_localPlayerModel.Female);
             if (editor != null && _localModelAppliedRoot != editor.transform)
             {
@@ -1314,6 +1469,40 @@ namespace CardShopCoop
             }
             if (_lastCommittedPlayerModel == null)
                 _lastCommittedPlayerModel = ClonePlayerModel(_localPlayerModel);
+        }
+
+        /// <summary>A model needs a random clothed preset when it has no saved appearance yet,
+        /// or when it is nude while NSFW is disabled. Kept false once the player makes an
+        /// explicit wardrobe choice.</summary>
+        private static bool NeedsAutoRepair(PlayerModelEntry model)
+        {
+            if (model == null)
+                return true;
+            if (string.IsNullOrEmpty(model.CustomizationJson))
+                return true;
+            return !CoopPlugin.AllowNsfw.Value && AvatarManager.IsNude(model);
+        }
+
+        /// <summary>Assigns a random clothed preset of the model's current gender. Does
+        /// nothing until the game's preset data is available, and is retried later.</summary>
+        private void TryUpgradeAutoModel()
+        {
+            if (_localPlayerModel == null)
+            {
+                _localPlayerModel = _avatars.CreateDefaultModel();
+                return;
+            }
+            var preset = _avatars.TryCreateRandomPresetModel(_localPlayerModel.Female);
+            if (preset == null)
+                return;
+            _localPlayerModel = preset;
+            _localModelAuto = false;
+            _localModelAppliedRoot = null;
+            _lastCommittedPlayerModel = ClonePlayerModel(_localPlayerModel);
+            PlayerModelGeneration++;
+            QueueLocalModelSave();
+            SubmitLocalPlayerModel();
+            CoopPlugin.Log.LogInfo($"default appearance assigned: {(preset.Female ? "female" : "male")} model {preset.ModelIndex}");
         }
 
         private void QueueLocalModelSave()
@@ -1382,7 +1571,7 @@ namespace CardShopCoop
             foreach (var pair in _playerModels)
             {
                 var model = ClonePlayerModel(pair.Value);
-                model.Id = (byte)pair.Key;
+                model.Id = pair.Key;
                 state.Entries.Add(model);
             }
             return state;
@@ -1400,6 +1589,7 @@ namespace CardShopCoop
                 {
                     _localPlayerModel = ClonePlayerModel(entry);
                     _localPlayerModelReady = true;
+                    _localModelAuto = false;
                     continue;
                 }
                 int avatarId = entry.Id == 0 ? 1 : 1000 + entry.Id;
@@ -1444,6 +1634,11 @@ namespace CardShopCoop
             _clientWorldArrived = false;
             CoopPlugin.Log.LogInfo($"Join world load completed in {elapsed:F2}s; resuming co-op sync");
 
+            // The join-time authoritative snapshots are emitted during world transfer, before
+            // this world exists, so ask the host to reconverge all state now that it can apply it.
+            if (Role == CoopRole.Client && _net != null)
+                Send(1, new JoinResyncRequestMessage());
+
             // A shop name that arrived while loading may have been painted onto a sign
             // that the reload then rebuilt. Re-stamp it now that the real world is ready.
             if (_shopSign != null && !string.IsNullOrEmpty(_lastShopNameApplied))
@@ -1452,7 +1647,7 @@ namespace CardShopCoop
                 {
                     _shopSign.text = _lastShopNameApplied;
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
             return true;
         }
@@ -1475,141 +1670,311 @@ namespace CardShopCoop
 
         private void ModulesTick()
         {
-            bool inGame = InGameLevel();
+            if (_moduleRegistry == null)
+                return;
+            var frame = new Sync.SyncFrame(_dt, InGameLevel(), ClientPreloadHold);
             if (Role == CoopRole.Host)
             {
-                _grading.HostTick(_dt, inGame);
-                _trades.HostTick(_dt, inGame);
-                _tables.HostTick(_dt, inGame);
-                _staff.HostTick(_dt, inGame);
-                _shopState.HostTick(_dt, inGame);
-                _settings.HostTick(_dt, inGame);
-                _market.HostTick(_dt, inGame);
-                _report.HostTick(_dt, inGame); // per-frame: its report-open flag fires outside the timer
-                _containers.HostTick(_dt, inGame);
-                _tournament.HostTick(_dt, inGame);
-                _cardBoxes.HostTick(_dt, inGame);
-                _furnBoxes.HostTick(_dt, inGame);
-                _register.HostTick(_dt, inGame);
-                _tv.HostTick(_dt, inGame);
+                for (int i = 0; i < _hostTickOrder.Length; i++)
+                    TickModule(_hostTickOrder[i], in frame);
             }
             else if (Role == CoopRole.Client)
             {
-                _tv.ClientTick(_dt, inGame);
-                _trades.ClientTick(_dt, inGame); // offer countdown + accept/decline keys
-                _containers.ClientTick(_dt, inGame && !ClientPreloadHold); // mirror opener presentation + retry container clicks
-                _cardBoxes.ClientTick(_dt, inGame && !ClientPreloadHold); // carried transitions + box moves
-                _furnBoxes.ClientTick(_dt, inGame && !ClientPreloadHold);
-                // Box trajectories are cosmetic client prediction only. Their endpoints are
-                // still host-authored; this makes throw/drop/set-down reconciliation readable
-                // instead of teleporting the remote copy.
-                BoxSync.TickRemoteMotions(_dt);
-                // content mods register their products SECONDS after the scene loads
-                // (and per-save: a host mid-tutorial has none yet) - keep re-digesting
-                // as our catalog changes so the comparison never goes stale
-                _catalogTimer += _dt;
-                if (inGame && (_catalogTimer >= 45f || !_catalogSent))
-                {
-                    _catalogTimer = 0f;
-                    _catalogSent = true;
-                    int h = LocalCatalogHash();
-                    if (h != _lastCatalogSentHash)
-                    {
-                        _lastCatalogSentHash = h;
-                        SendCatalogDigest();
-                    }
-                }
-                // ...and the graded-cert digest on the same gating for the same reason: the album
-                // changes constantly (every pack opened, every card graded), so a one-shot send
-                // would be stale within a minute. Built once and reused for both the hash test
-                // and the send - the union walk is the expensive half, not the write.
-                _gradedTimer += _dt;
-                if (inGame && (_gradedTimer >= 45f || !_gradedSent))
-                {
-                    var inv = Util.GradingInterop.BuildGradedCertInventory();
-                    // NULL IS NOT AN EMPTY ALBUM - it is "the world here is still spawning", and
-                    // sending a SHORT union is the one direction that hurts: the host would read
-                    // every graded card on our own shelves as one-sided and offer them back for
-                    // adoption. InGameLevel() cannot tell us apart from a loaded world (it stays
-                    // true through the client reload screen), so this is the gate. Do not mark
-                    // the send done; come back in a second rather than in 45.
-                    if (inv == null)
-                    {
-                        _gradedTimer = 44f;
-                    }
-                    else
-                    {
-                        _gradedTimer = 0f;
-                        _gradedSent = true;
-                        int gh = GradedHash(inv);
-                        if (gh != _lastGradedHash)
-                        {
-                            _lastGradedHash = gh;
-                            SendGradedDigest(1, inv);
-                        }
-                    }
-                }
+                // ORDER IS LOAD-BEARING: the market flush applies any snapshot that arrived
+                // while the world loaded (after CGameData.PropagateLoadData swapped the card
+                // tables in), then tv/trades/containers run, and the cosmetic box trajectories
+                // plus the catalog/graded digests come last - exactly as before the migration.
+                for (int i = 0; i < _clientTickOrder.Length; i++)
+                    TickModule(_clientTickOrder[i], in frame);
+                ClientDigestTick(in frame);
             }
         }
 
-        private void ModulesReset()
+        /// <summary>Runs one pipeline entry with per-stage armor and allocation-free probing.
+        /// Unlike the old Guarded("modules", ...) wrapper, one failure degrades a single
+        /// subsystem instead of aborting the rest of the frame's pipeline.</summary>
+        private void TickModule(Sync.TickEntry entry, in Sync.SyncFrame frame)
         {
-            _grading.Reset();
-            _trades.Reset();
-            _tables.Reset();
-            _staff.Reset();
-            _shopState.Reset();
-            _settings.Reset();
-            _market.Reset();
-            _report.Reset();
-            _containers.Reset();
-            _tournament.Reset();
-            _cardBoxes.Reset();
-            _furnBoxes.Reset();
-            _register.Reset();
-            _tv.Reset();
+            long t = Util.PerfProbe.Start();
+            try
+            {
+                entry.Module.Tick(frame);
+            }
+            catch (Exception e)
+            {
+                Sync.ModuleGuard.Log(entry.Probe, e);
+            }
+            Util.PerfProbe.End(entry.Probe, t);
+        }
+
+        /// <summary>Client-only per-frame work that is not owned by a module: the
+        /// periodically re-digested catalog and graded-album hashes.</summary>
+        private void ClientDigestTick(in Sync.SyncFrame frame)
+        {
+            bool inGame = frame.InGame;
+            float dt = frame.Dt;
+            long t;
+
+            // content mods register their products SECONDS after the scene loads
+            // (and per-save: a host mid-tutorial has none yet) - keep re-digesting
+            // as our catalog changes so the comparison never goes stale
+            t = Util.PerfProbe.Start();
+            _catalogTimer += dt;
+            if (inGame && (_catalogTimer >= 45f || !_catalogSent))
+            {
+                _catalogTimer = 0f;
+                _catalogSent = true;
+                int h = LocalCatalogHash();
+                if (h != _lastCatalogSentHash)
+                {
+                    _lastCatalogSentHash = h;
+                    SendCatalogDigest();
+                }
+            }
+            Util.PerfProbe.End("mod.catalogDigest", t);
+            // ...and the graded-cert digest on the same gating for the same reason: the album
+            // changes constantly (every pack opened, every card graded), so a one-shot send
+            // would be stale within a minute. Built once and reused for both the hash test
+            // and the send - the union walk is the expensive half, not the write.
+            t = Util.PerfProbe.Start();
+            _gradedTimer += dt;
+            if (inGame && (_gradedTimer >= 45f || !_gradedSent))
+            {
+                var inv = Util.GradingInterop.BuildGradedCertInventory();
+                // NULL IS NOT AN EMPTY ALBUM - it is "the world here is still spawning", and
+                // sending a SHORT union is the one direction that hurts: the host would read
+                // every graded card on our own shelves as one-sided and offer them back for
+                // adoption. InGameLevel() cannot tell us apart from a loaded world (it stays
+                // true through the client reload screen), so this is the gate. Do not mark
+                // the send done; come back in a second rather than in 45.
+                if (inv == null)
+                {
+                    _gradedTimer = 44f;
+                }
+                else
+                {
+                    _gradedTimer = 0f;
+                    _gradedSent = true;
+                    int gh = GradedHash(inv);
+                    if (gh != _lastGradedHash)
+                    {
+                        _lastGradedHash = gh;
+                        SendGradedDigest(1, inv);
+                    }
+                }
+            }
+            Util.PerfProbe.End("mod.gradedDigest", t);
+        }
+
+        /// <summary>The catalog is the single source of truth for lifecycle order, registry
+        /// membership, tick pipelines, and static patch registration. This is the v1.1 reset
+        /// order (with the unified box engine replacing the old box modules). Disposal walks it
+        /// in reverse, so live hooks detach first; join-heal and live-hooks therefore remain
+        /// last. Actual population/index dependencies remain explicit in the per-role slots.</summary>
+        private Sync.CoopModuleEntry[] BuildModuleCatalog()
+        {
+            return new[]
+            {
+                new Sync.CoopModuleEntry(_world, "world"),
+                new Sync.CoopModuleEntry(_npcs, "npcs"),
+                new Sync.CoopModuleEntry(_cardShelves, "cardshelves"),
+                new Sync.CoopModuleEntry(_objMoves, "objmoves"),
+                new Sync.CoopModuleEntry(_movePreview, "movepreview"),
+                new Sync.CoopModuleEntry(_boxEngine, "boxes"),
+                new Sync.CoopModuleEntry(_population, "population"),
+                new Sync.CoopModuleEntry(_grading, "grading", 0, -1, Sync.GradingSync.ApplyPatches),
+                new Sync.CoopModuleEntry(_trades, "trades", 1, 2, Sync.TradeServe.ApplyPatches),
+                new Sync.CoopModuleEntry(_tables, "tables", 2, -1, Sync.PlayTableSync.ApplyPatches),
+                new Sync.CoopModuleEntry(_staff, "staff", 3, -1, Sync.StaffSync.ApplyPatches),
+                new Sync.CoopModuleEntry(_shopState, "shopState", 4, -1, Sync.ShopStateSync.ApplyPatches),
+                new Sync.CoopModuleEntry(_settings, "settings", 5, -1, Sync.SettingsSync.ApplyPatches),
+                new Sync.CoopModuleEntry(_market, "market", 6, 0, Sync.MarketSync.ApplyPatches),
+                new Sync.CoopModuleEntry(_report, "report", 7, -1, Sync.ReportSync.ApplyPatches),
+                new Sync.CoopModuleEntry(_containers, "containers", 8, 3, Sync.ContainerSync.ApplyPatches),
+                new Sync.CoopModuleEntry(_tournament, "tournament", 9, -1, Sync.TournamentSync.ApplyPatches),
+                new Sync.CoopModuleEntry(_register, "register", 10, -1, Sync.RegisterSync.ApplyPatches),
+                new Sync.CoopModuleEntry(_tv, "tv", 11, 1, Sync.TvSync.ApplyPatches),
+                new Sync.CoopModuleEntry(new Sync.DelegateCoopModule("join-heal", null, null,
+                    () => _priceFullPending = true), "join-heal"),
+                new Sync.CoopModuleEntry(new Sync.DelegateCoopModule("live-hooks",
+                    InstallLiveModuleHooks, null, null, ClearLiveModuleHooks), "live-hooks"),
+                new Sync.CoopModuleEntry(null, "cardboxes", patches: Sync.CardBoxOps.ApplyPatches),
+                new Sync.CoopModuleEntry(null, "furnboxes", patches: Sync.FurnitureBoxOps.ApplyPatches),
+                new Sync.CoopModuleEntry(null, "hand-protection", patches: Sync.HandProtection.ApplyPatches),
+            };
+        }
+
+        private Sync.CoopModuleRegistry CreateModuleRegistry()
+        {
+            return new Sync.CoopModuleRegistry(_allModules);
+        }
+
+        /// <summary>Builds the explicit per-role tick pipelines. The two roles need different
+        /// orders, and several comments in the synchronizers depend on that order (market
+        /// flush before the other client modules; the client digests last), so it is declared
+        /// here rather than inferred from the lifecycle list.</summary>
+        private void BuildTickOrders()
+        {
+            _hostTickOrder = BuildTickOrder(host: true);
+            _clientTickOrder = BuildTickOrder(host: false);
+        }
+
+        private Sync.TickEntry[] BuildTickOrder(bool host)
+        {
+            var ordered = new List<Sync.TickEntry>();
+            int maxSlot = -1;
+            for (int i = 0; i < _moduleCatalog.Length; i++)
+            {
+                int slot = host ? _moduleCatalog[i].HostSlot : _moduleCatalog[i].ClientSlot;
+                if (slot > maxSlot)
+                    maxSlot = slot;
+            }
+            for (int slot = 0; slot <= maxSlot; slot++)
+                for (int i = 0; i < _moduleCatalog.Length; i++)
+                {
+                    Sync.CoopModuleEntry entry = _moduleCatalog[i];
+                    if ((host ? entry.HostSlot : entry.ClientSlot) == slot)
+                        ordered.Add(new Sync.TickEntry((ITickableCoopModule)entry.Module,
+                            "mod." + entry.Name));
+                }
+            return ordered.ToArray();
+        }
+
+        private void ResetAllModules()
+        {
+            for (int i = 0; i < _allModules.Length; i++)
+                _allModules[i].ResetState();
         }
 
         private void ActivateLiveModuleHooks()
         {
+            if (_moduleRegistry != null)
+                throw new InvalidOperationException("Cannot activate co-op module hooks twice.");
+            BuildTickOrders();
+            _moduleRegistry = CreateModuleRegistry();
+            try
+            {
+                _moduleRegistry.Start();
+            }
+            catch
+            {
+                // A module Start() fault would otherwise leave a half-started registry
+                // installed and block every retry behind the double-activation guard.
+                DeactivateLiveModuleHooks();
+                throw;
+            }
+        }
+
+        /// <summary>Tears the live registry down without touching transport or world state.
+        /// Failed-start paths use this so a retry cannot inherit installed Harmony hooks or
+        /// trip the double-activation guard.</summary>
+        private void DeactivateLiveModuleHooks()
+        {
+            if (_moduleRegistry == null)
+                return;
+            _moduleRegistry.Dispose();
+            _moduleRegistry = null;
+        }
+
+        /// <summary>Undoes the partial session setup a failed host/join start can leave
+        /// behind: stops any transport, detaches the module hooks, and returns to the idle
+        /// role so the player can retry without restarting.</summary>
+        private void AbortSessionStart(string error)
+        {
+            ErrorLine = error;
+            try
+            {
+                _net?.Stop();
+            }
+            catch (Exception e)
+            {
+                CoopPlugin.Log.LogWarning("transport stop during aborted session start: " + e.Message);
+            }
+            _net = null;
+            DeactivateLiveModuleHooks();
+            Role = CoopRole.None;
+            _sessionInGame = false;
+            _dispatchDeferredFrames = 0;
+            _dispatchBuf.Clear();
+            _dispatchRetryNextFrame.Clear();
+            _dispatchHeldTransfers.Clear();
+            IsSteamSession = false;
+            GuestBorrowedWorld = false;
+            HostPassword = "";
+            _joinPassword = "";
+        }
+
+        private void InstallLiveModuleHooks()
+        {
+            PopulationSync.OnClientStructureChanged = kind =>
+            {
+                if (Role != CoopRole.Client)
+                    return;
+                // The client's placed-object roster just changed (a shelf was removed or
+                // spawned). Every index-keyed mirror's baseline is now keyed against stale
+                // indexes, so read the structure back fresh instead of diffing against
+                // garbage. Repaired objects start with loader defaults; those defaults must
+                // not be reported as guest edits through any index-based mirror.
+                _world.InvalidateBaseline();
+                _objMoves.Reset();
+                if (kind == 2 || kind == 3 || kind == 14)
+                    _cardShelves.InvalidateBaseline();
+                // container stations (card storage, cleansers, pack openers, box storage,
+                // donation boxes) and play tables are index-keyed too; their per-index
+                // mirrors/caches go stale the moment a machine/table of that kind shifts.
+                if (kind >= 9 && kind <= 13)
+                {
+                    _containers.Reset();
+                    _containers.ForceResend();
+                }
+                if (kind == 6)
+                {
+                    _tables.Reset();
+                    _tables.ForceResend();
+                }
+                // Population reconciliation removes/inserts list elements, so every
+                // index-keyed mirror needs an immediate authoritative snapshot rather than
+                // waiting for its normal heal interval.
+                _boxEngine?.ForceNextTick();
+                _register.ForceResend();
+            };
             Util.GradingInterop.Reset();
             NpcSync.ActivateLive(_npcs);
             TradeServe.ActivateLive(_trades);
             RegisterSync.ActivateLive(_register);
-            BoxSync.ActivateLive(_boxes);
             ContainerSync.ActivateLive(_containers);
-            FurnBoxSync.ActivateLive(_furnBoxes);
+
             GradingSync.ActivateLive(_grading);
         }
 
         private static void ClearLiveModuleHooks()
         {
+            HandEscrow.Reset();
+            PopulationSync.OnClientStructureChanged = null;
             NpcSync.ClearLive();
             TradeServe.ClearLive();
             RegisterSync.ClearLive();
-            BoxSync.ClearLive();
+            BoxShared.ApplyingRemote = false;
+            BoxPlacement.Reset();
             ContainerSync.ClearLive();
-            FurnBoxSync.ClearLive();
+
             GradingSync.ClearLive();
             Util.GradingInterop.Reset();
         }
 
         private void ModulesForceResend()
         {
-            _grading.ForceResend();
-            _trades.ForceResend();
-            _tables.ForceResend();
-            _staff.ForceResend();
-            _shopState.ForceResend();
-            _settings.ForceResend();
-            _market.ForceResend();
-            _report.ForceResend();
-            _containers.ForceResend();
-            _tournament.ForceResend();
-            _cardBoxes.ForceResend();
-            _furnBoxes.ForceResend();
-            _register.ForceResend();
-            _tv.ForceResend();
+            if (_moduleRegistry != null)
+            {
+                _moduleRegistry.ForceResend();
+                return;
+            }
+
+            // Process-lifetime fallback (no live registry): mirror the registry's module set
+            // so a joiner still gets a full authoritative baseline.
+            for (int i = 0; i < _allModules.Length; i++)
+                _allModules[i].ForceResend();
+            _priceFullPending = true; // fresh joiner gets the authoritative price table
         }
 
         internal void SendTvOp(TvOpMessage message)
@@ -1635,7 +2000,7 @@ namespace CardShopCoop
                     {
                         _shopSign = renamer.m_ShopName;
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                     renamer.gameObject.SetActive(false);
                     CoopPlugin.Log.LogInfo("disabled shop-renamer trigger (host names the shop)");
                     // a ShopName may have already arrived while the renamer was still live
@@ -1646,7 +2011,7 @@ namespace CardShopCoop
                         {
                             _shopSign.text = _lastShopNameApplied;
                         }
-                        catch { }
+                        catch (System.Exception e) { Swallow.Log(e); }
                     }
                 }
             }
@@ -1676,25 +2041,58 @@ namespace CardShopCoop
         {
             float interval = 1f / Mathf.Clamp(CoopPlugin.SendRateHz.Value, 4f, 30f);
             Transform playerTf = InGameLevel() ? ResolvePlayer() : null;
-            if (_stateTimer < interval || playerTf == null)
+            if (playerTf == null)
+                return;
+            _stateKeepalive += _dt;
+            if (_stateTimer < interval)
                 return;
             Vector3 pos = playerTf.position;
+            float yaw = _playerCamTf != null ? _playerCamTf.eulerAngles.y
+                : (Camera.main != null ? Camera.main.transform.eulerAngles.y : playerTf.eulerAngles.y);
+            Transform camera = _playerCamTf != null ? _playerCamTf : Camera.main != null ? Camera.main.transform : null;
+            byte hold = ComputeHoldState();
+            Vector3 cameraPos = camera != null ? camera.position : pos;
+            Quaternion cameraRot = camera != null ? camera.rotation : Quaternion.Euler(0f, yaw, 0f);
+            int holdSig = HoldPayloadSignature();
+
+            // Change-gate: only send when pose/camera/hold actually moved, plus a slow
+            // keepalive so a standing-still player still refreshes the far side.
+            bool changed = !_hasSentState
+                || (pos - _lastSentPos).sqrMagnitude > 0.0004f   // > 2 cm
+                || Mathf.Abs(Mathf.DeltaAngle(yaw, _lastSentCamYaw)) > 1f
+                || hold != _lastSentHold
+                || (cameraPos - _lastSentCamPos).sqrMagnitude > 0.0004f
+                || Quaternion.Angle(cameraRot, _lastSentCamRot) > 0.5f
+                || holdSig != _lastSentHoldSig;
+            if (!changed && _stateKeepalive < 5f)
+            {
+                _stateTimer = 0f; // consumed this interval
+                return;
+            }
+            _stateKeepalive = 0f;
+
             float speed = 0f;
             if (_hasLastPos)
             {
                 Vector3 delta = pos - _lastPos;
                 delta.y = 0f;
-                speed = Mathf.Clamp(delta.magnitude / _stateTimer, 0f, 6f);
+                speed = Mathf.Clamp(delta.magnitude / Mathf.Max(_stateTimer, 0.0001f), 0f, 6f);
             }
             _lastPos = pos;
             _hasLastPos = true;
-            float yaw = _playerCamTf != null ? _playerCamTf.eulerAngles.y
-                : (Camera.main != null ? Camera.main.transform.eulerAngles.y : playerTf.eulerAngles.y);
-            byte hold = ComputeHoldState();
+            _lastSentPos = pos;
+            _lastSentCamYaw = yaw;
+            _lastSentCamPos = cameraPos;
+            _lastSentCamRot = cameraRot;
+            _lastSentHold = hold;
+            _lastSentHoldSig = holdSig;
+            _hasSentState = true;
             BroadcastTransient(new PlayerStateMessage
             {
                 Position = pos,
                 Yaw = yaw,
+                CameraPosition = cameraPos,
+                CameraRotation = cameraRot,
                 Speed = speed,
                 Hold = hold,
                 HoldTypes = hold == 3 ? null : new List<int>(_holdTypesBuf),
@@ -1722,6 +2120,7 @@ namespace CardShopCoop
         private Transform _playerTf;   // the MOVING body: IPC.m_WalkerCtrl (CMF walker)
         private Transform _playerCamTf; // player camera, for look yaw
         private InteractionPlayerController _playerIpc;
+        private Sync.BoxPushProbe _pushProbe; // detects the boxes the local player is pushing
         private bool _uiModeHeldByWindow;
         private InteractionPlayerController _uiModeController;
 
@@ -1742,8 +2141,47 @@ namespace CardShopCoop
                 _playerTf = ipc.m_WalkerCtrl != null ? ipc.m_WalkerCtrl.transform : ipc.transform;
                 _playerCamTf = ipc.m_Cam != null ? ipc.m_Cam.transform : null;
                 CoopPlugin.Log.LogInfo($"Player body resolved: {_playerTf.name} at {_playerTf.position}, cam={(_playerCamTf != null ? _playerCamTf.name : "none")}");
+                AttachPushProbe();
             }
             return _playerTf;
+        }
+
+        /// <summary>
+        /// Idempotently attach and initialize <see cref="Sync.BoxPushProbe"/> on the player
+        /// walker's rigidbody, so the local player's own pushing feeds the box engine. Safe
+        /// to call whenever a player is resolved; it no-ops once the probe exists, and the
+        /// probe is surfaced to <see cref="BoxEngine"/> through the <c>LocalPushed</c>
+        /// delegate wired in the constructor (which reads this field dynamically).
+        /// </summary>
+        private void AttachPushProbe()
+        {
+            if (_pushProbe != null)
+                return;
+            if (_playerIpc == null || _playerIpc.m_PlayerRigidbody == null)
+            {
+                CoopPlugin.Log.LogWarning("push probe NOT attached: "
+                    + (_playerIpc == null ? "no InteractionPlayerController" : "m_PlayerRigidbody is null"));
+                return;
+            }
+            _pushProbe = _playerIpc.m_PlayerRigidbody.GetComponent<Sync.BoxPushProbe>()
+                ?? _playerIpc.m_PlayerRigidbody.gameObject.AddComponent<Sync.BoxPushProbe>();
+            _pushProbe.Init(_playerIpc.m_PlayerRigidbody);
+            CoopPlugin.Log.LogInfo($"push probe attached to {_playerIpc.m_PlayerRigidbody.gameObject.name} (kinematic={_playerIpc.m_PlayerRigidbody.isKinematic})");
+        }
+
+        /// <summary>True if the collider belongs to the LOCAL player's body. Box-side contact
+        /// probes use this to tell a real player push from any other box collision.</summary>
+        internal static bool IsLocalPlayerCollider(Collider collider)
+        {
+            var core = Instance;
+            if (core == null || collider == null || core._playerIpc == null)
+                return false;
+            var playerCollider = core._playerIpc.m_PlayerCollider;
+            if (playerCollider == null)
+                return false;
+            return collider == playerCollider
+                || collider.transform.IsChildOf(playerCollider.transform)
+                || playerCollider.transform.IsChildOf(collider.transform);
         }
 
         /// <summary>Make the co-op window modal while it is visible in a game level.
@@ -1809,7 +2247,7 @@ namespace CardShopCoop
 
         /// <summary>Client-side half of an acknowledged empty-box take. Reuse the game's own
         /// StartHoldBox recipe so the controller enters HoldingBoxState, the box physics are
-        /// disabled, and the normal carry report reaches the host on the next BoxSync tick.</summary>
+        /// disabled, and the normal carry report reaches the host on the next box-engine tick.</summary>
         private static bool TryHoldClientBox(InteractablePackagingBox_Item box)
         {
             if (Role != CoopRole.Client || box == null)
@@ -1827,9 +2265,9 @@ namespace CardShopCoop
                 if (FiIsHoldBoxMode?.GetValue(ipc) is bool held && held)
                     return false;
                 box.StartHoldBox(isPlayer: true, ipc.m_HoldItemPos);
-                // BoxSync caches the controller's held-box fields for the current frame.
+                // CoopCore caches the controller's held-box fields for the current frame.
                 // Invalidate that cache because this handoff changes those fields inside the
-                // BoxState reconciliation callback itself.
+                // snapshot apply itself.
                 core._heldBoxFrame = -1;
                 return true;
             }
@@ -1896,8 +2334,136 @@ namespace CardShopCoop
                     }
                 }
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
         }
+
+        private static readonly MethodInfo MiRemoveHoldItem =
+            HarmonyLib.AccessTools.Method(typeof(InteractionPlayerController), "RemoveHoldItem");
+
+        /// <summary>Controller used by the local hand primitives. Keep this accessor here so
+        /// sync policies do not need to know how the player controller is discovered.</summary>
+        internal static InteractionPlayerController PlayerIpc
+        {
+            get
+            {
+                return Instance != null ? Instance._playerIpc : null;
+            }
+        }
+
+        internal static List<Item> GetHeldItemList(InteractionPlayerController ipc)
+        {
+            return ipc != null ? FiHoldItemList?.GetValue(ipc) as List<Item> : null;
+        }
+
+        private static readonly FieldInfo FiHoldCardMode =
+            HarmonyLib.AccessTools.Field(typeof(InteractionPlayerController), "m_IsHoldCardMode");
+
+        /// <summary>Whether vanilla is currently able to accept an item into the hand. Escrow
+        /// must not race modal hold states: those states can consume or reposition the item.</summary>
+        internal static bool HandAcceptsItems()
+        {
+            var ipc = PlayerIpc;
+            if (ipc == null)
+                return false;
+            if (FiIsHoldBoxMode?.GetValue(ipc) is bool boxMode && boxMode)
+                return false;
+            if (FiHoldCardMode?.GetValue(ipc) is bool cardMode && cardMode)
+                return false;
+            if (FiViewAlbum?.GetValue(ipc) is bool albumMode && albumMode)
+                return false;
+            return true;
+        }
+
+        /// <summary>Remove one item from the local hand through the game's own path, keeping
+        /// the hand and its parallel type list in sync. Returns false when the item is still
+        /// present afterwards (a suppressed RemoveHoldItem prefix), so callers never destroy
+        /// an object that is still in the hand.</summary>
+        internal static bool RemoveHeldItemFromHand(Item item)
+        {
+            var ipc = PlayerIpc;
+            if (item == null || ipc == null || !(FiHoldItemList?.GetValue(ipc) is List<Item> items))
+                return false;
+            RemoveHeldItemAt(ipc, items, item);
+            if (items.IndexOf(item) >= 0)
+            {
+                CoopPlugin.Log.LogError("RemoveHeldItemFromHand: RemoveHoldItem was suppressed or failed; item remains in hand during rollback");
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>Attach a returned item through the game's own hand path. The explicit
+        /// activation is required because AddHoldItemToFront only updates hand bookkeeping.</summary>
+        internal static bool TryAttachHeldItem(Item item)
+        {
+            if (item == null || !HandAcceptsItems())
+                return false;
+            var ipc = PlayerIpc;
+            if (ipc == null || ipc.GetHoldItemCount() >= HandProtection.HandCapacity)
+                return false;
+            item.gameObject.SetActive(true);
+            ipc.AddHoldItemToFront(item);
+            return true;
+        }
+
+        internal static void DestroyDetachedItem(Item item)
+        {
+            if (item == null)
+                return;
+            try
+            {
+                item.DisableItem();
+            }
+            catch (Exception e)
+            {
+                CoopPlugin.Log.LogError("DestroyDetachedItem: DisableItem failed; phantom item may remain: " + e);
+            }
+        }
+
+        /// <summary>Remove one held item using the game's own RemoveHoldItem, so the hold state,
+        /// game state, and the remaining items' HUD positions stay correct. Vanilla always
+        /// removes the FRONT type entry from the parallel type list, so move the target to the
+        /// front in both lists first.</summary>
+        private static void RemoveHeldItemAt(InteractionPlayerController ipc, List<Item> items, Item item)
+        {
+            int index = items.IndexOf(item);
+            if (index < 0)
+                return;
+            var types = CPlayerData.m_HoldItemTypeList;
+            if (index != 0)
+            {
+                var front = items[0];
+                items[0] = item;
+                items[index] = front;
+                if (types != null && types.Count > index)
+                {
+                    var frontType = types[0];
+                    types[0] = types[index];
+                    types[index] = frontType;
+                }
+            }
+            if (MiRemoveHoldItem != null)
+            {
+                try
+                {
+                    MiRemoveHoldItem.Invoke(ipc, new object[] { item });
+                    if (items.IndexOf(item) < 0)
+                        return;
+                }
+                catch (System.Exception e)
+                {
+                    CoopPlugin.Log.LogWarning("RemoveHoldItem failed, removing manually: " + e.Message);
+                }
+            }
+            int idx = items.IndexOf(item);
+            if (idx >= 0)
+            {
+                items.RemoveAt(idx);
+                if (types != null && idx < types.Count)
+                    types.RemoveAt(idx);
+            }
+        }
+
 
         private readonly List<int> _holdTypesBuf = new List<int>(6);
         private readonly List<CardData> _holdCardsBuf = new List<CardData>(4);
@@ -1953,8 +2519,35 @@ namespace CardShopCoop
                 if (FiViewAlbum?.GetValue(_playerIpc) is bool album && album)
                     return 4; // reading the collection binder
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             return 0;
+        }
+
+        private int HoldPayloadSignature()
+        {
+            unchecked
+            {
+                int hash = 17;
+                hash = hash * 31 + _holdTypesBuf.Count;
+                for (int i = 0; i < _holdTypesBuf.Count; i++)
+                    hash = hash * 31 + _holdTypesBuf[i];
+                hash = hash * 31 + _holdCardsBuf.Count;
+                for (int i = 0; i < _holdCardsBuf.Count; i++)
+                {
+                    CardData card = _holdCardsBuf[i];
+                    if (card == null)
+                    {
+                        hash = hash * 31;
+                        continue;
+                    }
+                    hash = hash * 31 + (int)card.monsterType;
+                    hash = hash * 31 + (int)card.expansionType;
+                    hash = hash * 31 + (card.isFoil ? 1 : 0);
+                    hash = hash * 31 + card.cardGrade;
+                    hash = hash * 31 + card.gradedCardIndex;
+                }
+                return hash;
+            }
         }
 
         private bool IsAlive(FieldInfo fi)
@@ -1984,7 +2577,7 @@ namespace CardShopCoop
             {
                 var tcp = new Transport { KeepaliveMessage = new PingMessage() };
                 tcp.StartHost(CoopPlugin.Port.Value);
-                _net = tcp;
+                _net = LagTransport.Wrap(tcp);
                 Role = CoopRole.Host;
                 ActivateLiveModuleHooks();
                 StatusLine = "Hosting - waiting for a player...";
@@ -2002,11 +2595,10 @@ namespace CardShopCoop
             }
             catch (Exception e)
             {
-                ErrorLine = "Could not host: " + e.Message;
-                _net?.Stop();
-                _net = null;
-                Role = CoopRole.None;
-                HostPassword = ""; // nothing is listening; don't leave a stale one behind
+                // Tear the registry down too: leaving it installed would keep the static
+                // Harmony hooks live and make the next StartHosting attempt throw the
+                // double-activation guard, permanently wedging hosting until a restart.
+                AbortSessionStart("Could not host: " + e.Message);
             }
         }
 
@@ -2136,7 +2728,7 @@ namespace CardShopCoop
                         {
                             lan = NetHelpers.LocalIPv4();
                         }
-                        catch { }
+                        catch (System.Exception ex) { Swallow.Log(ex); }
                     }
                 }
 
@@ -2225,41 +2817,48 @@ namespace CardShopCoop
 
             CoopPlugin.LastJoinIP.Value = ip;
             Role = CoopRole.Client;
-            ActivateLiveModuleHooks();
-            GuestBorrowedWorld = true; // block ALL saves until we're back at the title screen
-            // Sent in our Hello; empty for a plain "Join LAN", non-empty only when an invite
-            // code carried the host's lobby password.
-            _joinPassword = password ?? "";
-            StatusLine = "Connecting to " + ip + "...";
-            var net = new Transport { KeepaliveMessage = new PingMessage() };
-            _net = net;
-            // A code from a host on a non-default port has to win over our own config; a
-            // nonsense value falls back rather than throwing at the socket.
-            int port = (joinPort > 0 && joinPort <= 65535) ? joinPort : CoopPlugin.Port.Value;
-            new Thread(() =>
+            try
             {
-                try
+                ActivateLiveModuleHooks();
+                GuestBorrowedWorld = true; // block ALL saves until we're back at the title screen
+                // Sent in our Hello; empty for a plain "Join LAN", non-empty only when an invite
+                // code carried the host's lobby password.
+                _joinPassword = password ?? "";
+                StatusLine = "Connecting to " + ip + "...";
+                var net = new Transport { KeepaliveMessage = new PingMessage() };
+                _net = LagTransport.Wrap(net);
+                // A code from a host on a non-default port has to win over our own config; a
+                // nonsense value falls back rather than throwing at the socket.
+                int port = (joinPort > 0 && joinPort <= 65535) ? joinPort : CoopPlugin.Port.Value;
+                new Thread(() =>
                 {
-                    net.StartClient(ip, port);
-                    QueueMainThread("connect-established", () =>
+                    try
                     {
-                        StatusLine = "Connected - requesting world...";
-                        SendHello();
-                    }, true);
-                }
-                catch (Exception e)
+                        net.StartClient(ip, port);
+                        QueueMainThread("connect-established", () =>
+                        {
+                            StatusLine = "Connected - requesting world...";
+                            SendHello();
+                        }, true);
+                    }
+                    catch (Exception e)
+                    {
+                        QueueMainThread("connect-failed", () =>
+                        {
+                            ErrorLine = "Could not connect: " + e.Message;
+                            Shutdown(null);
+                        }, false);
+                    }
+                })
                 {
-                    QueueMainThread("connect-failed", () =>
-                    {
-                        ErrorLine = "Could not connect: " + e.Message;
-                        Shutdown(null);
-                    }, false);
-                }
-            })
+                    IsBackground = true,
+                    Name = "CoopConnect"
+                }.Start();
+            }
+            catch (Exception e)
             {
-                IsBackground = true,
-                Name = "CoopConnect"
-            }.Start();
+                AbortSessionStart("Could not connect: " + e.Message);
+            }
         }
 
         public void Disconnect()
@@ -2363,6 +2962,20 @@ namespace CardShopCoop
             });
         }
 
+        /// <summary>Single marshalling point for the host-side green play-table money popup.</summary>
+        public void ForwardNpcMoneyPopup(ushort index, int identity, float amount, float offsetUp)
+        {
+            if (Role != CoopRole.Host || _net == null || amount <= 0f)
+                return;
+            Broadcast(new NpcMoneyPopupMessage
+            {
+                Index = index,
+                Identity = identity,
+                Amount = amount,
+                OffsetUp = offsetUp,
+            });
+        }
+
         /// <summary>Both roles: mirror a collection change (pack pull, trash, sale) to the
         /// other side so there is one shared binder.</summary>
         public void ForwardCardDelta(CardData card, int amount, bool isAdd)
@@ -2408,7 +3021,7 @@ namespace CardShopCoop
             {
                 rd = InventoryBase.GetRestockData(restockIndex);
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
             if (rd == null)
                 return;
             _lastLicenseBuyTime = UnityEngine.Time.realtimeSinceStartupAsDouble;
@@ -2446,18 +3059,18 @@ namespace CardShopCoop
                 {
                     AchievementManager.OnItemLicenseUnlocked((EItemType)itemType);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
                 try
                 {
                     GameInstance.m_IsItemLicenseUnlocked = true;
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
                 try
                 {
                     if ((EItemType)itemType == EItemType.BasicCardBox)
                         TutorialManager.AddTaskValue(ETutorialTaskCondition.UnlockBasicCardBox, 1f);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
             finally { Patches.GamePatches.ApplyingRemoteLicense = false; }
             RefreshLicensePanels();
@@ -2488,14 +3101,14 @@ namespace CardShopCoop
                     {
                         on = CPlayerData.GetIsItemLicenseUnlocked(idx);
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                     if (!on)
                         continue;
                     (FiPanelLicGrp?.GetValue(p) as GameObject)?.SetActive(false);
                     (FiPanelUIGrp?.GetValue(p) as GameObject)?.SetActive(true);
                 }
             }
-            catch { }
+            catch (System.Exception e) { Swallow.Log(e); }
         }
 
         // ---- product catalog diagnosis: content DATA packs (PTCGO expansions) are
@@ -2646,7 +3259,7 @@ namespace CardShopCoop
                     return bytes.Length + "#" + h.ToString("x16");
                 }
             }
-            catch { return "?"; }
+            catch (System.Exception e) { Swallow.Log(e); return "?"; }
         }
 
         private static long CatalogKey(int type, bool big, int nameHash)
@@ -2834,14 +3447,19 @@ namespace CardShopCoop
             // Harmony callbacks can arrive while transport and world teardown are in progress.
             // Drop all static module entry points first so they cannot touch the old instance
             // state (or a newly loaded world's objects).
-            ClearLiveModuleHooks();
+            bool hadModuleRegistry = _moduleRegistry != null;
+            if (hadModuleRegistry)
+            {
+                _moduleRegistry.Dispose();
+                _moduleRegistry = null;
+            }
             if (_net != null)
             {
                 try
                 {
                     Broadcast(new ByeMessage { Reason = "session ended" });
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
                 _net.Stop();
                 _net = null;
             }
@@ -2894,6 +3512,7 @@ namespace CardShopCoop
             _priceWarnedKeys.Clear(); // the once-per-session warn memo is per session
             _dispatchBuf.Clear();   // leftovers held back by the per-frame dispatch budget
             _dispatchRetryNextFrame.Clear();
+            _dispatchHeldTransfers.Clear();
             _dispatchSeen.Clear();
             _gotStateFrom.Clear();
             _saveBuf = null;
@@ -2904,7 +3523,8 @@ namespace CardShopCoop
             _worldRequested = false;
             _hasLastPos = false;
             _lastCoinSent = double.MinValue;
-            _lastPriceHash = 0;
+            _priceFullPending = true; // first host tick after a session reset sends the whole table
+            _pricePending.Clear();
             // card-price heal change-gate: a re-host inheriting the PREVIOUS world's hash
             // would gate away the new world's very first price sync (the guests would sit on
             // whatever they had until something moved), so it resets with the session.
@@ -2914,14 +3534,13 @@ namespace CardShopCoop
             _cardPriceHealDirty = true; // preserve the first post-join price sync
             _cardPriceHealTimer = -2.1f;
             _lastProgressSent = long.MinValue;
-            _world.Reset();
-            _npcs.Reset();
-            _cardShelves.Reset();
-            _objMoves.Reset();
-            _movePreview.Reset();
-            _boxes.Reset();
-            _population.Reset();
-            ModulesReset();
+            if (!hadModuleRegistry)
+            {
+                // No live registry (e.g. quitting from the title screen): fall back to the
+                // per-instance resets. A session that had a registry was already reset by
+                // CoopModuleRegistry.Dispose, so re-resetting here would be redundant.
+                ResetAllModules();
+            }
             _lastShopNameSent = null;
             // UNCONDITIONAL PATH: Shutdown runs from OnDestroy and OnApplicationQuit, i.e.
             // on EVERY game exit and every LAN session too. The null-conditional is what
@@ -2972,6 +3591,8 @@ namespace CardShopCoop
             Role = CoopRole.None;
             ClientReloading = false;
             _clientWorldArrived = false;
+            _sessionInGame = false;
+            _dispatchDeferredFrames = 0;
             IsTearingDown = false;
             // Only clear the save guard if we're NOT in a level - i.e. a join that failed at
             // the title before loading the host's world. A mid-session disconnect leaves the
@@ -3080,6 +3701,15 @@ namespace CardShopCoop
             }
             else
                 _avatars.DestroyPreview();
+            if (_localModelAuto)
+            {
+                _localModelAutoRetry -= Time.deltaTime;
+                if (_localModelAutoRetry <= 0f && InGameLevel())
+                {
+                    _localModelAutoRetry = 1f;
+                    EnsureLocalPlayerModel();
+                }
+            }
             FlushLocalModelSave(Time.deltaTime);
 
             // A day transition can arrive while the guest is changing scenes or has a
@@ -3101,6 +3731,13 @@ namespace CardShopCoop
             }
             if (_net == null)
                 return;
+
+            if (!_sessionInGame && InGameLevel())
+            {
+                _sessionInGame = true;
+                _dispatchDeferredFrames = 0;
+                CoopPlugin.Log.LogInfo("Dispatch session gate opened after entering the game world");
+            }
 
             Guarded("net-pump", _actNetPump);
 
@@ -3137,6 +3774,7 @@ namespace CardShopCoop
                     _playerModels.Remove(left);
                 if (Role == CoopRole.Host)
                 {
+                    _world.HostReleaseConn(left);
                     // release anything the departed guest was CARRYING: the set-down
                     // request is never coming, and without this the boxes stay hidden /
                     // worker-locked / carried-frozen on every peer until a full shutdown
@@ -3146,34 +3784,29 @@ namespace CardShopCoop
                     // re-asserts its carry on its next ~0.5s report).
                     try
                     {
-                        _boxes.HostReleaseConn(left);
+                        _boxEngine?.HostReleaseConn(left);
                     }
-                    catch { }
-                    try
-                    {
-                        _cardBoxes.HostReleaseRemoteCarried();
-                    }
-                    catch { }
-                    try
-                    {
-                        _furnBoxes.HostReleaseRemoteCarried();
-                    }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                     try
                     {
                         _register.HostReleaseConn(left);
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                     try
                     {
                         _staff.HostReleaseConn(left);
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                     try
                     {
                         _containers.HostReleaseConn(left);
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
+                    try
+                    {
+                        _trades.HostReleaseConn(left);
+                    }
+                    catch (System.Exception e) { Swallow.Log(e); }
                     // and DROP any product still held for the departed guest: its charge
                     // is never coming, and the fail-open pump would otherwise deliver the
                     // product chargeless 1.5s from now. Its charge verdict goes too.
@@ -3212,16 +3845,77 @@ namespace CardShopCoop
             // Anything last frame's budget held back is still at the FRONT of _dispatchBuf, in
             // order; the fresh drain appends after it. The coalescer then re-runs over the
             // combined buffer, so a stale leftover snapshot still loses to a newer one.
-            while (_net != null && _net.Incoming.TryDequeue(out var msg))
+            if (_dispatchHeldTransfers.Count > 0 && _dispatchBuf.Count < DispatchBacklogCap)
+            {
+                _dispatchBuf.Add(_dispatchHeldTransfers[0]);
+                _dispatchHeldTransfers.RemoveAt(0);
+            }
+            bool canDrainIncoming = _dispatchHeldTransfers.Count == 0;
+            while (canDrainIncoming && _net != null && _net.Incoming.TryDequeue(out var msg))
+            {
+                if (_dispatchBuf.Count >= DispatchBacklogCap)
+                {
+                    int drop = FindBufferedSnapshot();
+                    if (drop >= 0)
+                        _dispatchBuf.RemoveAt(drop);
+                    else
+                    {
+                        bool transferMessage = IsTransferMessage(msg.Type);
+                        if (transferMessage)
+                        {
+                            if (!_dispatchTransferOverflowWarned)
+                            {
+                                _dispatchTransferOverflowWarned = true;
+                                CoopPlugin.Log.LogWarning($"Dispatch backlog cap reached; bounding transfer admission for {msg.Type}");
+                            }
+                            _dispatchHeldTransfers.Add(msg);
+                            break;
+                        }
+                        if (!_dispatchBacklogWarned)
+                        {
+                            _dispatchBacklogWarned = true;
+                            CoopPlugin.Log.LogWarning("Dispatch backlog cap reached; dropping incoming traffic until it drains");
+                        }
+                        if (!_dispatchTransferHardDropWarned)
+                        {
+                            _dispatchTransferHardDropWarned = true;
+                            CoopPlugin.Log.LogError($"Dispatch backlog hard-drop path consumed non-transfer message {msg.Type}");
+                        }
+                        // A dropped BoxSnapshot is not self-healing (the host's content hash
+                        // already advanced and it is never re-sent), so ask for a fresh one.
+                        // Use the coalesced/rate-limited request so a sustained flood cannot
+                        // form a request/response loop.
+                        if (msg.Type == MsgType.BoxSnapshot)
+                            _boxEngine?.RequestResyncCoalesced();
+                        else if (IsSingleShotOp(msg.Type))
+                            _messageRouter.Heal(msg.Type);
+                        continue;
+                    }
+                }
                 _dispatchBuf.Add(msg);
+            }
+            if (_dispatchBuf.Count < DispatchBacklogCap / 2)
+            {
+                _dispatchBacklogWarned = false;
+                _dispatchTransferOverflowWarned = false;
+                _dispatchTransferHardDropWarned = false;
+            }
             if (_dispatchBuf.Count > 8)
             {
                 _dispatchSeen.Clear();
                 for (int i = _dispatchBuf.Count - 1; i >= 0; i--)
                 {
                     var t = _dispatchBuf[i].Type;
+                    // Only full-replacement state may be coalesced: PlayerState is the latest
+                    // pose, RegisterState/RegisterCart and PopState are complete rosters, so the
+                    // newest frame fully supersedes older ones. BoxSnapshot is deliberately NOT
+                    // here: a Full carries every box while a Partial carries only changes, and
+                    // the box engine has no periodic full scan. Dropping a Full strands every
+                    // unchanged box; dropping an intermediate Partial strands that box's change
+                    // (the host's hash already advanced, so it is never re-sent). Apply the whole
+                    // reliable sequence in order instead.
                     if (t != MsgType.PlayerState && t != MsgType.RegisterState
-                        && t != MsgType.RegisterCart && t != MsgType.BoxState && t != MsgType.PopState)
+                        && t != MsgType.RegisterCart && t != MsgType.PopState)
                         continue;
                     long key = ((long)t << 32) | (uint)_dispatchBuf[i].ConnId;
                     if (!_dispatchSeen.Add(key))
@@ -3251,15 +3945,59 @@ namespace CardShopCoop
                     break; // next frame's work
                 dispatched++;
                 unitsSpent += cost;
-                consumed = i + 1;
                 InMsg current = _dispatchBuf[i];
                 try
                 {
-                    Dispatch(current);
+                    if (!Dispatch(current))
+                    {
+                        if (!_sessionInGame)
+                        {
+                            consumed = i + 1;
+                            if (current.Type == MsgType.BoxSnapshot)
+                                _boxEngine?.RequestResyncCoalesced();
+                            continue;
+                        }
+                        if (!_messageRouter.IsTransientInGameGate(new MessageContext
+                        {
+                            ConnectionId = current.ConnId,
+                            Role = Role,
+                            InGame = InGameLevel(),
+                            Transport = _net
+                        }, current.Message))
+                        {
+                            if (!_dispatchRoleDeniedWarned)
+                            {
+                                _dispatchRoleDeniedWarned = true;
+                                CoopPlugin.Log.LogWarning($"Dispatch: dropping {current.Type} due to role mismatch");
+                            }
+                            consumed = i + 1;
+                            continue;
+                        }
+                        _dispatchDeferredFrames++;
+                        if (_dispatchDeferredFrames > MaxDispatchDeferredFrames)
+                        {
+                            CoopPlugin.Log.LogError($"Dispatch: dropping gated head {current.Type} after {MaxDispatchDeferredFrames} deferred frames");
+                            _messageRouter.Heal(current.Type);
+                            consumed = i + 1;
+                            _dispatchDeferredFrames = 0;
+                            continue;
+                        }
+                        if (!_dispatchDeferredWarned)
+                        {
+                            _dispatchDeferredWarned = true;
+                            CoopPlugin.Log.LogWarning($"Dispatch queue waiting for in-game gate before applying {current.Type}");
+                        }
+                        consumed = i;
+                        break;
+                    }
+                    _dispatchDeferredWarned = false;
+                    _dispatchDeferredFrames = 0;
+                    consumed = i + 1;
                 }
                 catch (Exception e)
                 {
-                    bool retryable = IsRetryableDispatch(current.Type);
+                    consumed = i + 1;
+                    bool retryable = _messageRouter.IsRetryable(current.Type);
                     CoopPlugin.Log.LogError($"Dispatch conn={current.ConnId} type={current.Type} "
                         + (retryable ? "delta/op" : "snapshot") + " failed: " + e);
                     if (retryable && current.DispatchAttempts < MaxDispatchRetries)
@@ -3269,9 +4007,14 @@ namespace CardShopCoop
                     }
                     else
                     {
+                        // No retries happen for a non-retryable type, so do not report it as
+                        // one: the old wording claimed "retries" for every failure.
+                        string detail = retryable
+                            ? $"dropped after {current.DispatchAttempts} retry attempt(s)"
+                            : "failed (non-retryable)";
                         CoopPlugin.Log.LogError($"Dispatch conn={current.ConnId} type={current.Type} "
-                            + "dropped after bounded retries; requesting authoritative heal");
-                        RequestDispatchHeal(current.Type);
+                            + detail + "; requesting authoritative heal");
+                        _messageRouter.Heal(current.Type);
                     }
                 }
                 if (_net == null)
@@ -3284,12 +4027,15 @@ namespace CardShopCoop
                 _dispatchBuf.Clear();
             else if (consumed > 0)
                 _dispatchBuf.RemoveRange(0, consumed);
+            if (_dispatchBuf.Count == 0)
+            {
+                _dispatchDeferredWarned = false;
+                _dispatchRoleDeniedWarned = false;
+            }
             if (_net == null)
                 return;
 
             float dt = Time.deltaTime;
-            if (_errLogCooldown > 0f)
-                _errLogCooldown -= dt;
 
             // Every stage is individually armored: one failing subsystem must degrade
             // that feature only, never kill position sync for the whole session.
@@ -3358,10 +4104,10 @@ namespace CardShopCoop
                     {
                         int local = NpcSync.CountLocalActiveNpcs();
                         npcStr = Role == CoopRole.Client
-                            ? $" puppets={_npcs.PuppetCount} localNpcs={local}(should be 0)"
+                            ? $" puppets={_npcs.PuppetCount} localNpcs={NpcSync.CountUnexpectedActiveNpcs()}(should be 0) carriers={RegisterSync.CarrierCount} mirrors={NpcSync.ExistingMirrorCount}"
                             : $" liveNpcs={local}";
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                 }
                 CoopPlugin.Log.LogInfo($"diag: role={Role} conns={_net.ConnectionCount} sentStates={_diagSent} recvStates={_diagRecvStates} inGame={InGameLevel()} pos={posStr}{npcStr}");
             }
@@ -3470,6 +4216,34 @@ namespace CardShopCoop
                 Send(1, new ShelfRequestMessage { Entries = changes });
         }
 
+        private int FindBufferedSnapshot()
+        {
+            for (int i = 0; i < _dispatchBuf.Count; i++)
+            {
+                var type = _dispatchBuf[i].Type;
+                if (type == MsgType.PlayerState || type == MsgType.RegisterState
+                    || type == MsgType.RegisterCart || type == MsgType.PopState)
+                    return i;
+            }
+            return -1;
+        }
+
+        private static bool IsTransferMessage(MsgType type)
+        {
+            return type == MsgType.BoxUpdate || type == MsgType.BoxTransferResult
+                || type == MsgType.ShelfRequest || type == MsgType.ShelfTransferResult;
+        }
+
+        /// <summary>Host: one item price entry changed (player/worker/EPL, or a joiner
+        /// contribution we just applied); batch it for a partial broadcast next tick.</summary>
+        public void NoteItemPriceChanged(EItemType itemType, float price)
+        {
+            int t = (int)itemType;
+            if (t < 0 || t > 500000)
+                return;
+            _pricePending[t] = price;
+        }
+
         private void HostTick(float dt)
         {
             if (_net.ConnectionCount == 0)
@@ -3480,10 +4254,11 @@ namespace CardShopCoop
                 Guarded("npc-collect", _actNpcCollect);
             }
 
-            _priceTimer += dt;
-            if (_priceTimer >= 3f)
+            if (_priceFullPending)
             {
-                _priceTimer -= 3f;
+                _priceFullPending = false;
+                _pricePending.Clear(); // a full table supersedes any queued partials
+                long tPrice = Util.PerfProbe.Start();
                 try
                 {
                     // the table is indexed by RAW itemType and EPL registers modded items
@@ -3499,7 +4274,6 @@ namespace CardShopCoop
                     var seenTypes = _priceSeenTypes;
                     seenTypes.Clear();
                     int n = CatalogCount();
-                    int hash = 17;
                     for (int i = 0; i < n; i++)
                     {
                         var rd = CatalogAt(i);
@@ -3513,29 +4287,28 @@ namespace CardShopCoop
                         {
                             v = CPlayerData.GetItemPrice(rd.itemType, preventZero: false);
                         }
-                        catch { }
+                        catch (System.Exception e) { Swallow.Log(e); }
                         if (v == 0f)
                             continue;
                         _priceBuf.Add(new KeyValuePair<int, float>(t, v));
-                        hash = hash * 31 + t;
-                        hash = hash * 31 + v.GetHashCode();
                     }
-                    // heal beat: the hash updates BEFORE the send, so a single failed
-                    // or lost broadcast used to leave those prices stale FOREVER (tag
-                    // stuck at "-" on the joiner until the next unrelated price change).
-                    // Every other snapshot engine already has a slow heal; now this does
-                    _priceHeal += 3f;
-                    if (hash != _lastPriceHash || _priceHeal >= 30f)
-                    {
-                        _lastPriceHash = hash;
-                        _priceHeal = 0f;
-                        var priceList = new PriceListMessage();
-                        for (int i = 0; i < _priceBuf.Count; i++)
-                            priceList.Prices.Add(new PriceEntry { ItemType = _priceBuf[i].Key, Price = _priceBuf[i].Value });
-                        Broadcast(priceList);
-                    }
+                    var fullList = new PriceListMessage { Full = true };
+                    for (int i = 0; i < _priceBuf.Count; i++)
+                        fullList.Prices.Add(new PriceEntry { ItemType = _priceBuf[i].Key, Price = _priceBuf[i].Value });
+                    Broadcast(fullList);
+                    Util.PerfProbe.End("price-sync", tPrice);
                 }
                 catch (Exception e) { CoopPlugin.Log.LogWarning("price sync: " + e.Message); }
+            }
+            else if (_pricePending.Count > 0)
+            {
+                // Per-change partial: the SetItemPrice hook already names the exact entry that
+                // moved, so there is no catalog walk. Reliable, so a send is a delivery.
+                var partial = new PriceListMessage { Full = false };
+                foreach (var kv in _pricePending)
+                    partial.Prices.Add(new PriceEntry { ItemType = kv.Key, Price = kv.Value });
+                _pricePending.Clear();
+                Broadcast(partial);
             }
 
             _shopNameTimer += dt;
@@ -3776,7 +4549,7 @@ namespace CardShopCoop
                         {
                             on = CPlayerData.GetIsItemLicenseUnlocked(i);
                         }
-                        catch { }
+                        catch (System.Exception e) { Swallow.Log(e); }
                         if (!on)
                             continue;
                         var rd = CatalogAt(i);
@@ -3830,7 +4603,7 @@ namespace CardShopCoop
                             min = (int)FiTimeMin.GetValue(_lightManager);
                     }
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
                 int day = CPlayerData.m_CurrentDay;
                 float minFloat = min;
                 try
@@ -3838,22 +4611,28 @@ namespace CardShopCoop
                     if (_lightManager != null && FiTimeMinFloat != null)
                         minFloat = (float)FiTimeMinFloat.GetValue(_lightManager);
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
                 bool shopOnceOpen = CPlayerData.m_IsShopOnceOpen;
                 Broadcast(new DayTimeMessage { Day = day, Hour = hour, Minute = min, MinuteFloat = minFloat, ShopOnceOpen = shopOnceOpen });
             }
         }
 
-        private void Dispatch(InMsg msg)
+        private bool Dispatch(InMsg msg)
         {
-            if (msg.Message != null && _messageRouter.Dispatch(new MessageContext
+            if (msg.Message != null)
             {
-                ConnectionId = msg.ConnId,
-                Role = Role,
-                InGame = InGameLevel(),
-                Transport = _net
-            }, msg.Message))
-                return;
+                bool routed = _messageRouter.Dispatch(new MessageContext
+                {
+                    ConnectionId = msg.ConnId,
+                    Role = Role,
+                    InGame = InGameLevel(),
+                    Transport = _net
+                }, msg.Message);
+                if (routed)
+                    return true;
+                if (_messageRouter.IsRegistered(msg.Message))
+                    return false;
+            }
             switch (msg.Type)
             {
                 case MsgType.Hello:
@@ -4143,6 +4922,18 @@ namespace CardShopCoop
                                 Shutdown("wire protocol mismatch");
                                 break;
                             }
+                            if (!string.Equals(welcome.Version, CoopPlugin.Version, StringComparison.Ordinal))
+                            {
+                                Shutdown("plugin version mismatch (host " + welcome.Version + ", client " + CoopPlugin.Version + ")");
+                                break;
+                            }
+                            if (welcome.SaveLength <= 0 || welcome.SaveLength > MaxWorldTransferBytes
+                                || welcome.BundleLength < 0 || welcome.BundleLength > MaxWorldTransferBytes)
+                            {
+                                CoopPlugin.Log.LogError($"Welcome advertised invalid transfer lengths save={welcome.SaveLength} bundle={welcome.BundleLength} (cap {MaxWorldTransferBytes})");
+                                Shutdown("invalid world download lengths");
+                                break;
+                            }
                             string hostName = ResolvePeerName(welcome.SteamId, welcome.HostName ?? "");
                             _saveExpected = welcome.SaveLength;
                             _hostSlot = welcome.HostSlot;
@@ -4191,8 +4982,8 @@ namespace CardShopCoop
                             // opened, while the UI can later submit richer CC slider data.
                             EnsureLocalPlayerModel();
                             SubmitLocalPlayerModel();
-                            _saveBuf = new MemoryStream(_saveExpected > 0 ? _saveExpected : 1024);
-                            _bundleBuf = new MemoryStream(_bundleExpected > 0 ? _bundleExpected : 16);
+                            _saveBuf = new MemoryStream(1024);
+                            _bundleBuf = new MemoryStream(1024);
                             StatusLine = $"Downloading {hostName}'s shop ({(_saveExpected + _bundleExpected) / 1024} KB)...";
                         }
                         break;
@@ -4204,6 +4995,12 @@ namespace CardShopCoop
                         if (msg.Message is SaveChunkMessage saveChunk)
                         {
                             var bytes = saveChunk.Data ?? new byte[0];
+                            if (_saveExpected >= 0 && _saveBuf.Length + bytes.Length > _saveExpected)
+                            {
+                                CoopPlugin.Log.LogError($"Save download exceeded advertised length {_saveExpected}; rejecting session");
+                                Shutdown("bad download");
+                                break;
+                            }
                             _saveBuf.Write(bytes, 0, bytes.Length);
                             if (_saveExpected > 0)
                                 StatusLine = $"downloading shop... {Math.Min(100, _saveBuf.Length * 100 / _saveExpected)}%";
@@ -4224,7 +5021,9 @@ namespace CardShopCoop
                         }
                         try
                         {
-                            data = Msg.Gunzip(data);
+                            data = GunzipCappedBytes(data, Msg.MaxFrameSize);
+                            if (data == null)
+                                throw new InvalidDataException("save exceeded decompression cap");
                         }
                         catch
                         {
@@ -4249,6 +5048,12 @@ namespace CardShopCoop
                         if (msg.Message is BundleChunkMessage bundleChunk)
                         {
                             var bytes = bundleChunk.Data ?? new byte[0];
+                            if (_bundleExpected >= 0 && _bundleBuf.Length + bytes.Length > _bundleExpected)
+                            {
+                                CoopPlugin.Log.LogError($"Bundle download exceeded advertised length {_bundleExpected}; rejecting session");
+                                Shutdown("bad download");
+                                break;
+                            }
                             _bundleBuf.Write(bytes, 0, bytes.Length);
                             if (_bundleExpected > 0)
                                 StatusLine = $"downloading mod data... {Math.Min(100, _bundleBuf.Length * 100 / _bundleExpected)}%";
@@ -4285,7 +5090,9 @@ namespace CardShopCoop
                         try
                         {
                             if (bundle.Length > 0)
-                                bundle = Msg.Gunzip(bundle);
+                                bundle = GunzipCappedBytes(bundle, Msg.MaxFrameSize);
+                            if (bundle == null)
+                                throw new InvalidDataException("bundle exceeded decompression cap");
                         }
                         catch (Exception e)
                         {
@@ -4329,692 +5136,15 @@ namespace CardShopCoop
                         _reloadStartedFrame = Time.frameCount;
                         break;
                     }
-                case MsgType.ShelfDelta:
-                    {
-                        // Dropping deltas while not in the game scene is safe (the world just
-                        // loaded from the host's save; the host keeps re-diffing changes) and
-                        // avoids touching scene managers that don't exist yet.
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is ShelfDeltaMessage shelfDelta)
-                            _world.ApplyRemote(shelfDelta.Entries);
-                        break;
-                    }
-                case MsgType.ShelfRequest:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is ShelfRequestMessage shelfRequest)
-                        {
-                            var entries = shelfRequest.Entries;
-                            _world.ApplyRemote(entries);
-                            // applying updates the host's diff baseline, so its own tick
-                            // never re-detects this change - with 3+ players the OTHER
-                            // clients must be told explicitly
-                            if (_net.ConnectionCount > 1)
-                                Broadcast(new ShelfDeltaMessage { Entries = entries });
-                        }
-                        break;
-                    }
-                case MsgType.PriceList:
-                    {
-                        if (Role != CoopRole.Client)
-                            break;
-                        if (msg.Message is PriceListMessage priceList)
-                        {
-                            Patches.GamePatches.ApplyingRemotePrice = true; // don't echo these back
-                            try
-                            {
-                                _incomingPriced.Clear();
-                                int changed = 0;
-                                for (int k = 0; k < priceList.Prices.Count; k++)
-                                {
-                                    var priceEntry = priceList.Prices[k];
-                                    // Both sets below are keyed by LOCAL item ids (they are compared
-                                    // against our own catalog and against _myItemPriceEdits), so the
-                                    // translation has to happen here, before anything is recorded.
-                                    bool known = Util.EnumMap.TryFromWire(Util.EnumKind.ItemType, priceEntry.ItemType, out int i);
-                                    float v = priceEntry.Price;
-                                    // A price for a product only the HOST has: there is nothing local
-                                    // to price, and - critically - it must NOT be recorded as priced,
-                                    // because every unmappable id would collapse onto the same None
-                                    // sentinel and the clear pass below reads this set.
-                                    if (!known)
-                                        continue;
-                                    _incomingPriced.Add(i);
-                                    if (i < 0 || i > 500000)
-                                        continue;
-                                    // this table was built BEFORE our own ItemPriceContrib landed:
-                                    // for a few seconds our fresh edit outranks it (it still counts
-                                    // as "priced" above, so the clear pass below leaves it alone)
-                                    if (HeldLocalItemPrice(i, v))
-                                        continue;
-                                    // write through the game's WOVEN SetItemPrice: raw list
-                                    // writes for modded types land in a shadow list the game
-                                    // never reads (EPL routes those rows to its own save
-                                    // data), which kept joiner tags at "-" while the value
-                                    // "applied" - and SetItemPrice fires the tag-repaint
-                                    // event itself
-                                    float cur = 0f;
-                                    try
-                                    {
-                                        cur = CPlayerData.GetItemPrice((EItemType)i, preventZero: false);
-                                    }
-                                    catch { }
-                                    if (Math.Abs(cur - v) > 0.0001f)
-                                    {
-                                        try
-                                        {
-                                            CPlayerData.SetItemPrice((EItemType)i, v);
-                                            changed++;
-                                        }
-                                        catch { }
-                                    }
-                                }
-                                // stale-price reports were undiagnosable: applies were silent
-                                if (changed > 0)
-                                    CoopPlugin.Log.LogInfo($"price apply: {changed} price(s) updated from host");
-                                // a price the host CLEARED is absent from the sparse set.
-                                // BOTH sets hold LOCAL ids now, so this stays an apples-to-apples
-                                // comparison. A host-only product can never be zeroed here: it never
-                                // resolved, so it was never added above and so cannot be in
-                                // _clientPriced either. One-sided content packs keep their prices.
-                                foreach (int i in _clientPriced)
-                                    if (!_incomingPriced.Contains(i) && i >= 0 && i <= 500000)
-                                    {
-                                        // a clear is an overwrite too: the host simply hasn't seen
-                                        // our brand-new price yet
-                                        if (HeldLocalItemPrice(i, 0f))
-                                            continue;
-                                        float cur = 0f;
-                                        try
-                                        {
-                                            cur = CPlayerData.GetItemPrice((EItemType)i, preventZero: false);
-                                        }
-                                        catch { }
-                                        if (cur != 0f)
-                                        {
-                                            try
-                                            {
-                                                CPlayerData.SetItemPrice((EItemType)i, 0f);
-                                            }
-                                            catch { }
-                                        }
-                                    }
-                                var tmp = _clientPriced;
-                                _clientPriced = _incomingPriced;
-                                _incomingPriced = tmp;
-                            }
-                            finally { Patches.GamePatches.ApplyingRemotePrice = false; }
-                        }
-                        break;
-                    }
-                case MsgType.DayTime:
-                    {
-                        if (Role != CoopRole.Client)
-                            break;
-                        var timeMessage = msg.Message as DayTimeMessage;
-                        if (timeMessage == null)
-                            break;
-                        {
-                            int day = timeMessage.Day;
-                            int hour = timeMessage.Hour;
-                            int min = timeMessage.Minute;
-                            float minFloat = timeMessage.MinuteFloat;
-                            bool shopOnceOpen = timeMessage.ShopOnceOpen;
-                            if (!_loggedTimeLink)
-                            {
-                                _loggedTimeLink = true;
-                                CoopPlugin.Log.LogInfo($"Time link active (Day {day} {hour:00}:{min:00})");
-                            }
-                            HostTimeLine = $"Day {day + 1}  {hour:00}:{min:00}"; // HUD shows day+1
-                            bool dayChanged = day != CPlayerData.m_CurrentDay;
-                            CPlayerData.m_CurrentDay = day;
-                            // Match the host's clock gate. Forcing this true made a client advance
-                            // through a new morning while the host was still waiting to open shop.
-                            CPlayerData.m_IsShopOnceOpen = shopOnceOpen;
-                            if (dayChanged)
-                                MarkClientDayResetPending();
-                            try
-                            {
-                                if (_lightManager == null)
-                                    _lightManager = FindObjectOfType<LightManager>();
-                                if (_lightManager != null)
-                                {
-                                    EnforceClientClock(_lightManager);
-                                    // Always apply the host clock, even while a morning reset is
-                                    // pending. The old gate let the local clock run unchecked until
-                                    // it reached night, then dropped every lighting correction.
-                                    FiTimeHour?.SetValue(_lightManager, hour);
-                                    FiTimeMin?.SetValue(_lightManager, min);
-                                    FiTimeMinFloat?.SetValue(_lightManager, minFloat);
-                                    MiEvaluateTimeClock?.Invoke(_lightManager, null);
-                                    if (hour < 21)
-                                        FiHasDayEnded?.SetValue(_lightManager, false);
-
-                                    if (dayChanged || _clientDayResetPending)
-                                        TryStartClientDayReset();
-                                }
-                            }
-                            catch (Exception e) { CoopPlugin.Log.LogWarning("day-time apply: " + e.Message); }
-                        }
-                        break;
-                    }
-                case MsgType.RelayTag:
-                    {
-                        if (Role != CoopRole.Client)
-                            break;
-                        var relayTag = msg.Message as RelayTagMessage;
-                        if (relayTag == null)
-                            break;
-                        {
-                            int senderId = relayTag.SenderId;
-                            byte kind = relayTag.Kind;
-                            int extra = (int)relayTag.Extra;
-                            if (senderId == _selfId)
-                                break;
-                            if (kind == 0)
-                                _avatars.ShowEmote(1000 + senderId);
-                            else
-                            {
-                                _avatars.ShowTag(1000 + senderId, "opening a pack!", 3f);
-                                _avatars.ShowPackOpen(1000 + senderId, extra);
-                            }
-                        }
-                        break;
-                    }
-                // Nothing has sent a single CardDelta since the outbox landed (SendCardDeltaTo
-                // still does, and older internal senders may), so this case stays exactly as
-                // it was; CardDeltaBatch below runs the very same per-delta logic in a loop.
-                case MsgType.CardDelta:
-                    {
-                        if (msg.Message is CardDeltaMessage cardDelta)
-                        {
-                            if (!ApplyOrHoldCardDelta(cardDelta.IsAdd, cardDelta.Amount, cardDelta.Card, out bool relayAnyway) && !relayAnyway)
-                                break; // held for the level load, or genuinely refused: don't propagate
-                                       // relayAnyway == this PC lacks the content pack but the delta is sound;
-                                       // a third player who HAS it still needs it, so fall through to the relay.
-                                       // Shared collection: a card a guest gained/lost has to reach the OTHER
-                                       // guests too, or their binder totals drift out of sync in 3+ player
-                                       // sessions. Forward to everyone except the sender.
-                            RelayToOthers(msg.ConnId, msg.Message);
-                        }
-                        break;
-                    }
-                case MsgType.CardDeltaBatch:
-                    {
-                        // the host only needs the per-delta rebuild when it actually has other
-                        // guests to relay to; snapshot BEFORE applying, because the game's AddCard
-                        // path may mutate the CardData we hand it
-                        bool needFiltered = Role == CoopRole.Host && _net != null && _net.ConnectionCount > 1;
-                        _batchRelayBuf.Clear();
-                        int total = 0, applied = 0, relayedOnly = 0;
-                        if (msg.Message is CardDeltaBatchMessage batchMessage)
-                        {
-                            total = batchMessage.Deltas.Count;
-                            if (total < 0 || total > CardDeltaBatchMax)
-                            {
-                                CoopPlugin.Log.LogWarning($"card delta batch: bogus count {total} - dropped");
-                                break;
-                            }
-                            for (int i = 0; i < total; i++)
-                            {
-                                var delta = batchMessage.Deltas[i];
-                                bool isAdd = delta.IsAdd;
-                                int amount = delta.Amount;
-                                CardData card = delta.Card;
-                                var relayCopy = needFiltered ? SnapshotCard(card) : null;
-                                bool ok, relayAnyway = false;
-                                try
-                                {
-                                    ok = ApplyOrHoldCardDelta(isAdd, amount, card, out relayAnyway);
-                                }
-                                catch (Exception e)
-                                {
-                                    CoopPlugin.Log.LogWarning($"card delta batch: delta {i + 1}/{total} failed to apply ({e.Message}) - skipped");
-                                    continue; // one bad delta costs one delta, not the batch
-                                }
-                                // A delta this PC can't hold because it lacks the content pack still
-                                // belongs in the relay set (its snapshot was taken BEFORE the apply,
-                                // same as the applied ones) - a third player may have that pack.
-                                if (!ok && !relayAnyway)
-                                    continue;
-                                if (ok)
-                                    applied++;
-                                else
-                                    relayedOnly++;
-                                if (needFiltered)
-                                    _batchRelayBuf.Add(new PendingCard { IsAdd = isAdd, Amount = amount, Card = relayCopy });
-                            }
-                        }
-                        // Same shared-collection fan-out as CardDelta, and it runs on EVERY exit
-                        // path above (clean, read-fault, apply-fault). The ORIGINAL bytes go out
-                        // untouched only when every delta applied here and none was merely forwarded
-                        // (encoded grades verbatim); otherwise the filtered rebuild carries the
-                        // accepted deltas PLUS the ones this PC lacks the content for - a delta we
-                        // genuinely refused (corrupt grade, would-go-negative, throw) must never
-                        // spread, exactly as in the single-delta case above.
-                        if (applied == total && relayedOnly == 0 && total > 0)
-                            RelayToOthers(msg.ConnId, msg.Message);
-                        else if (_batchRelayBuf.Count > 0)
-                            RelayCardDeltaBatchToOthers(msg.ConnId, _batchRelayBuf);
-                        break;
-                    }
-                case MsgType.NpcState:
-                    {
-                        if (Role != CoopRole.Client)
-                            break;
-                        if (msg.Message is NpcStateMessage npcState)
-                            _npcs.ApplyBatch(npcState, InGameLevel());
-                        break;
-                    }
-                case MsgType.NpcSpeech:
-                    {
-                        if (Role != CoopRole.Client)
-                            break;
-                        if (msg.Message is NpcSpeechMessage npcSpeech)
-                            _npcs.ShowSpeech(npcSpeech, InGameLevel());
-                        break;
-                    }
-                case MsgType.CardShelfDelta:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is CardShelfDeltaMessage cardShelfDelta)
-                            _cardShelves.ApplyRemote(cardShelfDelta.Entries);
-                        break;
-                    }
-                case MsgType.CardShelfRequest:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is CardShelfRequestMessage cardShelfRequest)
-                        {
-                            var entries = cardShelfRequest.Entries;
-                            _cardShelves.ApplyRemote(entries);
-                            if (_net.ConnectionCount > 1) // see ShelfRequest note
-                                Broadcast(new CardShelfDeltaMessage { Entries = entries });
-                        }
-                        break;
-                    }
-                case MsgType.BoxState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is BoxStateMessage boxState)
-                            _boxes.ClientApply(boxState.Entries);
-                        break;
-                    }
-                case MsgType.PopState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is PopStateMessage popState)
-                            _population.ClientApply(popState.Entries);
-                        break;
-                    }
-                case MsgType.BoxRequest:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is BoxRequestMessage boxRequest)
-                            _boxes.HostApplyRequest(boxRequest.Entries, msg.ConnId);
-                        break;
-                    }
-                case MsgType.BoxMovePreview:
-                    {
-                        if (!InGameLevel() || !(msg.Message is BoxMovePreviewMessage boxPreview))
-                            break;
-                        if (Role == CoopRole.Host)
-                        {
-                            boxPreview.SourceId = msg.ConnId;
-                            _boxes.ApplyRemotePreview(boxPreview, msg.ConnId);
-                            if (_net != null)
-                                foreach (int cid in _net.ConnIds())
-                                    if (cid != msg.ConnId)
-                                        _net.SendTransient(cid, boxPreview);
-                        }
-                        else if (Role == CoopRole.Client)
-                            _boxes.ApplyRemotePreview(boxPreview, boxPreview.SourceId);
-                        break;
-                    }
-                case MsgType.Toast:
-                    {
-                        if (Role != CoopRole.Client)
-                            break;
-                        if (msg.Message is ToastMessage toast)
-                        {
-                            RegisterLine = toast.Text ?? "";
-                            RegisterLineTimer = 8f;
-                            // support gold: the on-screen line vanishes in 8s, the log keeps it
-                            CoopPlugin.Log.LogInfo("host says: " + RegisterLine);
-                        }
-                        break;
-                    }
-                case MsgType.CatalogDigest:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is CatalogDigestMessage catalogDigest)
-                            CompareCatalogs(catalogDigest, msg.ConnId);
-                        break;
-                    }
-                case MsgType.GradedDigest:
-                    {
-                        // BOTH roles: the host compares a guest's digest, and a guest compares the
-                        // one the host sends back when it found a difference. On the client the peer
-                        // is always the host, so the diff is filed under conn 1 - the same id the
-                        // client sends to - rather than whatever the transport labelled the frame.
-                        if (Role == CoopRole.None || !InGameLevel())
-                            break;
-                        bool amHost = Role == CoopRole.Host;
-                        if (msg.Message is GradedDigestMessage gradedDigest)
-                            CompareGradedDigests(gradedDigest, amHost ? msg.ConnId : 1, amHost);
-                        break;
-                    }
-                case MsgType.BoxRemoved:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is BoxRemovedMessage boxRemoved)
-                        {
-                            int id = boxRemoved.Index;
-                            // HostApplyRemoval refuses the removal unless this type matches the
-                            // tracked box's own item type, so the id has to be in local terms. An
-                            // unmappable one lands on None, fails that guard, and the box is left
-                            // standing - the safe direction for a destructive op.
-                            int type = (int)boxRemoved.ItemType;
-                            string who = PeerNames.TryGetValue(msg.ConnId, out var n) ? n : "player";
-                            CoopPlugin.Log.LogInfo($"{who} trashed box id {id} ({(EItemType)type})");
-                            _boxes.HostApplyRemoval(id, type, msg.ConnId);
-                        }
-                        break;
-                    }
-                case MsgType.LicenseUnlock:
-                    {
-                        if (!InGameLevel())
-                            break;
-                        if (msg.Message is LicenseUnlockMessage licenseUnlock)
-                        {
-                            int itemType = (int)licenseUnlock.ItemType;
-                            bool isBig = licenseUnlock.IsBig;
-                            string rdName = licenseUnlock.RestockName;
-                            // Charge/product coupling (host only, charge-first): honor this
-                            // cart's charge verdict (accept -> process, decline -> drop with
-                            // toast) or hold a rare product-first straggler. Host-gated so the
-                            // host->clients echo (Role==Client on the receiver) is untouched.
-                            // LicenseUnlock is now a host broadcast; legacy inbound messages remain harmless.
-                            bool ok = ApplyLicenseUnlock(itemType, isBig, rdName);
-                            if (Role == CoopRole.Host)
-                            {
-                                if (ok) // echo to the other clients + confirm to the buyer
-                                {
-                                    Broadcast(new LicenseUnlockMessage
-                                    {
-                                        ItemType = (EItemType)itemType,
-                                        IsBig = isBig,
-                                        RestockName = rdName
-                                    });
-                                    Send(msg.ConnId, new ToastMessage { Text = $"license unlocked for everyone: {rdName}" });
-                                }
-                                else
-                                    Send(msg.ConnId, new ToastMessage { Text = $"'{rdName}' license couldn't unlock on the host (product missing) - match your content packs" });
-                            }
-                        }
-                        break;
-                    }
-                case MsgType.LicenseState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is LicenseStateMessage licenseState)
-                        {
-                            bool scanner = licenseState.Scanner;
-                            var wanted = new HashSet<long>();
-                            var wantedNames = new HashSet<long>();
-                            for (int i = 0; i < licenseState.Entries.Count; i++)
-                            {
-                                var e = licenseState.Entries[i];
-                                // The name key below is already machine-independent, but the ID key
-                                // is NOT a redundant spare: it is OR'd in, and matched against our
-                                // OWN rl[i].itemType, so an untranslated modded id from a permuted
-                                // registry is a false POSITIVE - it unlocks whichever local product
-                                // happens to wear that number. Translate it, and when the host has a
-                                // product we don't, add no id key at all rather than letting every
-                                // unmappable one collapse onto the None sentinel and match together.
-                                bool known = Util.EnumMap.TryFromWire(Util.EnumKind.ItemType, (int)e.ItemType, out int t);
-                                bool big = e.Big;
-                                int nameFnv = e.NameFnv;
-                                if (known)
-                                    wanted.Add(((long)t << 1) | (big ? 1L : 0L));
-                                wantedNames.Add(((long)(uint)nameFnv << 1) | (big ? 1L : 0L));
-                            }
-                            // don't re-lock during the window where our own purchase is
-                            // still round-tripping to the host
-                            bool allowLock = UnityEngine.Time.realtimeSinceStartupAsDouble
-                                - _lastLicenseBuyTime > 12.0;
-                            Guarded("license-apply", () =>
-                            {
-                                CPlayerData.m_IsScannerRestockUnlocked |= scanner;
-                                var rl = Inv().m_StockItemData_SO.m_RestockDataList;
-                                var flags = CPlayerData.m_IsItemLicenseUnlocked;
-                                bool anyUnlocked = false;
-                                for (int i = 0; i < rl.Count && i < flags.Count; i++)
-                                {
-                                    if (rl[i] == null)
-                                        continue;
-                                    long big = rl[i].isBigBox ? 1L : 0L;
-                                    bool should = wanted.Contains(((long)(int)rl[i].itemType << 1) | big)
-                                        || wantedNames.Contains(((long)(uint)Fnv(rl[i].name ?? "") << 1) | big);
-                                    if (should && !flags[i])
-                                    {
-                                        Patches.GamePatches.ApplyingRemoteLicense = true;
-                                        try
-                                        {
-                                            CPlayerData.SetUnlockItemLicense(i);
-                                        }
-                                        finally { Patches.GamePatches.ApplyingRemoteLicense = false; }
-                                        anyUnlocked = true;
-                                        try
-                                        {
-                                            if (rl[i].itemType == EItemType.BasicCardBox)
-                                                TutorialManager.AddTaskValue(ETutorialTaskCondition.UnlockBasicCardBox, 1f);
-                                        }
-                                        catch { }
-                                    }
-                                    else if (!should && flags[i] && i != 0 && allowLock)
-                                    {
-                                        // scrambled save-transfer flag (index order differs
-                                        // between machines): host truth says locked
-                                        flags[i] = false;
-                                    }
-                                }
-                                if (anyUnlocked)
-                                {
-                                    try
-                                    {
-                                        GameInstance.m_IsItemLicenseUnlocked = true;
-                                    }
-                                    catch { }
-                                    RefreshLicensePanels();
-                                }
-                            });
-                        }
-                        break;
-                    }
-                case MsgType.StaffOp:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is StaffOpMessage staffOp)
-                            _staff.HostApplyOp(staffOp, msg.ConnId);
-                        break;
-                    }
-                case MsgType.StaffInteract:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is StaffInteractMessage staffInteract)
-                            StaffSync.ClientInteractionMessage(staffInteract);
-                        break;
-                    }
-                case MsgType.StaffState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is StaffStateMessage staffState)
-                            _staff.ClientApplyState(staffState);
-                        break;
-                    }
-                case MsgType.ShopOp:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is ShopOpMessage shopOp)
-                            _shopState.HostApplyOp(shopOp);
-                        break;
-                    }
-                case MsgType.ShopState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is ShopStateMessage shopState)
-                            _shopState.ClientApplyState(shopState);
-                        break;
-                    }
-                case MsgType.SettingsOp:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is SettingsOpMessage settingsOp)
-                            _settings.HostApplyOp(settingsOp);
-                        break;
-                    }
-                case MsgType.SettingsState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is SettingsStateMessage settingsState)
-                            _settings.ClientApplyState(settingsState);
-                        break;
-                    }
-                case MsgType.TvOp:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is TvOpMessage tvOp)
-                            _tv.HostApplyOp(tvOp, msg.ConnId);
-                        break;
-                    }
-                case MsgType.TvState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is TvStateMessage tvState)
-                            _tv.ClientApplyState(tvState);
-                        break;
-                    }
-                case MsgType.MarketState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is MarketStateMessage marketState)
-                            _market.ClientApplyState(marketState);
-                        break;
-                    }
-                case MsgType.ReportState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is ReportStateMessage reportState)
-                            _report.ClientApplyState(reportState);
-                        break;
-                    }
-                case MsgType.ContainerOp:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is ContainerOpMessage containerOp)
-                            _containers.HostApplyOp(containerOp, msg.ConnId);
-                        break;
-                    }
-                case MsgType.ContainerState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is ContainerStateMessage containerState)
-                            _containers.ClientApplyState(containerState);
-                        break;
-                    }
-                case MsgType.ContainerBoxTake:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is ContainerBoxTakeMessage containerTake)
-                            _containers.ClientApplyTakeAccepted(containerTake);
-                        break;
-                    }
-                case MsgType.ContainerPackClaim:
-                    {
-                        if (Role == CoopRole.Client && msg.Message is ContainerPackClaimMessage claim)
-                            _containers.ClientApplyPackClaim(claim);
-                        break;
-                    }
-                case MsgType.TournamentState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is TournamentStateMessage tournamentState)
-                            _tournament.ClientApplyState(tournamentState);
-                        break;
-                    }
-                case MsgType.CardBoxOp:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is CardBoxOpMessage cardBoxOp)
-                            _cardBoxes.HostApplyOp(cardBoxOp, msg.ConnId);
-                        break;
-                    }
-                case MsgType.CardBoxState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is CardBoxStateMessage cardBoxState)
-                            _cardBoxes.ClientApplyState(cardBoxState);
-                        break;
-                    }
-                case MsgType.CardBoxCollectResult:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is CardBoxCollectResultMessage cardBoxCollect)
-                            _cardBoxes.ClientApplyCollectRejected(cardBoxCollect);
-                        break;
-                    }
-                case MsgType.FurnBoxOp:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is FurnBoxOpMessage furnBoxOp)
-                            _furnBoxes.HostApplyOp(furnBoxOp, msg.ConnId);
-                        break;
-                    }
-                case MsgType.FurnBoxState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is FurnBoxStateMessage furnBoxState)
-                            _furnBoxes.ClientApplyState(furnBoxState);
-                        break;
-                    }
                 case MsgType.EnumSync:
                     {
                         if (Role != CoopRole.Client)
                             break;
                         if (msg.Message is EnumSyncMessage enumSync)
                         {
-                            var hostBytes = Msg.Gunzip(enumSync.Data);
+                            var hostBytes = GunzipCappedBytes(enumSync.Data, Msg.MaxFrameSize);
+                            if (hostBytes == null)
+                                throw new InvalidDataException("enum sync exceeded decompression cap");
                             if (CoopPlugin.AutoSyncCardDatabase.Value)
                             {
                                 StatusLine = Util.ModParity.InstallEnumFile(hostBytes);
@@ -5025,311 +5155,6 @@ namespace CardShopCoop
                                 StatusLine = "card databases differ - auto-sync is disabled; copy the host's enum_values.json (PrefabLoader folder) yourself";
                             }
                         }
-                        break;
-                    }
-                case MsgType.GradingOp:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is GradingOpMessage gradingOp)
-                            _grading.HostApplyOp(gradingOp, msg.ConnId);
-                        break;
-                    }
-                case MsgType.GradingState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is GradingStateMessage gradingState)
-                            _grading.ClientApplyState(gradingState);
-                        break;
-                    }
-                case MsgType.TradeOp:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is TradeOpMessage tradeOp)
-                            _trades.HostApplyOp(tradeOp);
-                        break;
-                    }
-                case MsgType.TradeState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is TradeStateMessage tradeState)
-                            _trades.ClientApplyState(tradeState);
-                        break;
-                    }
-                case MsgType.TableState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is TableStateMessage tableState)
-                            _tables.ClientApplyState(tableState);
-                        break;
-                    }
-                case MsgType.PlayerIntent:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is PlayerIntentMessage intent)
-                            _intents.HostApplyOp(intent);
-                        break;
-                    }
-                case MsgType.LightState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is LightStateMessage lightState)
-                        {
-                            var data = JsonUtility.FromJson<LightTimeData>(lightState.LightJson);
-                            if (data == null)
-                                break;
-                            try
-                            {
-                                // Reject an older heartbeat that was already queued before a
-                                // rollover. A newer day heartbeat is the fallback for a missed
-                                // DayTime packet and must schedule the same full environment reset.
-                                if (lightState.HasDay)
-                                {
-                                    if (lightState.Day < CPlayerData.m_CurrentDay)
-                                        break;
-                                    if (lightState.Day > CPlayerData.m_CurrentDay)
-                                    {
-                                        CPlayerData.m_CurrentDay = lightState.Day;
-                                        MarkClientDayResetPending();
-                                        TryStartClientDayReset();
-                                        break;
-                                    }
-                                }
-                                if (_lightManager == null)
-                                    _lightManager = FindObjectOfType<LightManager>();
-                                if (_lightManager == null)
-                                    break;
-                                EnforceClientClock(_lightManager);
-                                int localIdx = FiTimeOfDayIdx?.GetValue(_lightManager) is int idx ? idx : -1;
-                                int localHour = FiTimeHour?.GetValue(_lightManager) is int h ? h : -1;
-                                int localMin = FiTimeMin?.GetValue(_lightManager) is int m2 ? m2 : 0;
-                                int driftMin = Math.Abs((data.m_TimeHour * 60 + data.m_TimeMin) - (localHour * 60 + localMin));
-                                bool phaseDiffer = localIdx != data.m_TImeOfDayIndex;
-
-                                // LightState is the complete authoritative snapshot. Apply its
-                                // clock before evaluating brightness so a client that already ran
-                                // into night cannot remain dark while the reset latch is pending.
-                                CPlayerData.m_LightTimeData = data;
-                                FiTimeHour?.SetValue(_lightManager, data.m_TimeHour);
-                                FiTimeMin?.SetValue(_lightManager, data.m_TimeMin);
-                                FiTimeMinFloat?.SetValue(_lightManager, data.m_TimeMinFloat);
-                                FiTimeOfDayIdx?.SetValue(_lightManager, data.m_TImeOfDayIndex);
-                                bool groupsDiffer = _lightManager.m_NightlightGrp == null
-                                    || _lightManager.m_ShoplightGrp == null
-                                    || _lightManager.m_SunlightGrp == null
-                                    || _lightManager.m_NightlightGrp.activeSelf != data.m_IsNightLightOn
-                                    || _lightManager.m_ShoplightGrp.activeSelf != data.m_IsShopLightOn
-                                    || _lightManager.m_SunlightGrp.activeSelf != data.m_IsSunlightOn;
-
-                                // Apply every authoritative light group, not just the shop-light
-                                // switch. This also repairs mods that change the groups directly.
-                                if (groupsDiffer)
-                                {
-                                    _lightManager.m_NightlightGrp?.SetActive(data.m_IsNightLightOn);
-                                    _lightManager.m_ShoplightGrp?.SetActive(data.m_IsShopLightOn);
-                                    _lightManager.m_SunlightGrp?.SetActive(data.m_IsSunlightOn);
-                                }
-                                if (groupsDiffer || phaseDiffer)
-                                    MiEvaluateWorldUIBrightness?.Invoke(_lightManager, null);
-                                ApplyClientLightSwitchModels(data.m_IsShopLightOn);
-                                // re-run the game's own lighting restore only when the sky
-                                // phase actually differs (avoids music/blend churn)
-                                if (phaseDiffer || driftMin > 4)
-                                {
-                                    FiFinishLoading?.SetValue(_lightManager, false);
-                                    MiLightInit?.Invoke(_lightManager, null);
-                                    CoopPlugin.Log.LogInfo($"lighting re-synced (phase {localIdx}->{data.m_TImeOfDayIndex}, drift {driftMin}min)");
-                                }
-                                FiHasDayEnded?.SetValue(_lightManager, false);
-                            }
-                            catch (Exception e) { CoopPlugin.Log.LogWarning("light apply: " + e.Message); }
-                        }
-                        break;
-                    }
-                case MsgType.ItemPriceContrib:
-                    {
-                        if (Role != CoopRole.Host)
-                            break;
-                        if (msg.Message is ItemPriceContribMessage itemPriceContrib)
-                        {
-                            // Host side, so this is the identity function. An unmappable id would
-                            // arrive as EItemType.None (-1), which the existing range guard below
-                            // already refuses.
-                            int itemType = (int)itemPriceContrib.ItemType;
-                            float price = itemPriceContrib.Price;
-                            if (itemType >= 0 && itemType <= 500000)
-                            {
-                                // Resolvability first, same runtime-enum oracle as the card guards:
-                                // a type this host has never heard of can't be priced here at all.
-                                if (!Enum.IsDefined(typeof(EItemType), (EItemType)itemType))
-                                {
-                                    CoopPlugin.Log.LogWarning($"item price for unknown item type {itemType} skipped - host missing content pack?");
-                                    // tell the SENDER too: the host log is invisible to the guest,
-                                    // who otherwise watches its price silently revert on the next
-                                    // PriceList with nothing anywhere explaining why
-                                    Send(msg.ConnId, new ToastMessage { Text = "the host couldn't apply that price - it may be missing that product" });
-                                    break;
-                                }
-                                // WOVEN SetItemPrice, never the raw list: EPL routes modded
-                                // rows to its own save data, and a raw write is a shadow
-                                // entry the game (and our own woven-read broadcast) never
-                                // sees. Fires the tag-repaint event itself.
-                                Patches.GamePatches.ApplyingRemotePrice = true;
-                                // a bare catch here swallowed the whole failure: the guest saw its
-                                // price "accepted" and nothing anywhere said otherwise
-                                bool priceThrew = false;
-                                try
-                                {
-                                    CPlayerData.SetItemPrice((EItemType)itemType, price);
-                                }
-                                catch (Exception e)
-                                {
-                                    priceThrew = true;
-                                    CoopPlugin.Log.LogWarning($"item price apply ({(EItemType)itemType}): " + e.Message);
-                                }
-                                finally { Patches.GamePatches.ApplyingRemotePrice = false; }
-                                // same reason as the unknown-type branch: the guest has to hear it
-                                if (priceThrew)
-                                    Send(msg.ConnId, new ToastMessage { Text = "the host couldn't apply that price - it may be missing that product" });
-                                // the periodic PriceList broadcast echoes this to every client
-                            }
-                        }
-                        break;
-                    }
-                case MsgType.ObjMoveDelta:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is ObjMoveDeltaMessage objMoveDelta)
-                            _objMoves.ApplyRemote(objMoveDelta.Entries);
-                        break;
-                    }
-                case MsgType.ObjMoveRequest:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is ObjMoveRequestMessage objMoveRequest)
-                        {
-                            var entries = objMoveRequest.Entries;
-                            // host authority: never let a client's (possibly stale) move-request
-                            // override an object the host is actively dragging - that echo is what
-                            // snapped placed machines back to their old spot every guest tick
-                            // Relay only poses the host actually accepted. Broadcasting the
-                            // original request made a rejected stale move teleport other guests.
-                            var accepted = _objMoves.ApplyRemote(entries, dropIfHostMoving: true);
-                            if (_net.ConnectionCount > 1 && accepted.Count > 0) // see ShelfRequest note
-                                Broadcast(new ObjMoveDeltaMessage { Entries = accepted });
-                        }
-                        break;
-                    }
-                case MsgType.CardPriceSet:
-                    {
-                        if (msg.Message is CardPriceSetMessage cardPriceSet)
-                        {
-                            var card = cardPriceSet.Card;
-                            float price = cardPriceSet.Price;
-                            if (!InGameLevel())
-                            {
-                                _pendingCardPrices.Add(new KeyValuePair<CardData, float>(card, price));
-                                break;
-                            }
-                            // IN-FLIGHT EDIT GATE. The host's price heal rebroadcasts its own
-                            // GetCardPrice for every displayed card; when our own CardPriceSet was
-                            // lost, that heal used to stomp the guest's fresh edit right back to the
-                            // old value. While we are still chasing an edit for this card, only OUR
-                            // value is allowed in - the retry loop keeps working until the host
-                            // confirms it (or gives up loudly).
-                            string key = CardPriceKey(card);
-                            if (key != null && _myCardPrices.TryGetValue(key, out var mine))
-                            {
-                                if (Math.Abs(mine.Value - price) <= CardPriceEpsilon)
-                                {
-                                    mine.Acked = true;   // the other side is holding our value: ack
-                                    _myCardPrices[key] = mine;
-                                }
-                                else if (!mine.Acked)
-                                {
-                                    break;               // stale heal racing our edit: ignore it
-                                }
-                                else
-                                {
-                                    mine.Value = price;  // they legitimately re-priced it; adopt, or
-                                    _myCardPrices[key] = mine; // our heals would war with theirs
-                                }
-                            }
-                            bool applied;
-                            float actual;
-                            bool relayAnyway;
-                            Patches.GamePatches.ApplyingRemotePrice = true;
-                            // graded (>10 encoded) prices route through Grading Overhaul's own store
-                            // (register the card, then GO's SetCardPrice patch handles it); ungraded
-                            // prices use the vanilla path; no-op for a modded grade without GO.
-                            string who = PeerNames.TryGetValue(msg.ConnId, out var pn) ? pn : ("conn " + msg.ConnId);
-                            try
-                            {
-                                applied = ApplyRemoteCardPrice(card, price, who, out actual, out relayAnyway);
-                            }
-                            finally { Patches.GamePatches.ApplyingRemotePrice = false; }
-                            if (!applied)
-                            {
-                                // The HOST couldn't store it, but the price itself is fine (content
-                                // pack missing here, encoded grade with no Grading Overhaul here,
-                                // store rejected the write). Forward the ORIGINAL (card, price) once
-                                // - a PURE RELAY, never the read-back, which would be this machine's
-                                // wrong value. It doubles as the sender's ack (it sees its own number
-                                // come back and stops retrying instead of burning 12 attempts) and
-                                // lets guests that DO have the content pack converge.
-                                // Loop-safe: only the host ever re-broadcasts, and a host's own
-                                // Broadcast never comes back to it.
-                                if (relayAnyway && Role == CoopRole.Host)
-                                {
-                                    var passCard = card;
-                                    float passValue = price;
-                                    Broadcast(new CardPriceSetMessage { Card = passCard, Price = passValue });
-                                }
-                                break;
-                            }
-                            // HOST: the READ-BACK value goes straight back out to every client. That
-                            // one broadcast is both the sender's ACK (this handler acked nothing
-                            // before) and the 3+ player relay (it reached nobody but the host).
-                            if (Role == CoopRole.Host)
-                            {
-                                _cardPriceHealDirty = true;
-                                var echoCard = card;
-                                float echoValue = actual;
-                                Broadcast(new CardPriceSetMessage { Card = echoCard, Price = echoValue });
-                            }
-                        }
-                        break;
-                    }
-                case MsgType.RegisterState:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is RegisterStateMessage registerState)
-                            _register.ClientApplyState(registerState);
-                        break;
-                    }
-                case MsgType.RegisterCart:
-                    {
-                        if (Role != CoopRole.Client || !InGameLevel())
-                            break;
-                        if (msg.Message is RegisterCartMessage registerCart)
-                            _register.ClientApplyCart(registerCart);
-                        break;
-                    }
-                case MsgType.RegisterOp:
-                    {
-                        if (Role != CoopRole.Host || !InGameLevel())
-                            break;
-                        if (msg.Message is RegisterOpMessage registerOp)
-                            _register.HostApplyOp(registerOp, msg.ConnId);
                         break;
                     }
                 case MsgType.Bye:
@@ -5350,6 +5175,7 @@ namespace CardShopCoop
                         break;
                     }
             }
+            return true;
         }
 
         private void SendWorldTo(int connId)
@@ -5418,7 +5244,7 @@ namespace CardShopCoop
                         SaveLength = payload.Length,
                         HostSlot = hostSlot,
                         BundleLength = bundle.Length,
-                        SelfId = (byte)connId,
+                        SelfId = connId,
                         HostEnumBlob = gzHostEnum,
                         HostCardsBlob = gzHostCards,
                     });
@@ -5477,7 +5303,7 @@ namespace CardShopCoop
                 {
                     _shopSign.text = name;
                 }
-                catch { }
+                catch (System.Exception e) { Swallow.Log(e); }
             }
         }
 
@@ -5510,8 +5336,8 @@ namespace CardShopCoop
         private void ApplyPlayerState(int avatarId, PlayerStateMessage state, bool directPeer)
         {
             _diagRecvStates++;
-            _avatars.UpdateState(avatarId, state.Position, state.Yaw, state.Speed,
-                state.Hold, state.HoldTypes, state.HoldCards);
+            _avatars.UpdateState(avatarId, state.Position, state.Yaw,
+                state.Hold, state.CameraPosition, state.CameraRotation, state.HoldTypes, state.HoldCards);
             string peerName = null;
             if (!PeerNames.TryGetValue(avatarId, out peerName) && avatarId >= 1000)
                 _rosterNames.TryGetValue(avatarId - 1000, out peerName);
@@ -5522,7 +5348,7 @@ namespace CardShopCoop
             {
                 var relay = new RelayStateMessage
                 {
-                    SenderId = (byte)avatarId,
+                    SenderId = avatarId,
                     State = state
                 };
                 foreach (int cid in _net.ConnIds())
@@ -5537,6 +5363,11 @@ namespace CardShopCoop
                 if (Role == CoopRole.Host)
                     StatusLine = "Hosting - " + who + " is in your shop!";
             }
+        }
+
+        public bool TryGetAvatarCamera(int avatarId, out Vector3 position, out Quaternion rotation)
+        {
+            return _avatars.TryGetPlacementCamera(avatarId, out position, out rotation);
         }
 
         private void ApplyPurchaseRequest(int connectionId, PurchaseRequestMessage request)
@@ -5703,31 +5534,46 @@ namespace CardShopCoop
 
         private void ApplyEconomyContribution(int connectionId, EconContributionMessage message)
         {
+            // Client-supplied deltas are accepted by design (the joiner earns/spends locally
+            // and forwards the result), but a non-finite value must never reach the shared
+            // wallet: NaN fails every comparison, so it would slip past the affordability
+            // guard below and permanently poison CPlayerData.m_CoinAmountDouble.
+            float value = message.Value;
+            if (float.IsNaN(value) || float.IsInfinity(value))
+            {
+                CoopPlugin.Log.LogWarning(
+                    $"rejected non-finite economy contribution kind={message.Kind} conn={connectionId} value={value}");
+                return;
+            }
             switch (message.Kind)
             {
                 case 1:
-                    CEventManager.QueueEvent(new CEventPlayer_AddCoin(message.Value));
+                    // An "add coin" of zero or less is not a contribution; a negative one
+                    // would be a reduce with no affordability guard, so refuse it.
+                    if (value <= 0f)
+                        break;
+                    CEventManager.QueueEvent(new CEventPlayer_AddCoin(value));
                     break;
                 case 2:
-                    if (message.Value <= 0f)
+                    if (value <= 0f)
                         break;
                     double balance = CPlayerData.m_CoinAmountDouble - _pendingReduceThisFrame;
-                    if ((double)message.Value > balance + 0.0001)
+                    if ((double)value > balance + 0.0001)
                     {
                         Send(connectionId, new ToastMessage { Text = "purchase declined - the shared wallet is short" });
                         _lastCoinSent = double.MinValue;
                     }
                     else
                     {
-                        _pendingReduceThisFrame += message.Value;
-                        CEventManager.QueueEvent(new CEventPlayer_ReduceCoin(message.Value));
+                        _pendingReduceThisFrame += value;
+                        CEventManager.QueueEvent(new CEventPlayer_ReduceCoin(value));
                     }
                     break;
                 case 3:
-                    CEventManager.QueueEvent(new CEventPlayer_AddShopExp((int)message.Value));
+                    CEventManager.QueueEvent(new CEventPlayer_AddShopExp((int)value));
                     break;
                 case 4:
-                    CEventManager.QueueEvent(new CEventPlayer_AddFame((int)message.Value));
+                    CEventManager.QueueEvent(new CEventPlayer_AddFame((int)value));
                     break;
             }
         }
@@ -5782,6 +5628,33 @@ namespace CardShopCoop
             foreach (int id in _net.ConnIds())
                 if (id != connectionId)
                     _net.Send(id, message);
+        }
+        private static bool IsSingleShotOp(MsgType type)
+        {
+            return type == MsgType.FurnitureBoxOp || type == MsgType.TradeOp
+                || type == MsgType.RegisterOp || type == MsgType.RegisterRejected
+                || type == MsgType.ShopOp
+                || type == MsgType.SettingsOp || type == MsgType.TvOp
+                || type == MsgType.StaffOp || type == MsgType.GradingOp
+                || type == MsgType.ContainerOp;
+        }
+
+        private static byte[] GunzipCappedBytes(byte[] data, int cap)
+        {
+            using (var src = new MemoryStream(data, false))
+            using (var gz = new System.IO.Compression.GZipStream(src, System.IO.Compression.CompressionMode.Decompress))
+            using (var dst = new MemoryStream())
+            {
+                var buffer = new byte[8192];
+                int n;
+                while ((n = gz.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    if (dst.Length + n > cap)
+                        throw new InvalidDataException("decompressed payload exceeds cap " + cap);
+                    dst.Write(buffer, 0, n);
+                }
+                return dst.ToArray();
+            }
         }
     }
 }

@@ -3,14 +3,13 @@ using System.Collections.Generic;
 namespace CardShopCoop.Sync
 {
     /// <summary>
-    /// Stable identity bookkeeping shared by the box synchronizers.
+    /// Stable identity bookkeeping shared by the box engine and its families.
     ///
-    /// BoxSync and FurnBoxSync have different wire identities and reconciliation
-    /// rules, but both need the same lifetime invariant: an object/id association
-    /// is created once, can be resolved in either direction, and is removed as a
-    /// pair. Keeping that invariant here avoids the two implementations drifting
-    /// in their identity-map lifecycle while leaving their type-specific state
-    /// machines independent.
+    /// Each box family maps its own object instances to the same host-assigned id space,
+    /// but all need the same lifetime invariant: an object/id association is created once,
+    /// can be resolved in either direction, and is removed as a pair. Keeping that
+    /// invariant here avoids the implementations drifting in their identity-map lifecycle
+    /// while leaving their type-specific state machines independent.
     /// </summary>
     internal sealed class BoxIdentityMap<T> where T : class
     {

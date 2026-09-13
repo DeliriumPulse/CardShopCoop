@@ -100,8 +100,9 @@ namespace CardShopCoop.Net
                 // decodes anything at all.
                 return Group(ToBase32(payload) + CheckChar(payload));
             }
-            catch
+            catch (System.Exception e)
             {
+                Swallow.Log(e);
                 return null;
             }
         }

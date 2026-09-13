@@ -49,7 +49,8 @@ namespace CardShopCoop.Net.Messages
         public int SaveLength;
         public int HostSlot;
         public int BundleLength;
-        public byte SelfId;
+        // int, not byte: the host's connection ids are unbounded; a byte wrapped at 255.
+        public int SelfId;
         public byte[] HostEnumBlob = new byte[0];
         public byte[] HostCardsBlob = new byte[0];
         public ulong SteamId;

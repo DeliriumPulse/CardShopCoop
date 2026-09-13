@@ -29,7 +29,7 @@ namespace CardShopCoop.Sync
     /// own SpecificSetup recipe on the client's SAME table prefab children, so
     /// nothing is spawned, pooled or registered: pure visuals on existing objects.
     /// </summary>
-    public class PlayTableSync
+    public class PlayTableSync : TickableCoopModule
     {
         private const float Cadence = 1.5f;
         private const float HealInterval = 12f;
@@ -56,9 +56,7 @@ namespace CardShopCoop.Sync
         public static PlayTableSync Active;
         private static PlayerIntentBus _intents;
 
-        private float _timer;
-        private int _lastHash;
-        private float _heal;
+        private readonly SnapshotGate _gate = new SnapshotGate(1.5f, 12f, -7.6f);
         private bool _loggedDrop;   // budget overflow warned once, not every tick
         private ShelfManager _sm;
 
@@ -74,6 +72,11 @@ namespace CardShopCoop.Sync
         {
             Active = this;
         }
+
+        public override string Name => nameof(PlayTableSync);
+
+        public override void Start() => Active = this;
+        protected override void OnHostTick(in SyncFrame frame) => HostTick(frame.Dt, frame.InGame);
 
         public void RegisterIntents(PlayerIntentBus bus)
         {
@@ -94,22 +97,27 @@ namespace CardShopCoop.Sync
             h.Patch(original, prefix: new HarmonyMethod(typeof(PlayTableSync), nameof(StartMoveObjectPrefix)));
         }
 
-        public void Reset()
+        public override void Reset()
         {
             ClearMirrors();
             _applied.Clear();
             _occupied.Clear();
-            _timer = -7.6f; // staggered phase vs the other snapshot engines
-            _lastHash = 0;
-            _heal = 0f;
+            _gate.Reset(-7.6f);
             _loggedDrop = false;
             _sm = null;
         }
 
-        public void ForceResend()
+        public override void ForceResend()
         {
-            _lastHash = 0;
-            _heal = 999f; // beats the hash gate even if the real hash is 0
+            _gate.Force();
+        }
+
+        public override void Dispose()
+        {
+            base.Dispose();
+            if (ReferenceEquals(Active, this))
+                Active = null;
+            _intents = null;
         }
 
         private ShelfManager Sm()
@@ -125,17 +133,14 @@ namespace CardShopCoop.Sync
         {
             if (!inGame)
                 return;
-            _timer += dt;
-            if (_timer < Cadence)
+            if (!_gate.Due(dt))
                 return;
-            _timer -= Cadence;
-            try
+            Guarded("host", () =>
             {
                 var sm = Sm();
                 if (sm == null)
                     return;
                 var tables = sm.m_PlayTableList;
-
                 // every table rides every broadcast (per-seat inactive flags clear the
                 // client), so match end / table move heal without a tombstone protocol
                 int hash = 17;
@@ -166,14 +171,10 @@ namespace CardShopCoop.Sync
                     }
                 }
 
-                _heal += Cadence;
-                if (hash == _lastHash && _heal < HealInterval)
+                if (!_gate.ShouldSend(hash))
                     return;
-                _lastHash = hash;
-                _heal = 0f;
                 BroadcastState?.Invoke(BuildState(tables, count));
-            }
-            catch (Exception e) { CoopPlugin.Log.LogWarning("PlayTableSync host: " + e.Message); }
+            });
         }
 
         private static SeatState HostSeat(TableGameItemSet set)
@@ -227,11 +228,7 @@ namespace CardShopCoop.Sync
 
         public void ClientApplyState(TableStateMessage message)
         {
-            try
-            {
-                ClientApplyInner(message);
-            }
-            catch (Exception e) { CoopPlugin.Log.LogWarning("PlayTableSync apply: " + e.Message); }
+            Guarded("apply", () => ClientApplyInner(message));
         }
 
         private void ClientApplyInner(TableStateMessage message)
@@ -387,7 +384,7 @@ namespace CardShopCoop.Sync
                         if (sets != null && seat < sets.Count && sets[seat] != null)
                             sets[seat].gameObject.SetActive(false);
                     }
-                    catch { }
+                    catch (System.Exception e) { Swallow.Log(e); }
                 }
             }
             _applied.Clear();

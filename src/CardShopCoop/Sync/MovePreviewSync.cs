@@ -11,9 +11,9 @@ namespace CardShopCoop.Sync
     /// <summary>Streams only the visual furniture move preview. The real object remains under
     /// ObjMoveSync's settled-pose authority; remote previews are detached meshes and therefore
     /// cannot participate in movement, collision, or index reconciliation.</summary>
-    public sealed class MovePreviewSync
+    public sealed class MovePreviewSync : CoopModule
     {
-        private const byte Start = 0;
+        private const byte StartPhase = 0;
         private const byte Update = 1;
         private const byte Stop = 2;
         private const float SendInterval = 1f / 12f;
@@ -23,19 +23,28 @@ namespace CardShopCoop.Sync
         {
             public int SourceId;
             public int ObjectKey;
+            public bool IsBox;
             public Component SourceObject;
             public GameObject Ghost;
             public MeshRenderer Renderer;
+            public Material Material;
             public Vector3 Position;
             public Quaternion Rotation;
+            public Vector3 LocalPickupPosition;
+            public Quaternion LocalPickupRotation;
+            public Vector3 PickupScale;
             public bool Valid;
             public float LastReceived;
+            public bool MaterialValiditySet;
+            public bool LastRenderedValid;
         }
 
         private static readonly FieldInfo FiValid = AccessTools.Field(
             typeof(InteractableObject), "m_IsMovingObjectValidState");
         private readonly Dictionary<int, RemotePreview> _remote =
             new Dictionary<int, RemotePreview>();
+        private readonly List<int> _expired = new List<int>();
+        private readonly HashSet<int> _ghostUnavailable = new HashSet<int>();
         private InteractableObject _localObject;
         private int _localKey;
         private int _localSourceId;
@@ -43,12 +52,22 @@ namespace CardShopCoop.Sync
         private bool _localValid;
         private static readonly FieldInfo FiBoxedObject = AccessTools.Field(
             typeof(InteractablePackagingBox_Shelf), "m_BoxedObject");
+        private ShelfManager _shelfManager;
 
-        public void Reset()
+        public override string Name => "move-preview";
+
+        public override void ForceResend()
+        {
+        }
+
+        public override void Reset()
         {
             _localObject = null;
             _localKey = 0;
             _sendTimer = 0f;
+            _shelfManager = null;
+            _expired.Clear();
+            _ghostUnavailable.Clear();
             foreach (var preview in _remote.Values)
                 DestroyPreview(preview);
             _remote.Clear();
@@ -91,12 +110,12 @@ namespace CardShopCoop.Sync
             }
 
             float now = Time.realtimeSinceStartup;
-            var expired = new List<int>();
+            _expired.Clear();
             foreach (var pair in _remote)
                 if (now - pair.Value.LastReceived > ExpireAfter)
-                    expired.Add(pair.Key);
-            for (int i = 0; i < expired.Count; i++)
-                RemoveRemote(expired[i]);
+                    _expired.Add(pair.Key);
+            for (int i = 0; i < _expired.Count; i++)
+                RemoveRemote(_expired[i]);
         }
 
         public void BeginLocal(InteractableObject obj)
@@ -112,7 +131,7 @@ namespace CardShopCoop.Sync
             _localSourceId = CoopCore.Role == CoopRole.Host ? 0 : 1;
             _localValid = ReadValid();
             _sendTimer = SendInterval;
-            SendLocal(Start, _localValid);
+            SendLocal(StartPhase, _localValid);
         }
 
         public void UpdateLocalValidity(bool valid)
@@ -120,7 +139,6 @@ namespace CardShopCoop.Sync
             if (_localObject == null)
                 return;
             _localValid = valid;
-            SendLocal(Update, valid);
         }
 
         public void EndLocal()
@@ -146,6 +164,8 @@ namespace CardShopCoop.Sync
             }
 
             int id = keyFor(sourceId, key);
+            if (message.Phase == StartPhase)
+                _ghostUnavailable.Remove(id);
             if (!_remote.TryGetValue(id, out var preview))
             {
                 preview = new RemotePreview { SourceId = sourceId, ObjectKey = key };
@@ -153,6 +173,7 @@ namespace CardShopCoop.Sync
             }
             preview.SourceId = sourceId;
             preview.ObjectKey = key;
+            preview.IsBox = message.IsBox;
             preview.Position = message.Pos;
             preview.Rotation = message.Rot;
             preview.Valid = message.Valid;
@@ -171,37 +192,77 @@ namespace CardShopCoop.Sync
 
         private void EnsureGhost(RemotePreview preview)
         {
-            if (preview.Ghost != null)
+            if (preview.Ghost != null || _ghostUnavailable.Contains(keyFor(preview.SourceId, preview.ObjectKey)))
                 return;
-            Component source = ResolvePreviewSource(preview.ObjectKey);
+            Component source = ResolvePreviewSource(preview.ObjectKey, preview.IsBox);
             var obj = source as InteractableObject;
             if (obj == null || obj.m_PickupObjectMesh == null || obj.m_PickupObjectMesh.sharedMesh == null)
+            {
+                _ghostUnavailable.Add(keyFor(preview.SourceId, preview.ObjectKey));
                 return;
-            var sm = UnityEngine.Object.FindObjectOfType<ShelfManager>();
+            }
+            var sm = ShelfManagerInstance();
             if (sm == null || sm.m_MoveObjectPreviewRenderer == null)
+            {
+                _ghostUnavailable.Add(keyFor(preview.SourceId, preview.ObjectKey));
                 return;
+            }
 
             var ghost = new GameObject("CoopRemoteMovePreview");
             var filter = ghost.AddComponent<MeshFilter>();
             var renderer = ghost.AddComponent<MeshRenderer>();
+            var pickupTransform = obj.m_PickupObjectMesh.transform;
+            var previewModel = sm.m_MoveObjectPreviewModel;
+            if (previewModel == null)
+            {
+                UnityEngine.Object.Destroy(ghost);
+                _ghostUnavailable.Add(keyFor(preview.SourceId, preview.ObjectKey));
+                return;
+            }
+            ghost.layer = previewModel.gameObject.layer;
+            renderer.renderingLayerMask = sm.m_MoveObjectPreviewRenderer.renderingLayerMask;
             filter.sharedMesh = obj.m_PickupObjectMesh.sharedMesh;
-            renderer.material = new Material(sm.m_MoveObjectPreviewRenderer.material);
+            renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            renderer.receiveShadows = false;
+            var sourceMaterial = sm.m_MoveObjectPreviewRenderer.material;
+            var material = new Material(sourceMaterial)
+            {
+                shaderKeywords = sourceMaterial.shaderKeywords,
+                renderQueue = sourceMaterial.renderQueue,
+            };
+            var materials = new Material[Mathf.Max(1, filter.sharedMesh.subMeshCount)];
+            for (int i = 0; i < materials.Length; i++)
+                materials[i] = material;
+            renderer.sharedMaterials = materials;
             preview.SourceObject = obj;
             preview.Ghost = ghost;
             preview.Renderer = renderer;
+            preview.Material = material;
+            preview.LocalPickupPosition = obj.transform.InverseTransformPoint(pickupTransform.position);
+            preview.LocalPickupRotation = Quaternion.Inverse(obj.transform.rotation) * pickupTransform.rotation;
+            preview.PickupScale = pickupTransform.lossyScale + Vector3.one * 0.001f;
+            preview.MaterialValiditySet = false;
         }
 
-        private static void ApplyGhost(RemotePreview preview)
+        private void ApplyGhost(RemotePreview preview)
         {
             if (preview.Ghost == null || preview.Renderer == null)
                 return;
-            preview.Ghost.transform.SetPositionAndRotation(preview.Position, preview.Rotation);
-            if (preview.SourceObject is InteractableObject obj && obj.m_PickupObjectMesh != null)
-                preview.Ghost.transform.localScale = obj.m_PickupObjectMesh.transform.lossyScale + Vector3.one * 0.001f;
-            var sm = UnityEngine.Object.FindObjectOfType<ShelfManager>();
-            if (sm != null)
-                preview.Renderer.material.SetColor("_Color",
-                    preview.Valid ? sm.m_PreviewMeshValidColor : sm.m_PreviewMeshInvalidColor);
+            preview.Ghost.transform.SetPositionAndRotation(
+                preview.Position + preview.Rotation * preview.LocalPickupPosition,
+                preview.Rotation * preview.LocalPickupRotation);
+            preview.Ghost.transform.localScale = preview.PickupScale;
+            var sm = ShelfManagerInstance();
+            if (sm != null && preview.Material != null)
+            {
+                if (!preview.MaterialValiditySet || preview.LastRenderedValid != preview.Valid)
+                {
+                    preview.Material.SetColor("_Color",
+                        preview.Valid ? sm.m_PreviewMeshValidColor : sm.m_PreviewMeshInvalidColor);
+                    preview.MaterialValiditySet = true;
+                    preview.LastRenderedValid = preview.Valid;
+                }
+            }
             preview.Ghost.SetActive(true);
         }
 
@@ -211,15 +272,19 @@ namespace CardShopCoop.Sync
             {
                 DestroyPreview(preview);
                 _remote.Remove(id);
+                _ghostUnavailable.Remove(id);
             }
         }
 
         private static void DestroyPreview(RemotePreview preview)
         {
+            if (preview.Material != null)
+                UnityEngine.Object.Destroy(preview.Material);
             if (preview.Ghost != null)
                 UnityEngine.Object.Destroy(preview.Ghost);
             preview.Ghost = null;
             preview.Renderer = null;
+            preview.Material = null;
         }
 
         private void StopLocal()
@@ -244,11 +309,19 @@ namespace CardShopCoop.Sync
                 Phase = phase,
                 ObjectKey = _localKey,
                 SourceId = _localSourceId,
+                IsBox = _localObject is InteractablePackagingBox_Shelf,
                 Pos = _localObject.transform.position,
                 Rot = _localObject.transform.rotation,
                 Valid = valid,
             };
             CoopCore.Instance?.SendMovePreview(message);
+        }
+
+        private ShelfManager ShelfManagerInstance()
+        {
+            if (_shelfManager == null)
+                _shelfManager = UnityEngine.Object.FindObjectOfType<ShelfManager>();
+            return _shelfManager;
         }
 
         private static bool TryFindKey(InteractableObject obj, out int key, out int kind)
@@ -283,11 +356,13 @@ namespace CardShopCoop.Sync
             return false;
         }
 
-        private static Component ResolvePreviewSource(int objectKey)
+        private static Component ResolvePreviewSource(int objectKey, bool isBox)
         {
             var identity = ObjMoveSync.ResolveObjectByKey(objectKey) as InteractableObject;
             if (identity == null)
                 return null;
+            if (!isBox)
+                return identity;
             var boxes = UnityEngine.Object.FindObjectsOfType<InteractablePackagingBox_Shelf>();
             for (int i = 0; i < boxes.Length; i++)
             {
