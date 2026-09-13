@@ -17,6 +17,12 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 - **Fixed: removing a label from a warehouse rack didn't update the other player.** Right-clicking a
   warehouse rack's tag cleared the label on your screen but the other player's rack kept it. Warehouse
   rack labels now sync like ordinary shelf labels, without touching the boxes stored on the rack.
+- **Fixed: an emptied box that still showed its label wouldn't accept a different product — the item
+  jumped back into your hand and could make the guest stutter.** The game remembers a box's label after
+  the last item is taken out, so the co-op side read the empty box as "still holding" the old product
+  and kept refusing the new one, bouncing it back and forth on every attempt. An empty box (and an
+  empty shelf) is now treated as able to take any product again, matching the game's own behavior, so
+  restocking an emptied labeled box works and the repeated round-trips stop.
 
 - **Fixed: a guest manning a register could get stuck after a sale — the money drawer stayed
   open, the received/total/change screen never cleared, and the guest could not interact or

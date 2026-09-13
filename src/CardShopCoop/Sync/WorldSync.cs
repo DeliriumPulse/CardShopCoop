@@ -517,8 +517,14 @@ namespace CardShopCoop.Sync
                             // items or delete the wrong type. Refuse so the reporter keeps its item.
                             bool transferKnown = e.TransferType != (int)EItemType.None
                                 && CanResolve(e.TransferType);
+                            // An empty compartment is rebindable: vanilla's locked label
+                            // (CGameManager.m_LockItemLabel) leaves a stale type after the last
+                            // item leaves, and ShelfCompartment.CheckItemType rebinds a 0-count
+                            // compartment to whatever arrives next. Only a non-empty compartment
+                            // constrains the incoming type.
                             bool typeOk = transferKnown
-                                && (hostType == (int)EItemType.None || hostType == e.TransferType);
+                                && (hostCount <= 0 || hostType == (int)EItemType.None
+                                    || hostType == e.TransferType);
                             if (typeOk && requested < 0)
                             {
                                 accepted = -Mathf.Min(-requested, hostCount);
@@ -534,21 +540,29 @@ namespace CardShopCoop.Sync
                                 // shelf: capacity 0 accepted 0, so the host still stamped the item
                                 // label (applyCount 0 with a type) but kept no items, and the client
                                 // got its item bounced back to hand. Trust the add exactly like the
-                                // box path (ItemBoxFamily.ApplyContentDelta): ApplyCompartment below
+                                // box path (ItemBoxFamily.ApplyContent): ApplyCompartment below
                                 // rebuilds through SetCompartmentItemType -> CalculatePositionList ->
                                 // SpawnItem, which computes the real capacity and clamps to it, and
                                 // the read-back then reports only what actually landed.
                                 int capacity = comp.GetMaxItemCount();
-                                if (capacity <= 0)
+                                if (capacity <= 0 || hostCount <= 0)
                                 {
+                                    // An empty compartment has no capacity for the incoming type
+                                    // yet (a stale locked label, or a shelf placed mid-session
+                                    // that never ran CalculatePositionList). Trust the add:
+                                    // ApplyCompartment below binds the type, measures the real
+                                    // capacity and clamps, and the read-back reports what landed.
                                     capacity = hostCount + requested;
                                     CoopPlugin.Log.LogDebug(
-                                        $"WorldSync: compartment {e.Key:X} capacity not built (new shelf?); trusting add host={hostCount} requested={requested}");
+                                        $"WorldSync: compartment {e.Key:X} empty/capacity not built; trusting add host={hostCount} requested={requested}");
                                 }
                                 accepted = Mathf.Min(requested, Mathf.Max(0, capacity - hostCount));
                                 applyCount = hostCount + accepted;
-                                applyType = hostType == (int)EItemType.None && e.TransferType >= 0
-                                    ? e.TransferType : hostType;
+                                // A 0-count compartment rebinds to the incoming type (vanilla
+                                // CheckItemType); a positive count with no label is an
+                                // inconsistent state that heals to the incoming type too.
+                                applyType = (hostCount <= 0 || hostType == (int)EItemType.None)
+                                    && e.TransferType >= 0 ? e.TransferType : hostType;
                             }
                         }
                         if (applyCount < 0)

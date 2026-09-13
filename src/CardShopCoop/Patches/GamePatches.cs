@@ -490,7 +490,10 @@ namespace CardShopCoop.Patches
 
         public static void SetCompartmentItemTypePostfix(ShelfCompartment __instance)
         {
-            if (CoopCore.Instance?.World?.ApplyingRemote == true || __instance == null
+            // BoxShared.ApplyingRemote marks a remote box-content rebuild (ItemBoxFamily.ApplyContent),
+            // whose internal SetCompartmentItemType call is reconciliation, not a player label edit.
+            if (CoopCore.Instance?.World?.ApplyingRemote == true || BoxShared.ApplyingRemote
+                || __instance == null
                 || (CoopCore.Role == CoopRole.Client && CoopCore.ClientReloading))
                 return;
             // Warehouse racks are box containers, not loose-item shelves, and their type is also
@@ -535,7 +538,10 @@ namespace CardShopCoop.Patches
         /// escrowed) on the next tick instead of after a player-action window.</summary>
         public static void TakeItemToHandPostfix(ShelfCompartment __instance, Item __result, int __state)
         {
-            if (CoopCore.Instance?.World?.ApplyingRemote == true || __instance == null || __result == null)
+            // BoxShared.ApplyingRemote marks a remote box-content rebuild (ItemBoxFamily.ApplyContent),
+            // whose internal TakeItemToHand teardown is reconciliation, not a player take.
+            if (CoopCore.Instance?.World?.ApplyingRemote == true || BoxShared.ApplyingRemote
+                || __instance == null || __result == null)
                 return;
             HandEscrow.NoteTakenItem(__result);
             CoopCore.Instance?.World?.QueueTake(__instance, __state, __result);
