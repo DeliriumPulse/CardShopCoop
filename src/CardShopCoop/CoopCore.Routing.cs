@@ -415,6 +415,7 @@ namespace CardShopCoop
                 // engine's ForceResend only re-arms a diff scan, so broadcast its full shelf
                 // state explicitly as well.
                 ModulesForceResend();
+                ModulesOnFullyJoin(context.ConnectionId);
                 _world.RequestResync?.Invoke();
                 return;
             },

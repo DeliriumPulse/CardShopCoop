@@ -36,6 +36,12 @@ namespace CardShopCoop.Sync
         {
         }
 
+        /// <summary>Host: a specific connection finished joining. Default is nothing; modules
+        /// with per-connection catch-up override this.</summary>
+        public virtual void OnFullyJoin(int connId)
+        {
+        }
+
         public virtual void Dispose() => ResetState();
 
         /// <summary>Runs one module step under the shared error boundary. Exceptions are

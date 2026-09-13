@@ -1977,6 +1977,19 @@ namespace CardShopCoop
             _priceFullPending = true; // fresh joiner gets the authoritative price table
         }
 
+        /// <summary>Host: give one freshly-joined connection whatever per-conn catch-up its
+        /// modules need, after the broadcast baselines were armed.</summary>
+        private void ModulesOnFullyJoin(int connId)
+        {
+            if (_moduleRegistry != null)
+            {
+                _moduleRegistry.OnFullyJoin(connId);
+                return;
+            }
+            for (int i = 0; i < _allModules.Length; i++)
+                _allModules[i].OnFullyJoin(connId);
+        }
+
         internal void SendTvOp(TvOpMessage message)
         {
             if (message != null && Role == CoopRole.Client)
