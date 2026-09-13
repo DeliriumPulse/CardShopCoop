@@ -10,6 +10,8 @@ players.
 
 BepInEx 5 plugin, Unity 2021.3 Mono, no game assets redistributed.
 
+Most of the 1.2.0 update is [Meepen](https://github.com/meepen)'s work. Thanks for the continued development, fixes, and testing!
+
 ## Features
 
 - **Steam lobbies**: friends-list invites, or a browsable/searchable public lobby list
