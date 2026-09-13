@@ -53,7 +53,8 @@ Most of the 1.2.0 update is [Meepen](https://github.com/meepen)'s work. Thanks f
 
 ## Repo layout
 
-- `src/CardShopCoop/` — plugin source. Build: `dotnet build -c Release`
+- `src/CardShopCoop/` — plugin source. Build from the repo root with
+  `dotnet build src/CardShopCoop/CardShopCoop.csproj -c Release`
   (deployment is opt-in; use `-p:Deploy=true` only when you want the DLL copied into the
   game's plugins directory).
   The game install path (`GamePath`) is resolved by `Directory.Build.props`:
@@ -63,6 +64,11 @@ Most of the 1.2.0 update is [Meepen](https://github.com/meepen)'s work. Thanks f
   one-off/CI build. Don't edit the csproj.
 - `tools/Decomp/` — regenerates the decompiled game-assembly reference locally
   (ILSpy; the output is not part of this repo).
+- `tools/Launcher/` — the auto-updating launcher.
+- `tests/ShelfBoxPull/` — regression checks for shelf-to-box inventory transfers.
+- `.github/workflows/lint.yml` — checks C# formatting on pushes and pull requests.
+- `CHANGELOG.md` — release changes. Release ZIPs are kept locally in the ignored
+  `dist/release/` folder.
 - Ready-to-install builds: see [Releases](https://github.com/DeliriumPulse/CardShopCoop/releases)
   or the Nexus page.
 

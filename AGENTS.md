@@ -41,6 +41,11 @@ Keep implementation details out unless they explain a user-visible behavior. Git
 GitHub releases remain the authoritative exact-diff record. When the wire version or required
 mod set changes, end the release section with **Both players must update.**
 
+Use `CHANGELOG.md` as the single release-notes source and copy the relevant version
+section into GitHub, Nexus, or Thunderstore release descriptions. Do not add separate
+`docs/` or `release-notes/` folders for audits, checklists, or duplicate release notes.
+Keep local release ZIPs in `dist/release/`, which is excluded from Git.
+
 ## Build and CI
 
 Build the plugin with:

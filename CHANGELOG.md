@@ -421,7 +421,7 @@ Both players must update — the launcher does it automatically.
 - `HostServeKey` (off by default): lets the HOST use the quick-serve key at the register too, same as joiners.
 
 ## 1.0.29
-**Preemptive fixes from a full audit of the game against the mod.** Instead of waiting for field reports, every game system was swept for 2-player coverage gaps (the full audit lives in `docs/audit-2026-07-07.md`: 134 systems confirmed covered, 10 gaps found — all fixed or safely blocked below). Adds one new network message, so 1.0.29 only connects to 1.0.29.
+**Preemptive fixes from a full audit of the game against the mod.** Instead of waiting for field reports, every game system was swept for 2-player coverage gaps (the [archived audit](https://github.com/DeliriumPulse/CardShopCoop/blob/v1.2.0/docs/audit-2026-07-07.md) covers 134 systems, with 10 gaps found — all fixed or safely blocked below). Adds one new network message, so 1.0.29 only connects to 1.0.29.
 
 **Duplication & money exploits (never reported — found by the audit)**
 - **Fixed: packs sitting in an auto pack opener duplicated on the host every time a guest joined.** The guest's world-load re-sent every stored pack as if a player had just inserted it. Same bug fixed for deodorant cans stored in the auto cleanser.
