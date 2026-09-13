@@ -17,7 +17,9 @@ namespace CardShopCoop.Net
             {
                 Culture = CultureInfo.InvariantCulture,
                 Formatting = Formatting.None,
-                NullValueHandling = NullValueHandling.Include,
+                // Preserve constructor-initialised collection defaults when an untrusted peer
+                // explicitly sends null. Nullable scalars are handled by their DTO defaults.
+                NullValueHandling = NullValueHandling.Ignore,
                 ContractResolver = new WireContractResolver(),
                 MissingMemberHandling = MissingMemberHandling.Error,
                 MaxDepth = 128,

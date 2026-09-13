@@ -54,7 +54,7 @@ namespace CardShopCoop.Sync
 
         public static bool DestroyedPrefix(InteractablePackagingBox_Shelf __instance)
         {
-            if (!ApplyingRemote && !CoopCore.ClientReloading)
+            if (!BoxShared.ApplyingRemote && !ApplyingRemote && !CoopCore.ClientReloading)
                 OnLocalDestroyed(__instance);
             return true;
         }
@@ -294,6 +294,9 @@ namespace CardShopCoop.Sync
             float salePrice = purchase.price / 2f;
             CoopPlugin.Log.LogInfo($"FurnitureBoxOps: sell accepted connId={connId} type={obj.m_ObjectType}");
             BoxShared.DebugLog("furniture-op", $"host: accepting guest sale of {obj.m_ObjectType} for {salePrice}");
+            var engine = Engine;
+            ushort hostBoxId = 0;
+            bool hasHostId = box != null && engine != null && engine.TryGetHostId(box, out hostBoxId);
             ApplyingRemote = true;
             bool destroyed = false;
             try
@@ -310,8 +313,8 @@ namespace CardShopCoop.Sync
                 return;
             PriceChangeManager.AddTransaction(salePrice, ETransactionType.SellFurniture, (int)obj.m_ObjectType);
             CEventManager.QueueEvent(new CEventPlayer_AddCoin(salePrice));
-            if (box != null)
-                Engine?.ForgetHostBox(Engine.EnsureHostId(box));
+            if (hasHostId)
+                engine.ForgetHostBox(hostBoxId);
             CoopCore.Instance?.NotifyHostStructureChanged();
             Engine?.ForceNextTick();
         }

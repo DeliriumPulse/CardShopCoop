@@ -145,6 +145,7 @@ namespace CardShopCoop.Sync
             h = h * 31 + w.StoreShelfId;
             h = h * 31 + w.StoreShelf;
             h = h * 31 + w.StoreComp;
+            h = h * 31 + (w.Stored ? 1 : 0);
             return h;
         }
 
@@ -171,6 +172,8 @@ namespace CardShopCoop.Sync
             if (IsLocallyCarried(item))
                 CoopCore.ForceExitHoldBox(box);
             UnhookIfStored(item); // a stored box destroyed without unhooking leaks its rack slot
+            BoxVisuals.Forget(box);
+            BoxPlacement.ClearThrow(box);
             box.OnDestroyed();
         }
 
@@ -229,7 +232,8 @@ namespace CardShopCoop.Sync
                     if (b.m_IsStored)
                         UnhookIfStored(b); // host took it off the rack
                     BoxLifecycle.ApplyEnabled(b, true);
-                    BoxPlacement.ApplyPhysicsPose(box, w.Pos, w.Yaw);
+                    if (BoxPlacement.IsSanePose(w.Pos, w.Yaw))
+                        BoxPlacement.ApplyPhysicsPose(box, w.Pos, w.Yaw);
                     if (b.m_Rigidbody != null)
                     {
                         b.m_Rigidbody.velocity = w.Velocity;
@@ -328,6 +332,7 @@ namespace CardShopCoop.Sync
         {
             try
             {
+                w.Stored = b.m_IsStored;
                 if (!b.m_IsStored)
                     return;
                 var sc = b.GetBoxStoredCompartment();
@@ -369,7 +374,7 @@ namespace CardShopCoop.Sync
             if (rack == null)
             {
                 BoxLifecycle.ApplyEnabled(b, false);
-                if (w.Pos.y > -2f)
+                if (BoxPlacement.IsSanePose(w.Pos, w.Yaw))
                     BoxPlacement.ApplyPhysicsPose(b, w.Pos, w.Yaw);
                 return;
             }
@@ -394,7 +399,7 @@ namespace CardShopCoop.Sync
                     $"box id {w.Id} not stored at rack {w.StoreShelf}/{w.StoreComp} ({StoreRejectReason(b, rack)})",
                     w.Id, 5f);
                 BoxLifecycle.ApplyEnabled(b, false); // stay kinematic at the host pose, not loose
-                if (w.Pos.y > -2f)
+                if (BoxPlacement.IsSanePose(w.Pos, w.Yaw))
                     BoxPlacement.ApplyPhysicsPose(b, w.Pos, w.Yaw);
             }
         }

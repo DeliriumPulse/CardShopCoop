@@ -11,7 +11,7 @@ using UnityEngine;
 namespace CardShopCoop.Sync
 {
     /// <summary>
-    /// Shelf-stock synchronization by snapshot diffing. Both sides load identical saves,
+    /// Shelf-stock synchronization by explicit vanilla mutation events. Both sides load identical saves,
     /// so a compartment is identified by (shelfKind, shelfIndex, compartmentIndex) into
     /// ShelfManager's lists. Every 0.75s the world is snapshotted; whatever changed since
     /// the last snapshot is reported. On the host those diffs are authoritative broadcasts
@@ -34,17 +34,10 @@ namespace CardShopCoop.Sync
             public uint TransferSeq;
         }
 
-        private struct CompState
-        {
-            public int Type; public int Count;
-        }
-
-        private readonly Dictionary<int, CompState> _last = new Dictionary<int, CompState>();
         /// <summary>Client role only: when this machine last reported a change of its own for
         /// a compartment. Protects a fresh local edit from being rolled back by a host echo
         /// (or the 12s full-state heal) that was built BEFORE our request landed - mirrors
         /// CardShelfSync's guard.</summary>
-        private readonly Dictionary<int, double> _locallyChanged = new Dictionary<int, double>();
         /// <summary>Memoized "can this machine actually build this item type" verdicts. The 12s
         /// full-state heal can carry every compartment in the shop, so the ItemData lookup must
         /// not be repeated per entry per heal.</summary>
@@ -68,12 +61,8 @@ namespace CardShopCoop.Sync
         /// undiagnosable.</summary>
         private readonly HashSet<int> _clampWarned = new HashSet<int>();
         private readonly HashSet<string> _snapshotErrors = new HashSet<string>();
-        private readonly Dictionary<WarehouseShelf, List<ShelfCompartment>> _whComps
-            = new Dictionary<WarehouseShelf, List<ShelfCompartment>>();
-        private float _timer;
-        private const float BaseScanInterval = 0.75f;
-        private const float MaxQuietScanInterval = 3.0f;
-        private float _scanInterval = BaseScanInterval;
+        private bool _applyingRemote;
+        public bool ApplyingRemote => _applyingRemote;
 
         /// <summary>Fired with locally-originated changes (host: broadcast; client: request).</summary>
         public Action<List<Entry>> OnLocalChanges;
@@ -86,6 +75,19 @@ namespace CardShopCoop.Sync
         private const float ResyncCooldownSeconds = 2f;
 
         private readonly PendingTransferLedger<int> _transfers = new PendingTransferLedger<int>();
+        /// <summary>Local mutations held while an earlier transfer for the same key is
+        /// outstanding. EscrowTake records whether the mutation was a hand take (must be
+        /// reconciled out of the hand) or a container/restock edit (must not touch the hand).</summary>
+        private struct QueuedMutation
+        {
+            public Entry Entry; public bool EscrowTake;
+        }
+        private readonly Dictionary<int, Queue<QueuedMutation>> _queued = new Dictionary<int, Queue<QueuedMutation>>();
+        private struct DirtyTake
+        {
+            public ShelfCompartment Comp; public int Base; public int Type; public Item Item;
+        }
+        private readonly List<DirtyTake> _dirtyTakes = new List<DirtyTake>();
         private readonly HostTransferAcks _hostAcks = new HostTransferAcks();
 
         public WorldSync()
@@ -113,38 +115,23 @@ namespace CardShopCoop.Sync
         private static bool TryKey(int kind, InteractableObject obj, int comp, out int key)
             => PlacedObjectIdentity.TryMakeCompartmentKey(kind, obj, comp, out key);
 
-        // Time-sliced scan state: the whole-world walk is spread over frames. The budget is in
-        // SHELVES; each shelf's (few) compartments ride with it.
-        private readonly ListScanCursor _cursor = new ListScanCursor { Budget = 12 };
-        private System.Collections.IList[] _groups;
-        private bool _scanning;
-        private List<Entry> _scanChanges;
-        private bool _sawError;
-
         public override string Name => "world";
 
         public override void ForceResend() => ForceNextTick();
 
         public override void Reset()
         {
-            _last.Clear();
-            _locallyChanged.Clear();
             _resolvable.Clear(); // a different host/save can mean a different content-pack set
             _clamped.Clear();    // ...and different shelves, so a remembered clamp means nothing
             _clampWarned.Clear();
             _snapshotErrors.Clear();
-            _whComps.Clear();
             _transfers.Clear();
+            _queued.Clear();
+            _dirtyTakes.Clear();
             _resyncRequested = false;
             _lastResyncRequestAt = -999f;
             _hostAcks.Clear();
-            _timer = 0.35f; // staggered phase: engines must not all walk on the same frame
-            _scanInterval = BaseScanInterval;
             _sm = null;
-            _scanning = false;
-            _groups = null;
-            _scanChanges = null;
-            _cursor.Reset();
         }
 
         /// <summary>Live structure change (a shelf/object was removed or spawned): every
@@ -153,200 +140,170 @@ namespace CardShopCoop.Sync
         /// drop its obligation and allow a duplicate.</summary>
         public void InvalidateBaseline()
         {
-            _last.Clear();
-            _locallyChanged.Clear();
             _resolvable.Clear();
             _clamped.Clear();
             _clampWarned.Clear();
             _snapshotErrors.Clear();
-            _whComps.Clear();
-            _timer = 0.35f;
-            _scanInterval = BaseScanInterval;
             _sm = null;
-            _scanning = false;
-            _groups = null;
-            _scanChanges = null;
-            _cursor.Reset();
+            _queued.Clear();
+            _dirtyTakes.Clear();
         }
 
         /// <summary>Request a same-frame scan after a vanilla inventory/shelf mutation.
         /// The normal timer remains as a recovery heal.</summary>
         public void ForceNextTick()
         {
-            _scanInterval = BaseScanInterval;
-            _timer = _scanInterval;
         }
 
         public void Tick(float dt, bool inGame)
         {
             if (!inGame)
                 return;
+            if (_dirtyTakes.Count > 0)
+            {
+                var pending = _dirtyTakes.ToArray();
+                _dirtyTakes.Clear();
+                for (int i = 0; i < pending.Length; i++)
+                    LocalCompartmentMutation(pending[i].Comp, pending[i].Base, pending[i].Type, -1, pending[i].Item);
+            }
             if (_resyncRequested && Time.time - _lastResyncRequestAt >= ResyncCooldownSeconds)
             {
                 _resyncRequested = false;
                 _lastResyncRequestAt = Time.time;
                 RequestResync?.Invoke();
             }
-            _timer += dt;
-            if (!_scanning)
+        }
+
+        private bool TryGetKey(ShelfCompartment comp, out int key)
+        {
+            key = 0;
+            var sm = ResolveShelfManager();
+            if (sm == null || comp == null)
+                return false;
+            for (int i = 0; i < sm.m_ShelfList.Count; i++)
             {
-                if (_timer < _scanInterval)
-                    return;
-                _timer -= _scanInterval; // keep the phase; reset-to-zero drifts back into alignment
-                var sm = ResolveShelfManager();
-                if (sm == null)
-                    return;
-                if (_groups == null || _groups.Length != 3)
-                    _groups = new System.Collections.IList[3];
-                _groups[0] = sm.m_ShelfList;
-                _groups[1] = sm.m_CardItemCombiShelfList;
-                _groups[2] = sm.m_TournamentPrizeShelfList;
-                _cursor.Reset();
-                _scanning = true;
-                _scanChanges = null;
-                _sawError = false;
+                var s = sm.m_ShelfList[i];
+                var cs = s == null ? null : s.GetItemCompartmentList();
+                if (cs != null && cs.Contains(comp))
+                    return TryKey(0, s, cs.IndexOf(comp), out key);
             }
-            try
+            for (int i = 0; i < sm.m_CardItemCombiShelfList.Count; i++)
             {
-                _cursor.Scan(_groups, VisitShelf);
+                var s = sm.m_CardItemCombiShelfList[i];
+                var cs = s == null ? null : s.GetItemCompartmentList();
+                if (cs != null && cs.Contains(comp))
+                    return TryKey(3, s, cs.IndexOf(comp), out key);
             }
-            catch (Exception e)
+            for (int i = 0; i < sm.m_TournamentPrizeShelfList.Count; i++)
             {
-                _sawError = true;
-                LogSnapshotError("snapshot", e);
-                _scanning = false;
+                var s = sm.m_TournamentPrizeShelfList[i];
+                var cs = s == null ? null : s.GetItemCompartmentList();
+                if (cs != null && cs.Contains(comp))
+                    return TryKey(14, s, cs.IndexOf(comp), out key);
+            }
+            return false;
+        }
+
+        public bool TryGetShelfKey(ShelfCompartment comp, out int key)
+            => TryGetKey(comp, out key);
+
+        public void LocalCompartmentMutation(ShelfCompartment comp, int baseCount, int transferType, int delta)
+            => LocalCompartmentMutation(comp, baseCount, transferType, delta, null);
+
+        public void QueueTake(ShelfCompartment comp, int baseCount, Item item)
+        {
+            if (_applyingRemote || comp == null || item == null || CoopCore.Role == CoopRole.None)
                 return;
-            }
-            if (_cursor.Done)
+            _dirtyTakes.Add(new DirtyTake
             {
-                _scanning = false;
-                if (!_sawError && _scanChanges != null && _scanChanges.Count > 0)
-                {
-                    _scanInterval = BaseScanInterval;
-                    OnLocalChanges?.Invoke(_scanChanges);
-                }
-                else if (!_sawError)
-                {
-                    _scanInterval = Math.Min(MaxQuietScanInterval, _scanInterval * 1.25f);
-                }
-            }
+                Comp = comp,
+                Base = baseCount,
+                Type = (int)item.GetItemType(),
+                Item = item
+            });
         }
 
-        /// <summary>Visit one shelf (kind 0, 3 or 14) and all of its item compartments.</summary>
-        private void VisitShelf(object item, int group, int index)
+        private void LocalCompartmentMutation(ShelfCompartment comp, int baseCount, int transferType, int delta, Item takeItem)
         {
-            var shelf = item as Shelf;
-            if (shelf == null)
-                return;
-            int kind = group == 0 ? 0 : (group == 1 ? 3 : 14);
-            // warehouse racks (kind 1) are deliberately NOT walked here: their compartment
-            // "count" is a STORED-BOX tally (AddBox/RemoveBox), not loose items, and applying
-            // it through the item path spawned phantom item meshes into the rack. The item box
-            // family owns racks via stored entries.
-            try
-            {
-                var comps = shelf.GetItemCompartmentList();
-                for (int j = 0; j < comps.Count; j++)
-                {
-                    try
-                    {
-                        if (TryKey(kind, shelf, j, out int key))
-                            Visit(key, comps[j]);
-                    }
-                    catch (Exception e) { _sawError = true; LogSnapshotError("shelf " + index + " compartment " + j, e); }
-                }
-            }
-            catch (Exception e) { _sawError = true; LogSnapshotError("shelf " + index, e); }
-        }
-
-        private void LogSnapshotError(string item, Exception e)
-        {
-            if (_snapshotErrors.Add(item))
-                CoopPlugin.Log.LogWarning("WorldSync snapshot item " + item + ": " + e.Message);
-        }
-
-        private void Visit(int key, ShelfCompartment comp)
-        {
-            if (comp == null)
+            if (_applyingRemote || comp == null || CoopCore.Role == CoopRole.None || !TryGetKey(comp, out int key))
                 return;
             int type = (int)comp.GetItemType();
-            int count = comp.GetItemCount();
-            int prevType = type;
-            int prevCount = count;
-            bool hadBaseline = false;
-            if (_last.TryGetValue(key, out var st))
+            var e = new Entry { Key = key, Type = type, Count = comp.GetItemCount(), BaseCount = baseCount, TransferType = transferType };
+            if (CoopCore.Role == CoopRole.Client && delta != 0)
             {
-                if (st.Type == type && st.Count == count)
-                    return; // unchanged since last snapshot
-                prevType = st.Type;
-                prevCount = st.Count;
-                hadBaseline = true;
-            }
-            else if (CoopCore.Role == CoopRole.Client)
-            {
-                // FIRST SIGHTING on a joiner: adopt the host's live value SILENTLY instead of
-                // reporting it as a change from an empty baseline. After Reset clears _last (a
-                // join or scene load), the client's first walk sees every compartment as "new";
-                // reporting those (often stale, or still-loading and therefore empty) reads back
-                // to the host made the HOST apply them and wipe live stock for every peer - the
-                // mid-day-join stock-wipe bug. A joiner must only report transitions it witnessed
-                // against a KNOWN baseline. Mirrors CardShelfSync.Walk's client silent-adoption;
-                // any slightly-wrong adopted value is repainted by the host's periodic full resync
-                // (ApplyFullState below). Adoption is deliberately NOT subject to the 512 cap - it
-                // emits nothing, it only records what we already see.
-                _last[key] = new CompState { Type = type, Count = count };
-                return;
-            }
-            if (_scanChanges == null)
-                _scanChanges = new List<Entry>();
-            if (_scanChanges.Count >= 512)
-                return; // leave un-recorded; picked up next tick
-            _last[key] = new CompState { Type = type, Count = count };
-            var entry = new Entry { Key = key, Type = type, Count = count };
-            // a guest's change is only a REQUEST: it has to round-trip to the host before it
-            // comes back as truth. Stamp it so an in-flight host echo (or the 12s full-state
-            // heal, built before our request landed) can't roll the placement back under us.
-            if (CoopCore.Role == CoopRole.Client)
-            {
-                _locallyChanged[key] = Time.realtimeSinceStartupAsDouble;
-                // A real item move is sent as a DELTA the host merges, so two concurrent takes
-                // can't overwrite each other with stale absolutes. The host echoes TransferSeq
-                // with what it accepted; we roll the rest back out of our hand.
-                int delta = count - prevCount;
-                if (hadBaseline && delta != 0)
+                // Only a take that actually moved an item into the hand may escrow hand items.
+                // A container-to-container removal (RemoveItem: box/shelf transfer) has no hand
+                // item, so escrowing it would reserve - and on rejection destroy - an unrelated
+                // hand item. GetShelfKey/QueueTake is the hand-take path (takeItem != null).
+                bool escrowTake = delta < 0 && takeItem != null;
+                if (_transfers.IsAddReserved(key) || _transfers.IsTakeReserved(key))
                 {
-                    int localTransfer = delta < 0 ? prevType : type;
-                    entry.BaseCount = prevCount;
-                    entry.TransferSeq = _transfers.Begin(key, delta, localTransfer, out entry.TransferType);
-                    if (entry.TransferSeq == 0)
-                    {
-                        int rolledBack = delta < 0
-                            ? HandEscrow.RollbackUnreservedTake(localTransfer, -delta) : 0;
-                        if (delta > 0)
-                        {
-                            var rollbackComp = Resolve(ResolveShelfManager(), key);
-                            int returned = rollbackComp != null
-                                ? HandEscrow.EscrowAdded(rollbackComp, localTransfer, delta) : 0;
-                            if (returned != delta)
-                                CoopPlugin.Log.LogError($"WorldSync: failed to return all {delta} untracked added items key={key:X}; returned {returned}");
-                            if (rollbackComp != null)
-                                _last[key] = new CompState
-                                {
-                                    Type = (int)rollbackComp.GetItemType(),
-                                    Count = rollbackComp.GetItemCount(),
-                                };
-                        }
-                        // Drop the local-edit guard, or the full-state answer to this resync is
-                        // skipped by ApplyRemote for the very key we need restored.
-                        _locallyChanged.Remove(key);
-                        CoopPlugin.Log.LogError(
-                            $"WorldSync: refused untracked shelf delta key={key:X}; rolled back {rolledBack} and requesting resync");
-                        RequestResync?.Invoke();
-                        return;
-                    }
+                    if (!_queued.TryGetValue(key, out var q))
+                        _queued[key] = q = new Queue<QueuedMutation>();
+                    if (q.Count < PendingTransferLedger<int>.MaxOutstanding)
+                        q.Enqueue(new QueuedMutation { Entry = e, EscrowTake = escrowTake });
+                    else
+                        CoopPlugin.Log.LogError($"WorldSync: queued-transfer cap reached key={key:X}; dropping the local edit and requesting resync");
+                    return;
+                }
+                e.TransferSeq = _transfers.Begin(key, delta, transferType, out e.TransferType, escrowTake);
+                if (e.TransferSeq == 0)
+                {
+                    FailClosedMutation(comp, key, delta, transferType, escrowTake);
+                    return;
                 }
             }
-            _scanChanges.Add(entry);
+            else
+            {
+                e.BaseCount = (CoopCore.Role == CoopRole.Client && delta == 0) ? -1 : 0;
+                e.TransferType = -1;
+            }
+            OnLocalChanges?.Invoke(new List<Entry> { e });
+        }
+
+        /// <summary>Fail-closed handling when a local transfer cannot be tracked: undo the local
+        /// mutation so a later authoritative heal cannot duplicate it, then ask for truth. A
+        /// refused restock is returned to the hand; a refused hand take is removed from the hand;
+        /// a refused container move is left to the resync (its item is in another container, not
+        /// the hand). Must never leave an unreported mutation in place.</summary>
+        private void FailClosedMutation(ShelfCompartment comp, int key, int delta, int transferType, bool escrowTake)
+        {
+            _applyingRemote = true;
+            try
+            {
+                if (delta < 0 && escrowTake)
+                    HandEscrow.RollbackUnreservedTake(transferType, -delta);
+                else if (delta > 0)
+                {
+                    int returned = comp != null ? HandEscrow.EscrowAdded(comp, transferType, delta) : 0;
+                    if (returned != delta)
+                        CoopPlugin.Log.LogError($"WorldSync: failed to return all {delta} untracked added items key={key:X}; returned {returned}");
+                }
+            }
+            finally { _applyingRemote = false; }
+            RequestResyncCoalesced();
+        }
+
+        private void FlushQueued(int key)
+        {
+            if (!_queued.TryGetValue(key, out var q) || q.Count == 0)
+                return;
+            var qe = q.Dequeue();
+            if (q.Count == 0)
+                _queued.Remove(key);
+            var e = qe.Entry;
+            int delta = e.Count - e.BaseCount;
+            e.TransferSeq = _transfers.Begin(key, delta, e.TransferType, out e.TransferType, qe.EscrowTake);
+            if (e.TransferSeq == 0)
+            {
+                // The remaining entries were derived against a baseline that this failed (and now
+                // rolled-back) edit changed; drop them and let the authoritative resync re-derive.
+                var comp = Resolve(ResolveShelfManager(), key);
+                FailClosedMutation(comp, key, delta, e.TransferType, qe.EscrowTake);
+                _queued.Remove(key);
+                return;
+            }
+            OnLocalChanges?.Invoke(new List<Entry> { e });
         }
 
         /// <summary>Apply authoritative states (client) or requested states (host).</summary>
@@ -355,87 +312,96 @@ namespace CardShopCoop.Sync
             var sm = ResolveShelfManager();
             if (sm == null)
                 return;
-            foreach (var e in entries)
+            _applyingRemote = true;
+            try
             {
-                ShelfCompartment comp = null;
-                try
+                foreach (var e in entries)
                 {
-                    // my own fresh edit is still round-tripping to the host; a stale
-                    // echo (or the periodic full-state heal) must not stomp it
-                    if (CoopCore.Role == CoopRole.Client && _locallyChanged.TryGetValue(e.Key, out double t)
-                        && Time.realtimeSinceStartupAsDouble - t < 6.0)
-                        continue;
-                    if (CoopCore.Role == CoopRole.Client
-                        && (_transfers.IsAddReserved(e.Key) || _transfers.IsTakeReserved(e.Key)))
-                        continue;
-                    comp = Resolve(sm, e.Key);
-                    if (comp == null)
-                        continue;
-                    // PARTIAL-CLAMP SUPPRESSION: this exact request already ran and came up
-                    // short, and the compartment still holds exactly what that rebuild left -
-                    // so running it again can only produce the same result. Skipping saves the
-                    // full teardown+respawn (N DisableItem + N GetItem + a price-tag refresh)
-                    // every heal beat for the rest of the session. Both halves are checked
-                    // against the LIVE compartment on purpose: the instant the host asks for
-                    // something else, or anything (a local pull, a partial apply) moves the
-                    // compartment off the clamped value, the memory stops matching and the
-                    // normal apply resumes.
-                    if (_clamped.TryGetValue(e.Key, out var cl)
-                        && cl.Type == e.Type && cl.Requested == e.Count
-                        && (int)comp.GetItemType() == e.Type && comp.GetItemCount() == cl.Actual)
-                        continue;
-                    // an item type this machine can't build is SKIPPED whole - never cleared.
-                    // ApplyCompartment tears the compartment down before it discovers the type
-                    // is unusable, so a missing content pack would silently empty the shelf
-                    // here. (count == 0 needs no type at all - it's a pure Clear, and
-                    // ApplyCompartment never touches SetCompartmentItemType on that path - so
-                    // an "emptied" instruction is still honoured for an unknown type.)
-                    // TYPE None WITH ITEMS ON IT is the id-translation miss, and it takes that
-                    // same skip-don't-clear path: Msg.ReadItemType yields EItemType.None for a
-                    // modded id whose name has no counterpart HERE, and Msg.WriteItemType does
-                    // the same for one the RECEIVER lacks, so this one test covers a one-sided
-                    // content pack in either direction. CanResolve can't decide it for us - it
-                    // answers "yes" for None, which is right for a genuinely empty compartment
-                    // but would send an unmappable type straight into the clear-and-rebuild.
-                    if (e.Count == 0 || (e.Type != (int)EItemType.None && CanResolve(e.Type)))
-                        ApplyCompartment(comp, e.Type, e.Count);
-                }
-                catch (Exception ex)
-                {
-                    CoopPlugin.Log.LogWarning($"WorldSync apply {e.Key:X}: {ex.Message}");
-                }
-                if (comp == null)
-                    continue; // guarded/unresolved: leave our baseline alone
-                try
-                {
-                    // Baseline is ALWAYS what the compartment ACTUALLY holds now - never what
-                    // was requested. A truncated apply (more items than the shelf has slots),
-                    // a mid-apply throw, or a skipped unresolvable type would otherwise leave
-                    // _last claiming the requested value; the next snapshot walk then reads the
-                    // real (smaller) value as a LOCAL change and reports the shortfall back -
-                    // a mirror that couldn't satisfy an apply wiping the side that could.
-                    int actualType = (int)comp.GetItemType();
-                    int actualCount = comp.GetItemCount();
-                    _last[e.Key] = new CompState { Type = actualType, Count = actualCount };
-                    // ...and remember an apply that could not be satisfied in full, so the next
-                    // identical request skips the pointless rebuild (see the check above). Only
-                    // a SHORTFALL of the requested type counts: anything else - an exact apply,
-                    // a skipped unresolvable type, a compartment that ended up on some other
-                    // type - clears the memory so no stale entry can suppress a real update.
-                    if (actualType == e.Type && actualCount < e.Count)
+                    ShelfCompartment comp = null;
+                    try
                     {
-                        _clamped[e.Key] = new ClampState { Type = e.Type, Requested = e.Count, Actual = actualCount };
-                        if (_clampWarned.Add(e.Key))
-                            CoopPlugin.Log.LogWarning($"WorldSync: compartment {e.Key:X} only holds {actualCount} of the {e.Count} item(s) the host has there (type {e.Type}) - your copy of that content pack gives the shelf fewer slots; it will stay short instead of rebuilding every heal");
+                        comp = Resolve(sm, e.Key);
+                        if (comp == null)
+                            continue;
+                        // my own fresh edit is still round-tripping to the host; a stale
+                        // echo (or the periodic full-state heal) must not stomp it
+                        if (e.BaseCount == -1)
+                        {
+                            // Type-only labels are deliberately non-destructive. Never clear a
+                            // live compartment merely because an empty local label was edited.
+                            if (comp.GetItemCount() == 0)
+                                comp.SetCompartmentItemType((EItemType)e.Type);
+                            continue;
+                        }
+                        if (CoopCore.Role == CoopRole.Client
+                            && (_transfers.IsAddReserved(e.Key) || _transfers.IsTakeReserved(e.Key)))
+                            continue;
+                        // PARTIAL-CLAMP SUPPRESSION: this exact request already ran and came up
+                        // short, and the compartment still holds exactly what that rebuild left -
+                        // so running it again can only produce the same result. Skipping saves the
+                        // full teardown+respawn (N DisableItem + N GetItem + a price-tag refresh)
+                        // every heal beat for the rest of the session. Both halves are checked
+                        // against the LIVE compartment on purpose: the instant the host asks for
+                        // something else, or anything (a local pull, a partial apply) moves the
+                        // compartment off the clamped value, the memory stops matching and the
+                        // normal apply resumes.
+                        if (_clamped.TryGetValue(e.Key, out var cl)
+                            && cl.Type == e.Type && cl.Requested == e.Count
+                            && (int)comp.GetItemType() == e.Type && comp.GetItemCount() == cl.Actual)
+                            continue;
+                        // an item type this machine can't build is SKIPPED whole - never cleared.
+                        // ApplyCompartment tears the compartment down before it discovers the type
+                        // is unusable, so a missing content pack would silently empty the shelf
+                        // here. (count == 0 needs no type at all - it's a pure Clear, and
+                        // ApplyCompartment never touches SetCompartmentItemType on that path - so
+                        // an "emptied" instruction is still honoured for an unknown type.)
+                        // TYPE None WITH ITEMS ON IT is the id-translation miss, and it takes that
+                        // same skip-don't-clear path: Msg.ReadItemType yields EItemType.None for a
+                        // modded id whose name has no counterpart HERE, and Msg.WriteItemType does
+                        // the same for one the RECEIVER lacks, so this one test covers a one-sided
+                        // content pack in either direction. CanResolve can't decide it for us - it
+                        // answers "yes" for None, which is right for a genuinely empty compartment
+                        // but would send an unmappable type straight into the clear-and-rebuild.
+                        if (e.Count == 0 || (e.Type != (int)EItemType.None && CanResolve(e.Type)))
+                            ApplyCompartment(comp, e.Type, e.Count);
                     }
-                    else
-                        _clamped.Remove(e.Key);
-                }
-                catch (Exception ex)
-                {
-                    CoopPlugin.Log.LogWarning($"WorldSync read-back {e.Key:X}: {ex.Message}");
+                    catch (Exception ex)
+                    {
+                        CoopPlugin.Log.LogWarning($"WorldSync apply {e.Key:X}: {ex.Message}");
+                    }
+                    if (comp == null)
+                        continue; // guarded/unresolved: leave our baseline alone
+                    try
+                    {
+                        // Baseline is ALWAYS what the compartment ACTUALLY holds now - never what
+                        // was requested. A truncated apply (more items than the shelf has slots),
+                        // a mid-apply throw, or a skipped unresolvable type would otherwise leave
+                        // _last claiming the requested value; the next snapshot walk then reads the
+                        // real (smaller) value as a LOCAL change and reports the shortfall back -
+                        // a mirror that couldn't satisfy an apply wiping the side that could.
+                        int actualType = (int)comp.GetItemType();
+                        int actualCount = comp.GetItemCount();
+                        // ...and remember an apply that could not be satisfied in full, so the next
+                        // identical request skips the pointless rebuild (see the check above). Only
+                        // a SHORTFALL of the requested type counts: anything else - an exact apply,
+                        // a skipped unresolvable type, a compartment that ended up on some other
+                        // type - clears the memory so no stale entry can suppress a real update.
+                        if (actualType == e.Type && actualCount < e.Count)
+                        {
+                            _clamped[e.Key] = new ClampState { Type = e.Type, Requested = e.Count, Actual = actualCount };
+                            if (_clampWarned.Add(e.Key))
+                                CoopPlugin.Log.LogWarning($"WorldSync: compartment {e.Key:X} only holds {actualCount} of the {e.Count} item(s) the host has there (type {e.Type}) - your copy of that content pack gives the shelf fewer slots; it will stay short instead of rebuilding every heal");
+                        }
+                        else
+                            _clamped.Remove(e.Key);
+                    }
+                    catch (Exception ex)
+                    {
+                        CoopPlugin.Log.LogWarning($"WorldSync read-back {e.Key:X}: {ex.Message}");
+                    }
                 }
             }
+            finally { _applyingRemote = false; }
         }
 
         /// <summary>Host: apply a client's shelf change request. A real item move is a DELTA
@@ -484,51 +450,69 @@ namespace CardShopCoop.Sync
                     int hostType = (int)comp.GetItemType();
                     int hostCount = comp.GetItemCount();
                     int requested = e.Count - e.BaseCount;
-                    int applyType = hostType;
-                    int applyCount = hostCount;
-                    if (requested != 0)
+                    bool baseValid = e.BaseCount == hostCount;
+                    if (!baseValid)
                     {
-                        // A one-sided content pack maps the moved type to None (-1) on the wire.
-                        // Never merge that into the host's stock: it would build phantom None
-                        // items or delete the wrong type. Refuse so the reporter keeps its item.
-                        bool transferKnown = e.TransferType != (int)EItemType.None
-                            && CanResolve(e.TransferType);
-                        bool typeOk = transferKnown
-                            && (hostType == (int)EItemType.None || hostType == e.TransferType);
-                        if (typeOk && requested < 0)
-                        {
-                            accepted = -Mathf.Min(-requested, hostCount);
-                            applyCount = hostCount + accepted;
-                            applyType = applyCount <= 0 ? e.Type : hostType;
-                        }
-                        else if (typeOk)
-                        {
-                            int capacity = comp.GetMaxItemCount();
-                            if (capacity <= 0)
-                                capacity = hostCount + requested;
-                            accepted = Mathf.Min(requested, Mathf.Max(0, capacity - hostCount));
-                            applyCount = hostCount + accepted;
-                            applyType = hostType == (int)EItemType.None && e.TransferType >= 0
-                                ? e.TransferType : hostType;
-                        }
+                        // Applying this delta would make a stale client baseline consume or
+                        // create stock unrelated to its request.  Return host truth and reject;
+                        // the client will reconcile its escrow and request a coalesced resync.
+                        CoopPlugin.Log.LogWarning(
+                            $"WorldSync: rejected transfer with stale base key={e.Key:X} base={e.BaseCount} host={hostCount}");
+                        actual = new Entry { Key = e.Key, Type = hostType, Count = hostCount };
+                        accepted = 0;
                     }
-                    if (applyCount < 0)
-                        applyCount = 0;
-                    bool resolvable = applyCount <= 0 || applyType == (int)EItemType.None || CanResolve(applyType);
-                    if (resolvable)
+                    if (baseValid)
                     {
-                        ApplyCompartment(comp, applyType, applyCount);
-                        int actualType = (int)comp.GetItemType();
-                        int actualCount = comp.GetItemCount();
-                        // Report what actually landed (the rebuild can clamp to this machine's
-                        // real slot count), not what was requested.
-                        accepted = actualCount - hostCount;
-                        _last[e.Key] = new CompState { Type = actualType, Count = actualCount };
-                        actual = new Entry { Key = e.Key, Type = actualType, Count = actualCount };
-                    }
-                    else
-                    {
-                        accepted = 0; // can't build this type here; refuse so the reporter keeps its item
+                        int applyType = hostType;
+                        int applyCount = hostCount;
+                        if (requested != 0)
+                        {
+                            // A one-sided content pack maps the moved type to None (-1) on the wire.
+                            // Never merge that into the host's stock: it would build phantom None
+                            // items or delete the wrong type. Refuse so the reporter keeps its item.
+                            bool transferKnown = e.TransferType != (int)EItemType.None
+                                && CanResolve(e.TransferType);
+                            bool typeOk = transferKnown
+                                && (hostType == (int)EItemType.None || hostType == e.TransferType);
+                            if (typeOk && requested < 0)
+                            {
+                                accepted = -Mathf.Min(-requested, hostCount);
+                                applyCount = hostCount + accepted;
+                                applyType = applyCount <= 0 ? e.Type : hostType;
+                            }
+                            else if (typeOk)
+                            {
+                                int capacity = comp.GetMaxItemCount();
+                                if (capacity <= 0)
+                                    capacity = hostCount;
+                                accepted = Mathf.Min(requested, Mathf.Max(0, capacity - hostCount));
+                                applyCount = hostCount + accepted;
+                                applyType = hostType == (int)EItemType.None && e.TransferType >= 0
+                                    ? e.TransferType : hostType;
+                            }
+                        }
+                        if (applyCount < 0)
+                            applyCount = 0;
+                        bool resolvable = applyCount <= 0 || applyType == (int)EItemType.None || CanResolve(applyType);
+                        if (resolvable)
+                        {
+                            _applyingRemote = true;
+                            try
+                            {
+                                ApplyCompartment(comp, applyType, applyCount);
+                            }
+                            finally { _applyingRemote = false; }
+                            int actualType = (int)comp.GetItemType();
+                            int actualCount = comp.GetItemCount();
+                            // Report what actually landed (the rebuild can clamp to this machine's
+                            // real slot count), not what was requested.
+                            accepted = actualCount - hostCount;
+                            actual = new Entry { Key = e.Key, Type = actualType, Count = actualCount };
+                        }
+                        else
+                        {
+                            accepted = 0; // can't build this type here; refuse so the reporter keeps its item
+                        }
                     }
                 }
             }
@@ -566,7 +550,12 @@ namespace CardShopCoop.Sync
                 {
                     int accepted = Mathf.Max(0, -msg.AcceptedDelta);
                     reconciliationAttempted = true;
-                    escrowResolved = _transfers.ResolveTake(pending, msg.AcceptedDelta);
+                    _applyingRemote = true;
+                    try
+                    {
+                        escrowResolved = HandEscrow.ResolveTake(pending.EscrowToken, accepted);
+                    }
+                    finally { _applyingRemote = false; }
                     CoopPlugin.Log.LogInfo($"WorldSync transfer key={pending.Target:X} take token={pending.EscrowToken} accepted={accepted} rejected={Mathf.Max(0, -rejected)}");
                 }
                 else if (rejected > 0)
@@ -574,10 +563,19 @@ namespace CardShopCoop.Sync
                     var sm = ResolveShelfManager();
                     var comp = sm != null ? Resolve(sm, pending.Target) : null;
                     reconciliationAttempted = true;
-                    int returned = comp != null ? HandEscrow.EscrowAdded(comp, pending.TransferType, rejected) : 0;
+                    // A local opposite move was observed while this transfer was in flight.  Do
+                    // not remove an arbitrary current shelf item as this add's rollback; the
+                    // current compartment is already at the post-move count.
+                    int returned = 0;
+                    _applyingRemote = true;
+                    try
+                    {
+                        if (comp != null)
+                            returned = HandEscrow.EscrowAdded(comp, pending.TransferType, rejected);
+                    }
+                    finally { _applyingRemote = false; }
                     if (comp != null)
-                        _last[pending.Target] = new CompState { Type = (int)comp.GetItemType(), Count = comp.GetItemCount() };
-                    CoopPlugin.Log.LogInfo($"WorldSync transfer key={pending.Target:X} add rejected={rejected} escrowed={returned}");
+                        CoopPlugin.Log.LogInfo($"WorldSync transfer key={pending.Target:X} add rejected={rejected} escrowed={returned}");
                 }
             }
             catch (Exception ex)
@@ -590,8 +588,13 @@ namespace CardShopCoop.Sync
                     {
                         try
                         {
-                            escrowResolved = HandEscrow.ResolveTake(
+                            _applyingRemote = true;
+                            try
+                            {
+                                escrowResolved = HandEscrow.ResolveTake(
                                 pending.EscrowToken, Mathf.Max(0, -msg.AcceptedDelta));
+                            }
+                            finally { _applyingRemote = false; }
                         }
                         catch (Exception reconcileEx)
                         {
@@ -607,7 +610,12 @@ namespace CardShopCoop.Sync
                         var sm = ResolveShelfManager();
                         var comp = sm != null ? Resolve(sm, pending.Target) : null;
                         reconciliationAttempted = true;
-                        HandEscrow.EscrowAdded(comp, pending.TransferType, Mathf.Max(0, rejected));
+                        _applyingRemote = true;
+                        try
+                        {
+                            HandEscrow.EscrowAdded(comp, pending.TransferType, Mathf.Max(0, rejected));
+                        }
+                        finally { _applyingRemote = false; }
                     }
                 }
                 catch (Exception reconcileEx)
@@ -628,13 +636,11 @@ namespace CardShopCoop.Sync
             }
             else
                 _transfers.TryResolve(msg.TransferSeq, out _);
-            _locallyChanged.Remove(pending.Target);
             // Only a diverging (rejected/partial) resolution needs authoritative truth; a fully
             // accepted transfer must not trigger a full all-module resync per item.
             if (rejected != 0)
                 RequestResyncCoalesced();
-            else
-                ForceNextTick();
+            FlushQueued(pending.Target);
         }
 
         public void HostReleaseConn(int connId) => _hostAcks.ReleaseConn(connId);

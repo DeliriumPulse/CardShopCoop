@@ -45,6 +45,8 @@ namespace CardShopCoop.Sync
         public ushort StoreShelfId;
         public byte StoreShelf;
         public byte StoreComp;
+        // Shelf and compartment indices are zero-based, so (0,0,0) is a valid address.
+        public bool Stored;
 
         // Orthogonal flags.
         public bool Open;
@@ -67,6 +69,6 @@ namespace CardShopCoop.Sync
         public int NameHash;
         public byte Kind;
 
-        public bool IsStored => StoreShelfId != 0 || StoreShelf != 0 || StoreComp != 0;
+        public bool IsStored => Stored;
     }
 }

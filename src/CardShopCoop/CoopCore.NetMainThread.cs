@@ -51,7 +51,7 @@ namespace CardShopCoop
         {
             if (m.Type != MsgType.CardDeltaBatch)
                 return 1;
-            int n = m.Message is CardDeltaBatchMessage batch ? batch.Deltas.Count : 0;
+            int n = m.Message is CardDeltaBatchMessage batch ? batch.Deltas?.Count ?? 0 : 0;
             if (n < 1)
                 return 1;
             return n > CardDeltaBatchMax ? CardDeltaBatchMax : n;

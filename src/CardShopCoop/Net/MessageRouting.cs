@@ -97,6 +97,18 @@ namespace CardShopCoop.Net
             return message != null && _routes.ContainsKey(message.GetType());
         }
 
+        /// <summary>True only when this route is role-allowed but waiting for the game scene.</summary>
+        public bool IsTransientInGameGate(MessageContext context, INetMessage message)
+        {
+            if (context == null || message == null)
+                return false;
+            if (!_routes.TryGetValue(message.GetType(), out var route))
+                return false;
+            if (!RoleAllowed(route.Policy, context))
+                return false;
+            return (route.Policy & MessagePolicy.InGameOnly) != 0 && !context.InGame;
+        }
+
         /// <summary>True when a failed dispatch of this type should be retried.</summary>
         public bool IsRetryable(MsgType type)
         {
@@ -112,11 +124,17 @@ namespace CardShopCoop.Net
 
         private static bool Allowed(MessagePolicy policy, MessageContext context)
         {
+            return RoleAllowed(policy, context)
+                && ((policy & MessagePolicy.InGameOnly) == 0 || context.InGame);
+        }
+
+        private static bool RoleAllowed(MessagePolicy policy, MessageContext context)
+        {
             if ((policy & MessagePolicy.HostOnly) != 0 && context.Role != CoopRole.Host)
                 return false;
             if ((policy & MessagePolicy.ClientOnly) != 0 && context.Role != CoopRole.Client)
                 return false;
-            return (policy & MessagePolicy.InGameOnly) == 0 || context.InGame;
+            return true;
         }
     }
 }

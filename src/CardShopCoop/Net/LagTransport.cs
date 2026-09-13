@@ -154,6 +154,21 @@ namespace CardShopCoop.Net
 
             int lag = ClampMs(CoopPlugin.ArtificialLagMs != null ? CoopPlugin.ArtificialLagMs.Value : 0);
             int jitter = ClampMs(CoopPlugin.ArtificialJitterMs != null ? CoopPlugin.ArtificialJitterMs.Value : 0);
+
+            if (lag == 0 && jitter == 0)
+            {
+                // A live config change can leave frames in the delayed path. They are due
+                // immediately now, and must be delivered before newly arrived frames.
+                while (_delay.Count > 0)
+                    _incoming.Enqueue(_delay.Dequeue().Message);
+                _delayBytes = 0;
+                _overflowWarned = false;
+
+                while (_inner.Incoming.TryDequeue(out InMsg msg))
+                    _incoming.Enqueue(msg);
+                return;
+            }
+
             long now = Stopwatch.GetTimestamp();
 
             while (_inner.Incoming.TryDequeue(out InMsg msg))

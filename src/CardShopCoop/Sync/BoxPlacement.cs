@@ -43,6 +43,9 @@ namespace CardShopCoop.Sync
         // is the correction size above which we hard-snap instead of dragging the box across.
         private const float DeadReckonMaxSpeed = 12f;
         private const float PushSnapDistance = 1.0f;
+        private const float MaxWireHorizontal = 1000f;
+        private const float MaxWireHeight = 100f;
+        private const float MaxWireVelocity = 1000f;
 
         private static readonly Dictionary<InteractablePackagingBox, RemoteMotion> RemoteMotions
             = new Dictionary<InteractablePackagingBox, RemoteMotion>();
@@ -104,8 +107,40 @@ namespace CardShopCoop.Sync
 
         public static void ClearThrow(InteractablePackagingBox box)
         {
-            if (box != null)
+            if (!(box is null))
                 ThrowPending.Remove(box);
+        }
+
+        public static bool IsSanePose(Vector3 position, float yaw)
+        {
+            return IsFinite(position.x) && IsFinite(position.y) && IsFinite(position.z)
+                && IsFinite(yaw)
+                && Mathf.Abs(position.x) <= MaxWireHorizontal
+                && position.y >= -2f && position.y <= MaxWireHeight
+                && Mathf.Abs(position.z) <= MaxWireHorizontal;
+        }
+
+        private static bool IsFinite(float value)
+        {
+            return !float.IsNaN(value) && !float.IsInfinity(value);
+        }
+
+        public static bool IsSaneVelocity(Vector3 velocity, Vector3 angularVelocity)
+        {
+            return IsFinite(velocity.x) && IsFinite(velocity.y) && IsFinite(velocity.z)
+                && IsFinite(angularVelocity.x) && IsFinite(angularVelocity.y)
+                && IsFinite(angularVelocity.z)
+                && velocity.sqrMagnitude <= MaxWireVelocity * MaxWireVelocity
+                && angularVelocity.sqrMagnitude <= MaxWireVelocity * MaxWireVelocity;
+        }
+
+        public static void SanitizeVelocity(ref Vector3 velocity, ref Vector3 angularVelocity)
+        {
+            if (!IsSaneVelocity(velocity, angularVelocity))
+            {
+                velocity = Vector3.zero;
+                angularVelocity = Vector3.zero;
+            }
         }
 
         public static int ResolvePlacementAvatar(byte ownerKind, int ownerId)
@@ -278,6 +313,9 @@ namespace CardShopCoop.Sync
         {
             if ((CoopCore.Role != CoopRole.Client && CoopCore.Role != CoopRole.Host) || box == null)
                 return;
+            if (!IsSanePose(position, yaw))
+                return;
+            SanitizeVelocity(ref velocity, ref angularVelocity);
             RemoteMotion existing;
             if (RemoteMotions.TryGetValue(box, out existing) && existing.DeadReckon)
             {
@@ -377,6 +415,7 @@ namespace CardShopCoop.Sync
         /// lease-timeout and reliable-edge paths) MUST call this, or the box stays kinematic.</summary>
         public static void ResumePushPhysics(InteractablePackagingBox box, Vector3 velocity, Vector3 angularVelocity)
         {
+            SanitizeVelocity(ref velocity, ref angularVelocity);
             BoxLifecycle.ApplyEnabled(box, true);
             var rb = box != null ? box.m_Rigidbody : null;
             if (rb != null)

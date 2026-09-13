@@ -114,7 +114,8 @@ namespace CardShopCoop.Sync
         {
             if (_anchor == null)
                 _anchor = new GameObject("CoopCardBoxSpawnAnchor").transform;
-            _anchor.SetPositionAndRotation(w.Pos, Quaternion.Euler(0f, w.Yaw, 0f));
+            if (BoxPlacement.IsSanePose(w.Pos, w.Yaw))
+                _anchor.SetPositionAndRotation(w.Pos, Quaternion.Euler(0f, w.Yaw, 0f));
             return RestockManager.SpawnPackageBoxCard(
                 new List<CardData>(w.Cards ?? new List<CardData>()), _anchor);
         }
@@ -123,6 +124,8 @@ namespace CardShopCoop.Sync
         {
             if (box == null)
                 return;
+            BoxVisuals.Forget(box);
+            BoxPlacement.ClearThrow(box);
             try
             {
                 box.OnDestroyed();
@@ -150,7 +153,8 @@ namespace CardShopCoop.Sync
                     BoxVisuals.SetVisible(box, true);
                     BoxLifecycle.ApplyEnabled(box, true);
                     BoxPlacement.ClearPlacementIntent(box);
-                    BoxPlacement.ApplyPhysicsPose(box, w.Pos, w.Yaw);
+                    if (BoxPlacement.IsSanePose(w.Pos, w.Yaw))
+                        BoxPlacement.ApplyPhysicsPose(box, w.Pos, w.Yaw);
                     if (box.m_Rigidbody != null)
                     {
                         box.m_Rigidbody.velocity = w.Velocity;

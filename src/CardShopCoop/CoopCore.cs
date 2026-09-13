@@ -420,6 +420,7 @@ namespace CardShopCoop
             = new System.Collections.Generic.List<InMsg>(1);
         private bool _dispatchBacklogWarned;
         private bool _dispatchDeferredWarned;
+        private bool _dispatchRoleDeniedWarned;
         private bool _dispatchTransferOverflowWarned;
         private bool _dispatchTransferHardDropWarned;
         private int _dispatchDeferredFrames;
@@ -3954,6 +3955,22 @@ namespace CardShopCoop
                                 _boxEngine?.RequestResyncCoalesced();
                             continue;
                         }
+                        if (!_messageRouter.IsTransientInGameGate(new MessageContext
+                        {
+                            ConnectionId = current.ConnId,
+                            Role = Role,
+                            InGame = InGameLevel(),
+                            Transport = _net
+                        }, current.Message))
+                        {
+                            if (!_dispatchRoleDeniedWarned)
+                            {
+                                _dispatchRoleDeniedWarned = true;
+                                CoopPlugin.Log.LogWarning($"Dispatch: dropping {current.Type} due to role mismatch");
+                            }
+                            consumed = i + 1;
+                            continue;
+                        }
                         _dispatchDeferredFrames++;
                         if (_dispatchDeferredFrames > MaxDispatchDeferredFrames)
                         {
@@ -4009,7 +4026,10 @@ namespace CardShopCoop
             else if (consumed > 0)
                 _dispatchBuf.RemoveRange(0, consumed);
             if (_dispatchBuf.Count == 0)
+            {
                 _dispatchDeferredWarned = false;
+                _dispatchRoleDeniedWarned = false;
+            }
             if (_net == null)
                 return;
 

@@ -53,6 +53,10 @@ namespace CardShopCoop.Sync
                     return false;
                 }
                 Bank(card, "hand full");
+                // The packaging box clears its stored data immediately after this call and only
+                // destroys the box later.  Retire the physical card now; otherwise its UI group
+                // remains registered with Card3dUISpawner as a live (but unreachable) card.
+                card3d.OnDestroyed();
                 return false;
             }
             catch (Exception e)

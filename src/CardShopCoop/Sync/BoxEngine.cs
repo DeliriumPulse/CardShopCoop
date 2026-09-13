@@ -233,11 +233,14 @@ namespace CardShopCoop.Sync
             _leases.Remove(id);
             _hostHashes.Remove(id);
             _hostDirty.Remove(id);
-            if (box != null)
+            if (!(box is null))
             {
                 ClearPushEntries(box);
                 BoxPlacement.CancelRemoteMotion(box); // stop any push smoothing follower
             }
+            // These maps retain CLR references even after Unity reports fake-null.
+            BoxVisuals.Forget(box);
+            BoxPlacement.ClearThrow(box);
         }
 
         /// <summary>Host: drop ids for boxes that were destroyed without a Removed edge
@@ -311,6 +314,7 @@ namespace CardShopCoop.Sync
             _active.Remove(box);
             ClearPushEntries(box);
             BoxVisuals.Forget(box);
+            BoxPlacement.ClearThrow(box);
             BoxPlacement.CancelRemoteMotion(box); // stop any push smoothing follower
         }
 
@@ -759,6 +763,7 @@ namespace CardShopCoop.Sync
             h = h * 31 + w.StoreShelfId;
             h = h * 31 + w.StoreShelf;
             h = h * 31 + w.StoreComp;
+            h = h * 31 + (w.Stored ? 1 : 0);
             h = h * 31 + w.ObjType;
             h = h * 31 + w.ObjIndex;
             h = h * 31 + w.NameHash;
@@ -803,6 +808,7 @@ namespace CardShopCoop.Sync
                 return;
             }
             var w = msg.Box;
+            BoxPlacement.SanitizeVelocity(ref w.Velocity, ref w.AngularVelocity);
             // The host is the only id authority: a client cannot legitimately reference an id the
             // host has never assigned. Drop it (and any lingering lease) instead of seeding an
             // unowned Free lease that ExpireLeases deliberately never expires.
@@ -1242,6 +1248,7 @@ namespace CardShopCoop.Sync
             for (int i = 0; i < msg.Boxes.Count; i++)
             {
                 var w = msg.Boxes[i];
+                BoxPlacement.SanitizeVelocity(ref w.Velocity, ref w.AngularVelocity);
                 var family = Family(w.Family);
                 if (family == null)
                     continue;
@@ -1440,6 +1447,7 @@ namespace CardShopCoop.Sync
         /// this destroy IS the reconciliation, not player gameplay.</summary>
         private void DestroyClientBox(InteractablePackagingBox box)
         {
+            _clientIdOf.Remove(box);
             bool prev = BoxShared.ApplyingRemote;
             BoxShared.ApplyingRemote = true;
             try
@@ -1693,20 +1701,26 @@ namespace CardShopCoop.Sync
                 // box). Add: the type we now hold.
                 int localTransfer = requestedDelta < 0 ? baseItemType : family.ReadItemType(box);
                 transferType = EnumMap.ToWire(EnumKind.ItemType, localTransfer);
-                transferSeq = _transfers.Begin(w.Id, requestedDelta, localTransfer, out var effectiveTransfer);
+                // A loose-box content decrease is escrowed out of the hand only when the item
+                // actually went into the hand. A container move (box <-> shelf) has no recent
+                // hand-take note, so escrowing it would reserve an unrelated hand item.
+                bool escrowTake = requestedDelta > 0 || HandEscrow.HasRecentTakeOfType(localTransfer);
+                transferSeq = _transfers.Begin(w.Id, requestedDelta, localTransfer, out var effectiveTransfer, escrowTake);
                 if (transferSeq != 0)
                     transferType = EnumMap.ToWire(EnumKind.ItemType, effectiveTransfer);
                 if (transferSeq == 0)
                 {
                     CoopPlugin.Log.LogError(
                         $"BoxEngine: transfer reserve failed box={w.Id} delta={requestedDelta}; reverting local mutation and requesting resync");
-                    if (requestedDelta < 0)
+                    if (requestedDelta < 0 && escrowTake)
                         HandEscrow.RollbackUnreservedTake(localTransfer, -requestedDelta);
                     else
                     {
                         var itemBox = box as InteractablePackagingBox_Item;
-                        int returned = HandEscrow.EscrowAdded(itemBox?.m_ItemCompartment, localTransfer, requestedDelta);
-                        if (returned != requestedDelta)
+                        int returned = itemBox?.m_ItemCompartment != null
+                            ? HandEscrow.EscrowAdded(itemBox.m_ItemCompartment, localTransfer, requestedDelta)
+                            : 0;
+                        if (requestedDelta > 0 && returned != requestedDelta)
                             CoopPlugin.Log.LogError($"BoxEngine: failed to return all {requestedDelta} untracked added items (returned {returned}) box={w.Id}");
                     }
                     transferType = -1;
@@ -1945,6 +1959,11 @@ namespace CardShopCoop.Sync
         {
             if (msg == null)
                 return;
+            if (!BoxPlacement.IsSanePose(msg.Pos, msg.Yaw))
+                return;
+            var motionVelocity = msg.Velocity;
+            var motionAngularVelocity = msg.AngularVelocity;
+            BoxPlacement.SanitizeVelocity(ref motionVelocity, ref motionAngularVelocity);
             if (!_hostIdentity.ById.TryGetValue(msg.Id, out var box) || box == null)
             {
                 BoxShared.DebugLog("box-motion-rx", $"id={msg.Id} sender={connId} reject=unknown-box", msg.Id, 0.5f);
@@ -1982,21 +2001,21 @@ namespace CardShopCoop.Sync
             lease.LastMotion = _leaseClock;
             lease.MotionPos = msg.Pos;
             lease.MotionYaw = msg.Yaw;
-            lease.MotionVel = msg.Velocity;
-            lease.MotionAngVel = msg.AngularVelocity;
+            lease.MotionVel = motionVelocity;
+            lease.MotionAngVel = motionAngularVelocity;
             _leases[msg.Id] = lease;
 
             // Kinematic follower: the motion stream is the single pose writer while it is fresh.
             BoxLifecycle.ApplyEnabled(box, false);
-            BoxPlacement.ScheduleRemoteMotion(box, msg.Pos, msg.Yaw, msg.Velocity, msg.AngularVelocity);
+            BoxPlacement.ScheduleRemoteMotion(box, msg.Pos, msg.Yaw, motionVelocity, motionAngularVelocity);
             RelayMotion?.Invoke(new BoxMotionStateMessage
             {
                 Id = msg.Id,
                 DriverConn = connId,
                 Pos = msg.Pos,
                 Yaw = msg.Yaw,
-                Velocity = msg.Velocity,
-                AngularVelocity = msg.AngularVelocity,
+                Velocity = motionVelocity,
+                AngularVelocity = motionAngularVelocity,
             }, connId);
         }
 
@@ -2008,6 +2027,11 @@ namespace CardShopCoop.Sync
         {
             if (msg == null)
                 return;
+            if (!BoxPlacement.IsSanePose(msg.Pos, msg.Yaw))
+                return;
+            var motionVelocity = msg.Velocity;
+            var motionAngularVelocity = msg.AngularVelocity;
+            BoxPlacement.SanitizeVelocity(ref motionVelocity, ref motionAngularVelocity);
             if (msg.DriverConn == CoopCore.LocalConnectionId)
                 return; // my own push; I'm the driver (my box is the real local one)
             if (_clientGuards.TryGetValue(msg.Id, out var guard))
@@ -2018,7 +2042,7 @@ namespace CardShopCoop.Sync
             }
             if (!_clientById.TryGetValue(msg.Id, out var box) || box == null)
                 return; // no local mirror for this id
-            BoxPlacement.ScheduleRemoteMotion(box, msg.Pos, msg.Yaw, msg.Velocity, msg.AngularVelocity);
+            BoxPlacement.ScheduleRemoteMotion(box, msg.Pos, msg.Yaw, motionVelocity, motionAngularVelocity);
         }
 
         /// <summary>Drop the local push bookkeeping for one box (it is being forgotten/destroyed

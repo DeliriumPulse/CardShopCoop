@@ -316,12 +316,15 @@ namespace CardShopCoop.Patches
             Try(h, typeof(ShelfCompartment), "RemoveBox",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
             Try(h, typeof(ShelfCompartment), "AddItem",
-                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(AddItemPrefix)),
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(AddItemPostfix)));
             Try(h, typeof(ShelfCompartment), "RemoveItem",
-                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(RemoveItemPrefix)),
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(RemoveItemPostfix)));
             // Player pickups decrement m_ItemAmount and remove from m_StoredItemList directly
             // instead of routing through RemoveItem.
             Try(h, typeof(ShelfCompartment), "TakeItemToHand",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(TakeItemToHandPrefix)),
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(TakeItemToHandPostfix)));
             Try(h, typeof(ShelfCompartment), "SpawnItem",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
@@ -329,8 +332,8 @@ namespace CardShopCoop.Patches
             // only clears m_ItemType - none of the Add/Remove/Spawn paths above fire, so
             // without this hook the label change waited for the slow poll (and the far side
             // kept its label). Nudge the world sync immediately.
-            Try(h, typeof(ShelfCompartment), "RemoveLabel",
-                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
+            Try(h, typeof(ShelfCompartment), "SetCompartmentItemType",
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(SetCompartmentItemTypePostfix)));
             Try(h, typeof(InteractableCardCompartment), "SetCardOnShelf",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
             Try(h, typeof(InteractableCardCompartment), "RemoveCardFromShelf",
@@ -457,15 +460,78 @@ namespace CardShopCoop.Patches
                 CoopCore.RequestImmediateObjectSync();
         }
 
+        public struct ShelfMutationState
+        {
+            public int Count; public int Type; public Item Item;
+        }
+        public static void AddItemPrefix(ShelfCompartment __instance, Item item, out ShelfMutationState __state)
+        {
+            __state = new ShelfMutationState
+            {
+                Count = __instance == null ? -1 : __instance.GetItemCount(),
+                Type = item == null ? -1 : (int)item.GetItemType(),
+                Item = item
+            };
+        }
+
+        public static void AddItemPostfix(ShelfCompartment __instance, ShelfMutationState __state)
+        {
+            if (CoopCore.Instance?.World?.ApplyingRemote == true || __instance == null || __state.Count < 0 || __state.Item == null)
+                return;
+            CoopCore.Instance?.World?.LocalCompartmentMutation(__instance, __state.Count,
+                __state.Type, 1);
+        }
+
+        public static void SetCompartmentItemTypePostfix(ShelfCompartment __instance)
+        {
+            if (CoopCore.Instance?.World?.ApplyingRemote == true || __instance == null
+                || (CoopCore.Role == CoopRole.Client && CoopCore.ClientReloading))
+                return;
+            // AddItem emits the item transfer itself; its resulting type assignment is not a
+            // second world mutation. Empty-label/type edits have no AddItem event and do emit.
+            if (__instance.GetItemCount() > 0)
+                return;
+            CoopCore.Instance?.World?.LocalCompartmentMutation(__instance,
+                __instance.GetItemCount(), -1, 0);
+        }
+
+        public static void TakeItemToHandPrefix(ShelfCompartment __instance, out int __state)
+        {
+            __state = __instance == null ? -1 : __instance.GetItemCount();
+        }
+
         /// <summary>A local item take: the content delta is on a ShelfCompartment (open box or
         /// shelf), not the box object, so a box take is invisible to the box engine until the
         /// round-robin reaches the box. Mark the owning box dirty so the take is reported (and
         /// escrowed) on the next tick instead of after a player-action window.</summary>
-        public static void TakeItemToHandPostfix(ShelfCompartment __instance, Item __result)
+        public static void TakeItemToHandPostfix(ShelfCompartment __instance, Item __result, int __state)
         {
-            ObjectMutationPostfix();
+            if (CoopCore.Instance?.World?.ApplyingRemote == true || __instance == null || __result == null)
+                return;
             HandEscrow.NoteTakenItem(__result);
-            if (__instance != null)
+            CoopCore.Instance?.World?.QueueTake(__instance, __state, __result);
+            CoopCore.Instance?.Boxes?.MarkClientCompartmentDirty(__instance);
+        }
+
+        public static void RemoveItemPrefix(ShelfCompartment __instance, Item item, out ShelfMutationState __state)
+        {
+            __state = new ShelfMutationState
+            {
+                Count = __instance == null ? -1 : __instance.GetItemCount(),
+                Type = item == null ? -1 : (int)item.GetItemType(),
+                Item = item
+            };
+        }
+
+        public static void RemoveItemPostfix(ShelfCompartment __instance, ShelfMutationState __state)
+        {
+            if (CoopCore.Instance?.World?.ApplyingRemote == true || __instance == null || __state.Count < 0)
+                return;
+            if (CoopCore.Role == CoopRole.Host)
+                CoopCore.Instance?.World?.LocalCompartmentMutation(__instance, __state.Count, -1, 0);
+            else if (CoopCore.Instance?.World?.TryGetShelfKey(__instance, out _) == true)
+                CoopCore.Instance?.World?.LocalCompartmentMutation(__instance, __state.Count, __state.Type, -1);
+            else
                 CoopCore.Instance?.Boxes?.MarkClientCompartmentDirty(__instance);
         }
 

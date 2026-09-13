@@ -39,6 +39,21 @@ namespace CardShopCoop.Sync
             Reserved.Add(item);
         }
 
+        /// <summary>True when the local player recently took an item of this type into hand and
+        /// the note has not yet been consumed by a reservation. A box/shelf content decrease that
+        /// has no such note did not move the item into the hand (it went to another container),
+        /// so it must NOT be escrowed out of the hand.</summary>
+        public static bool HasRecentTakeOfType(int localType)
+        {
+            if (CoopCore.Role != CoopRole.Client)
+                return false;
+            PruneRecentTaken();
+            foreach (var pair in Recent)
+                if (pair.Value.Type == localType)
+                    return true;
+            return false;
+        }
+
         public static bool IsInLocalHand(Item item)
         {
             if (item == null)
@@ -440,8 +455,9 @@ namespace CardShopCoop.Sync
                 // scan window, so keep the item and merely reconcile to authoritative state.
                 CoopPlugin.Log.LogWarning(
                     $"HandEscrow.PruneRecentTaken: unreported take note expired for type {expired[i].Type}; keeping the item and requesting resync");
-                CoopCore.Instance?.World?.RequestResync?.Invoke();
             }
+            if (expired.Count > 0)
+                CoopCore.Instance?.World?.RequestResyncCoalesced();
             for (int i = 0; i < drop.Count; i++)
             {
                 Recent.Remove(drop[i]);

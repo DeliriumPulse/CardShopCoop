@@ -19,16 +19,22 @@ namespace CardShopCoop
                 if (Role != CoopRole.Client || !InGameLevel())
                     return;
                 if (message is ShelfDeltaMessage shelfDelta)
+                {
+                    if (shelfDelta.Entries == null)
+                        return;
                     _world.ApplyRemote(shelfDelta.Entries);
+                }
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<ShelfRequestMessage>((context, message) =>
             {
                 if (Role != CoopRole.Host || !InGameLevel())
                     return;
                 if (message is ShelfRequestMessage shelfRequest)
                 {
+                    if (shelfRequest.Entries == null)
+                        return;
                     var applied = _world.ApplyRequest(shelfRequest.Entries, context.ConnectionId);
                     // applying updates the host's diff baseline, so its own tick
                     // never re-detects this change - with 3+ players the OTHER
@@ -48,7 +54,7 @@ namespace CardShopCoop
                     _world.ApplyTransferResult(result);
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, true, heal: () => _world.RequestResync?.Invoke());
+                MessagePolicy.ClientOnlyInGame, true, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<PriceListMessage>((context, message) =>
             {
                 if (Role != CoopRole.Client)
@@ -60,6 +66,8 @@ namespace CardShopCoop
                     {
                         _incomingPriced.Clear();
                         int changed = 0;
+                        if (priceList.Prices == null)
+                            return;
                         for (int k = 0; k < priceList.Prices.Count; k++)
                         {
                             var priceEntry = priceList.Prices[k];
@@ -207,7 +215,7 @@ namespace CardShopCoop
                 }
                 return;
             },
-                MessagePolicy.ClientOnly, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnly, false, heal: null);
             _messageRouter.Register<RelayTagMessage>((context, message) =>
             {
                 if (Role != CoopRole.Client)
@@ -231,7 +239,7 @@ namespace CardShopCoop
                 }
                 return;
             },
-                MessagePolicy.ClientOnly, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnly, false, heal: null);
             _messageRouter.Register<CardDeltaMessage>((context, message) =>
             {
                 if (message is CardDeltaMessage cardDelta)
@@ -258,7 +266,7 @@ namespace CardShopCoop
                 int total = 0, applied = 0, relayedOnly = 0;
                 if (message is CardDeltaBatchMessage batchMessage)
                 {
-                    total = batchMessage.Deltas.Count;
+                    total = batchMessage.Deltas?.Count ?? 0;
                     if (total < 0 || total > CardDeltaBatchMax)
                     {
                         CoopPlugin.Log.LogWarning($"card delta batch: bogus count {total} - dropped");
@@ -334,16 +342,20 @@ namespace CardShopCoop
                     _npcs.ShowMoneyPopup(npcMoney, InGameLevel());
                 return;
             },
-                MessagePolicy.ClientOnly, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnly, false, heal: null);
             _messageRouter.Register<CardShelfDeltaMessage>((context, message) =>
             {
                 if (Role != CoopRole.Client || !InGameLevel())
                     return;
                 if (message is CardShelfDeltaMessage cardShelfDelta)
+                {
+                    if (cardShelfDelta.Entries == null)
+                        return;
                     _cardShelves.ApplyRemote(cardShelfDelta.Entries, cardShelfDelta.Echo);
+                }
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<CardShelfRequestMessage>((context, message) =>
             {
                 if (Role != CoopRole.Host || !InGameLevel())
@@ -351,6 +363,8 @@ namespace CardShopCoop
                 if (message is CardShelfRequestMessage cardShelfRequest)
                 {
                     var entries = cardShelfRequest.Entries;
+                    if (entries == null)
+                        return;
                     _cardShelves.ApplyRemote(entries);
                     // ALWAYS echo the true post-apply state back - including to the sender in a
                     // 2-player session. The echo (MsgType.CardShelfDelta, Echo=true) is what lets
@@ -431,7 +445,7 @@ namespace CardShopCoop
                     _boxEngine.HostApplyMotion(boxMotion, context.ConnectionId);
                 return;
             },
-                MessagePolicy.HostOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.HostOnlyInGame, false, heal: () => _boxEngine?.ForceNextTick());
             _messageRouter.Register<BoxMotionStateMessage>((context, message) =>
             {
                 if (Role != CoopRole.Client || !InGameLevel())
@@ -440,16 +454,22 @@ namespace CardShopCoop
                     _boxEngine.ClientApplyMotion(boxMotionState);
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<PopStateMessage>((context, message) =>
             {
                 if (Role != CoopRole.Client || !InGameLevel())
                     return;
                 if (message is PopStateMessage popState)
+                {
+                    if (popState.Entries == null)
+                        return;
+                    if (popState.Entries.Count != PopulationSync.KindCount)
+                        return;
                     _population.ClientApply(popState.Entries);
+                }
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<ToastMessage>((context, message) =>
             {
                 if (Role != CoopRole.Client)
@@ -463,7 +483,7 @@ namespace CardShopCoop
                 }
                 return;
             },
-                MessagePolicy.ClientOnly, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnly, false, heal: null);
             _messageRouter.Register<CatalogDigestMessage>((context, message) =>
             {
                 if (Role != CoopRole.Host || !InGameLevel())
@@ -472,7 +492,7 @@ namespace CardShopCoop
                     CompareCatalogs(catalogDigest, context.ConnectionId);
                 return;
             },
-                MessagePolicy.HostOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.HostOnlyInGame, false, heal: null);
             _messageRouter.Register<GradedDigestMessage>((context, message) =>
             {
                 // BOTH roles: the host compares a guest's digest, and a guest compares the
@@ -486,7 +506,7 @@ namespace CardShopCoop
                     CompareGradedDigests(gradedDigest, amHost ? context.ConnectionId : 1, amHost);
                 return;
             },
-                MessagePolicy.InGameOnly, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.InGameOnly, false, heal: null);
             _messageRouter.Register<LicenseUnlockMessage>((context, message) =>
             {
                 if (!InGameLevel())
@@ -520,7 +540,7 @@ namespace CardShopCoop
                 }
                 return;
             },
-                MessagePolicy.InGameOnly, true, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.InGameOnly, true, heal: null);
             _messageRouter.Register<LicenseStateMessage>((context, message) =>
             {
                 if (Role != CoopRole.Client || !InGameLevel())
@@ -530,6 +550,8 @@ namespace CardShopCoop
                     bool scanner = licenseState.Scanner;
                     var wanted = new HashSet<long>();
                     var wantedNames = new HashSet<long>();
+                    if (licenseState.Entries == null)
+                        return;
                     for (int i = 0; i < licenseState.Entries.Count; i++)
                     {
                         var e = licenseState.Entries[i];
@@ -556,6 +578,8 @@ namespace CardShopCoop
                         CPlayerData.m_IsScannerRestockUnlocked |= scanner;
                         var rl = Inv().m_StockItemData_SO.m_RestockDataList;
                         var flags = CPlayerData.m_IsItemLicenseUnlocked;
+                        if (rl == null || flags == null)
+                            return;
                         bool anyUnlocked = false;
                         for (int i = 0; i < rl.Count && i < flags.Count; i++)
                         {
@@ -600,7 +624,7 @@ namespace CardShopCoop
                 }
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: null);
             _messageRouter.Register<StaffOpMessage>((context, message) =>
             {
                 if (Role != CoopRole.Host || !InGameLevel())
@@ -618,7 +642,7 @@ namespace CardShopCoop
                     StaffSync.ClientInteractionMessage(staffInteract);
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<StaffStateMessage>((context, message) =>
             {
                 if (Role != CoopRole.Client || !InGameLevel())
@@ -627,7 +651,7 @@ namespace CardShopCoop
                     _staff.ClientApplyState(staffState);
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<ShopOpMessage>((context, message) =>
             {
                 if (Role != CoopRole.Host || !InGameLevel())
@@ -645,7 +669,7 @@ namespace CardShopCoop
                     _shopState.ClientApplyState(shopState);
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<SettingsOpMessage>((context, message) =>
             {
                 if (Role != CoopRole.Host || !InGameLevel())
@@ -663,7 +687,7 @@ namespace CardShopCoop
                     _settings.ClientApplyState(settingsState);
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<TvOpMessage>((context, message) =>
             {
                 if (Role != CoopRole.Host || !InGameLevel())
@@ -681,7 +705,7 @@ namespace CardShopCoop
                     _tv.ClientApplyState(tvState);
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<MarketStateMessage>((context, message) =>
             {
                 if (Role != CoopRole.Client)
@@ -699,7 +723,7 @@ namespace CardShopCoop
                     _report.ClientApplyState(reportState);
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<ContainerOpMessage>((context, message) =>
             {
                 if (Role != CoopRole.Host || !InGameLevel())
@@ -717,7 +741,7 @@ namespace CardShopCoop
                     _containers.ClientApplyState(containerState);
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<ContainerBoxTakeMessage>((context, message) =>
             {
                 if (Role != CoopRole.Client || !InGameLevel())
@@ -726,14 +750,14 @@ namespace CardShopCoop
                     _containers.ClientApplyTakeAccepted(containerTake);
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<ContainerPackClaimMessage>((context, message) =>
             {
                 if (Role == CoopRole.Client && message is ContainerPackClaimMessage claim)
                     _containers.ClientApplyPackClaim(claim);
                 return;
             },
-                MessagePolicy.ClientOnly, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnly, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<TournamentStateMessage>((context, message) =>
             {
                 if (Role != CoopRole.Client || !InGameLevel())
@@ -742,7 +766,7 @@ namespace CardShopCoop
                     _tournament.ClientApplyState(tournamentState);
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<FurnitureBoxOpMessage>((context, message) =>
             {
                 if (Role != CoopRole.Host || !InGameLevel())
@@ -769,7 +793,7 @@ namespace CardShopCoop
                     _grading.ClientApplyState(gradingState);
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<TradeOpMessage>((context, message) =>
             {
                 if (Role != CoopRole.Host || !InGameLevel())
@@ -787,7 +811,7 @@ namespace CardShopCoop
                     _trades.ClientApplyState(tradeState);
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<TableStateMessage>((context, message) =>
             {
                 if (Role != CoopRole.Client || !InGameLevel())
@@ -796,7 +820,7 @@ namespace CardShopCoop
                     _tables.ClientApplyState(tableState);
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<PlayerIntentMessage>((context, message) =>
             {
                 if (Role != CoopRole.Host || !InGameLevel())
@@ -805,18 +829,33 @@ namespace CardShopCoop
                     _intents.HostApplyOp(intent);
                 return;
             },
-                MessagePolicy.HostOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.HostOnlyInGame, false, heal: null);
             _messageRouter.Register<LightStateMessage>((context, message) =>
             {
                 if (Role != CoopRole.Client || !InGameLevel())
                     return;
                 if (message is LightStateMessage lightState)
                 {
-                    var data = JsonUtility.FromJson<LightTimeData>(lightState.LightJson);
-                    if (data == null)
-                        return;
                     try
                     {
+                        if (string.IsNullOrEmpty(lightState.LightJson))
+                        {
+                            _world.RequestResyncCoalesced();
+                            return;
+                        }
+                        LightTimeData data;
+                        try
+                        {
+                            data = JsonUtility.FromJson<LightTimeData>(lightState.LightJson);
+                        }
+                        catch (Exception e)
+                        {
+                            CoopPlugin.Log.LogWarning("light state parse: " + e.Message);
+                            _world.RequestResyncCoalesced();
+                            return;
+                        }
+                        if (data == null)
+                            return;
                         // Reject an older heartbeat that was already queued before a
                         // rollover. A newer day heartbeat is the fallback for a missed
                         // DayTime packet and must schedule the same full environment reset.
@@ -883,7 +922,7 @@ namespace CardShopCoop
                 }
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<ItemPriceContribMessage>((context, message) =>
             {
                 if (Role != CoopRole.Host)
@@ -940,10 +979,14 @@ namespace CardShopCoop
                 if (Role != CoopRole.Client || !InGameLevel())
                     return;
                 if (message is ObjMoveDeltaMessage objMoveDelta)
+                {
+                    if (objMoveDelta.Entries == null)
+                        return;
                     _objMoves.ApplyRemote(objMoveDelta.Entries);
+                }
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<ObjMoveRequestMessage>((context, message) =>
             {
                 if (Role != CoopRole.Host || !InGameLevel())
@@ -951,6 +994,8 @@ namespace CardShopCoop
                 if (message is ObjMoveRequestMessage objMoveRequest)
                 {
                     var entries = objMoveRequest.Entries;
+                    if (entries == null)
+                        return;
                     // host authority: never let a client's (possibly stale) move-request
                     // override an object the host is actively dragging - that echo is what
                     // snapped placed machines back to their old spot every guest tick
@@ -1052,7 +1097,7 @@ namespace CardShopCoop
                     _register.ClientApplyState(registerState);
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<RegisterCartMessage>((context, message) =>
             {
                 if (Role != CoopRole.Client || !InGameLevel())
@@ -1061,7 +1106,7 @@ namespace CardShopCoop
                     _register.ClientApplyCart(registerCart);
                 return;
             },
-                MessagePolicy.ClientOnlyInGame, false, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
+                MessagePolicy.ClientOnlyInGame, false, heal: () => _world.RequestResyncCoalesced());
             _messageRouter.Register<RegisterOpMessage>((context, message) =>
             {
                 if (Role != CoopRole.Host || !InGameLevel())

@@ -107,10 +107,10 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
   missing a card content pack.
 - The SETTINGS tab gained **latency testing** sliders that add artificial delay and jitter to
   incoming network traffic, so connection problems can be reproduced on purpose.
-- **Item transfers are now confirmed by a single answer from the host instead of being retried in
-  the background.** A pickup or placement is decided once: it either goes through or the item is
-  returned exactly once, so a slow connection cannot cause repeated retries or leave an item caught
-  between the two players.
+- **Item transfers are now confirmed by a single answer from the host.** A pickup or placement is
+  retried until the host's answer actually arrives, but the host applies it only once and gives a
+  single deciding answer: it either goes through or the item is returned exactly once, so a slow
+  connection cannot apply a transfer twice or leave an item caught between the two players.
 
 Both players must update.
 

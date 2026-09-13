@@ -205,15 +205,20 @@ namespace CardShopCoop.Net
         {
             var o = SyncJson.Start(r);
             var result = new Messages.PopStateMessage();
-            var a = (JArray)o["Entries"];
+            var a = o["Entries"] as JArray;
             if (a == null)
                 return result;
             for (int k = 0; k < a.Count; k++)
             {
                 var list = new System.Collections.Generic.List<PopulationSync.Entry>();
-                foreach (var token in (JArray)a[k])
+                var row = a[k] as JArray;
+                if (row == null)
+                    return result;
+                foreach (var token in row)
                 {
-                    var x = (JObject)token;
+                    var x = token as JObject;
+                    if (x == null)
+                        return result;
                     var ek = k == 5 ? Util.EnumKind.DecoObject : Util.EnumKind.ObjectType;
                     int local;
                     bool ok = Util.EnumMap.TryFromWire(ek, SyncJson.Int(x, "ObjType"), out local);

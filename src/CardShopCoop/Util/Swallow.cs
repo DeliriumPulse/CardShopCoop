@@ -24,7 +24,8 @@ namespace CardShopCoop
         /// Safe to call from the net thread and before <see cref="CoopPlugin.Log"/> exists.</summary>
         public static void Log(Exception e,
             [CallerMemberName] string member = "",
-            [CallerFilePath] string file = "")
+            [CallerFilePath] string file = "",
+            [CallerLineNumber] int line = 0)
         {
             if (e == null)
                 return;
@@ -38,7 +39,7 @@ namespace CardShopCoop
             {
                 filePart = "?";
             }
-            string site = filePart + "." + (member ?? "?");
+            string site = filePart + "." + (member ?? "?") + ":" + line;
 
             int now = Environment.TickCount;
             if (LastLogged.TryGetValue(site, out int last) && unchecked(now - last) < CooldownMs)

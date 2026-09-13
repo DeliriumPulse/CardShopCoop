@@ -147,7 +147,9 @@ namespace CardShopCoop.Sync
 
         public static void Forget(InteractablePackagingBox box)
         {
-            if (box != null)
+            // Use a CLR null check: Unity-destroyed objects are fake-null but remain valid
+            // dictionary keys, and those stale keys are precisely what this removes.
+            if (!(box is null))
             {
                 Applied.Remove(box);
                 Pending.Remove(box);

@@ -36,6 +36,9 @@ namespace CardShopCoop.Sync
         /// of the hand; a positive delta reserves the target against authoritative content
         /// overwrites until the result arrives. Returns the wire sequence to send.</summary>
         public uint Begin(TKey target, int requestedDelta, int transferType, out int effectiveTransferType)
+            => Begin(target, requestedDelta, transferType, out effectiveTransferType, true);
+
+        public uint Begin(TKey target, int requestedDelta, int transferType, out int effectiveTransferType, bool escrowTake)
         {
             effectiveTransferType = transferType;
             if (_entries.Count >= MaxOutstanding)
@@ -46,10 +49,10 @@ namespace CardShopCoop.Sync
             uint seq = ++_seq;
             if (seq == 0)
                 seq = ++_seq; // 0 means "no transfer" on the wire
-            int token = requestedDelta < 0
+            int token = requestedDelta < 0 && escrowTake
                 ? HandEscrow.ReserveTake(transferType, -requestedDelta, out effectiveTransferType)
                 : 0;
-            if (requestedDelta < 0 && token == 0)
+            if (requestedDelta < 0 && escrowTake && token == 0)
             {
                 CoopPlugin.Log.LogWarning($"PendingTransferLedger.Begin: take of {-requestedDelta} type {transferType} could not be reserved; refusing to track it");
                 return 0;
