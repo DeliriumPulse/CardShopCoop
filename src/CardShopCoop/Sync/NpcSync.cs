@@ -148,6 +148,7 @@ namespace CardShopCoop.Sync
             if (CoopCore.Role != CoopRole.None && !CoopCore.IsTearingDown)
                 _live = this;
             _cm = null;
+            _inv = null;
             _missingHoldFieldLogged = false;
             _sendTimer = 0f;
             _nameRefreshIn = 0f;
@@ -505,9 +506,17 @@ namespace CardShopCoop.Sync
                 worker.UpdateSetPriceOption(data.isRoundUpPrice, data.isAvoidSetCardPrice, data.setPriceMultiplier);
                 worker.UpdateSetCardPriceOption(data.isRoundUpCardPrice, data.isAvoidSetCardPriceWhileRestock, data.setCardPriceMultiplier);
                 if (data.cardPackItemTypeEnabledList != null)
+                {
+                    // A puppet cloned from the live worker skips InitializeCharacter's list
+                    // build (its CharacterCustomization is already initialized), so the list
+                    // can be empty. Grow it to the authoritative length before applying, or
+                    // the pack-refill screen has no index to toggle and Confirm sends nothing.
+                    var enabled = worker.GetCardPackItemTypeEnabledList();
+                    while (enabled.Count < data.cardPackItemTypeEnabledList.Count)
+                        enabled.Add(true);
                     for (int i = 0; i < data.cardPackItemTypeEnabledList.Count; i++)
-                        if (i < worker.GetCardPackItemTypeEnabledList().Count)
-                            worker.SetCardPackItemTypeEnabled(i, data.cardPackItemTypeEnabledList[i]);
+                        worker.SetCardPackItemTypeEnabled(i, data.cardPackItemTypeEnabledList[i]);
+                }
                 if (data.expList != null)
                 {
                     worker.m_ExpList.Clear();
@@ -516,6 +525,42 @@ namespace CardShopCoop.Sync
                 MiEvaluateSkillLevel?.Invoke(worker, null);
             }
             catch (System.Exception e) { Swallow.Log(e); }
+        }
+
+        /// <summary>Client: a worker puppet is cloned from the LIVE worker, whose
+        /// CharacterCustomization is already initialized, so Worker.InitializeCharacter skips
+        /// building m_CardPackItemTypeEnabledList and it stays empty. The pack-refill option
+        /// screen indexes that list on every toggle and on Confirm, so an empty list makes
+        /// every option untickable and sends no change. Grow it to the card-pack count (the
+        /// game's default is enabled); the next authoritative RefreshWorkerUi sets the values.</summary>
+        private static void EnsureCardPackList(Worker worker)
+        {
+            if (worker == null)
+                return;
+            try
+            {
+                // NEVER CSingleton<InventoryBase>.Instance: touched while no real manager
+                // exists it fabricates a fake empty DontDestroyOnLoad InventoryBase that
+                // shadows the real one for the rest of the run (see GradingSync.Inv).
+                var ib = Inv();
+                if (ib == null || ib.m_StockItemData_SO == null)
+                    return;
+                var enabled = worker.GetCardPackItemTypeEnabledList();
+                int count = ib.m_StockItemData_SO.m_CardPackItemTypeList.Count;
+                while (enabled.Count < count)
+                    enabled.Add(true);
+            }
+            catch (System.Exception e) { Swallow.Log(e); }
+        }
+
+        // Unity fake-null makes the cached lookup re-resolve after a scene load.
+        private static InventoryBase _inv;
+
+        private static InventoryBase Inv()
+        {
+            if (_inv == null)
+                _inv = Object.FindObjectOfType<InventoryBase>();
+            return _inv;
         }
 
         private static NpcFlags CollectFlags(Animator anim)
@@ -916,8 +961,54 @@ namespace CardShopCoop.Sync
                         // screen, so handing the customer back (register sale finish, trade end)
                         // reveals a ready puppet instead of a hole that NpcSync has to rebuild
                         // from scratch - the puppet must not age out while it is hidden.
+                        //
+                        // This branch runs INSTEAD of the normal puppet-creation path below, so
+                        // a customer whose first snapshot arrives while it is ALREADY borrowed
+                        // (a register carrier claimed before any named snapshot spawned its
+                        // puppet) would otherwise never get one at all: on release the real
+                        // carrier is hidden and nothing is revealed until the 5s periodic name
+                        // refresh rebuilds a puppet, leaving the customer invisible for seconds.
+                        // Ensure a hidden puppet exists here so the handoff always has a body.
                         int visualKey = (KindCustomer << 16) | index;
-                        if (_puppets.TryGetValue(visualKey, out var visual) && visual != null)
+                        _puppets.TryGetValue(visualKey, out var visual);
+                        if (visual != null && visual.HasIdentity && visual.Identity != identity)
+                        {
+                            // This list slot was reused by a newer pooled customer: drop the
+                            // stale body so it is rebuilt for this identity, exactly as the
+                            // normal path does.
+                            if (visual.Go != null)
+                                Object.Destroy(visual.Go);
+                            visual.Go = null;
+                            visual.CharName = "";
+                            visual.BufCount = 0;
+                            visual.GrabSequence = actionSequence;
+                        }
+                        if (visual == null || visual.Go == null)
+                        {
+                            // Prefer the snapshot's name. The carrier's own name is only
+                            // authoritative for a register (RegisterSync writes it from the
+                            // cart); a trade carrier never sets it, so falling back to it there
+                            // could dress the puppet from a stale pooled name. Trade mirrors are
+                            // kept visible and will spawn on the next named snapshot instead.
+                            string puppetName = hasName && !string.IsNullOrEmpty(charName)
+                                ? charName
+                                : !existing.KeepPuppetVisible && existing.Customer != null
+                                    && existing.Customer.m_CharacterCustom != null
+                                    ? existing.Customer.m_CharacterCustom.CharacterName : null;
+                            if (!string.IsNullOrEmpty(puppetName))
+                            {
+                                if (visual == null)
+                                {
+                                    visual = new Puppet();
+                                    _puppets[visualKey] = visual;
+                                }
+                                visual.Kind = KindCustomer;
+                                visual.Identity = identity;
+                                visual.HasIdentity = true;
+                                ReDress(visual, puppetName, pos, (flags & NpcFlags.Female) != 0, KindCustomer, index);
+                            }
+                        }
+                        if (visual != null)
                         {
                             visual.LastSeen = _now;
                             visual.Flags = flags;
@@ -1398,6 +1489,7 @@ namespace CardShopCoop.Sync
                     MiEvaluateSkillLevel?.Invoke(worker, null);
                 }
                 catch (System.Exception e) { Swallow.Log(e); }
+                EnsureCardPackList(worker);
             }
             p.Custom = cust != null ? cust.m_CharacterCustom
                 : worker != null ? worker.m_CharacterCustom : null;
@@ -1488,6 +1580,12 @@ namespace CardShopCoop.Sync
             // A staff snapshot can arrive before this puppet is spawned. Seed the
             // vanilla UI model from the already-downloaded save immediately; later
             // StaffState packets continue to refresh it authoritatively.
+            clone.name = "CoopNpc_" + charName;
+            p.Go = clone;
+            // This must run AFTER p.Go is assigned: RefreshWorkerUi looks the puppet up
+            // through that field, so seeding before it is a silent no-op and the puppet
+            // keeps InitializeCharacter's all-enabled pack-refill defaults until an
+            // unrelated StaffState change happens to arrive.
             try
             {
                 var saved = CPlayerData.m_WorkerSaveDataList;
@@ -1496,8 +1594,6 @@ namespace CardShopCoop.Sync
             }
             catch (System.Exception e) { Swallow.Log(e); }
 
-            clone.name = "CoopNpc_" + charName;
-            p.Go = clone;
             // Prefer the Animator reference owned by the cloned Worker. Mods may leave
             // the original Animator disabled beside a replacement Animator in the same
             // hierarchy; GetComponentInChildren alone can select the wrong one.

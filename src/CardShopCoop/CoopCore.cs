@@ -1793,7 +1793,7 @@ namespace CardShopCoop
                 new Sync.CoopModuleEntry(_report, "report", 7, -1, Sync.ReportSync.ApplyPatches),
                 new Sync.CoopModuleEntry(_containers, "containers", 8, 3, Sync.ContainerSync.ApplyPatches),
                 new Sync.CoopModuleEntry(_tournament, "tournament", 9, -1, Sync.TournamentSync.ApplyPatches),
-                new Sync.CoopModuleEntry(_register, "register", 10, -1, Sync.RegisterSync.ApplyPatches),
+                new Sync.CoopModuleEntry(_register, "register", 10, 4, Sync.RegisterSync.ApplyPatches),
                 new Sync.CoopModuleEntry(_tv, "tv", 11, 1, Sync.TvSync.ApplyPatches),
                 new Sync.CoopModuleEntry(new Sync.DelegateCoopModule("join-heal", null, null,
                     () => _priceFullPending = true), "join-heal"),

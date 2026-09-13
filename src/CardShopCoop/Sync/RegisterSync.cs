@@ -77,6 +77,7 @@ namespace CardShopCoop.Sync
         private static readonly FieldInfo FiCashCustomer = ReflectionSurface.RequiredField(typeof(InteractableCustomerCash), "m_CurrentCustomer");
         private static readonly FieldInfo FiGivenAmount = ReflectionSurface.RequiredField(typeof(InteractableCounterMoneyChange), "m_GivenAmount");
         private static readonly FieldInfo FiInUIMode = ReflectionSurface.RequiredField(typeof(InteractionPlayerController), "m_IsInUIMode");
+        private static readonly FieldInfo FiCurrentCashCounter = ReflectionSurface.RequiredField(typeof(InteractionPlayerController), "m_CurrentCashierCounter");
 
         /// <summary>Set by CoopCore: client -> host op (MsgType.RegisterOp).</summary>
         public System.Action<INetMessage> SendOp;
@@ -110,6 +111,41 @@ namespace CardShopCoop.Sync
         protected override void OnHostTick(in SyncFrame frame)
         {
             HostTick(frame.Dt, frame.InGame);
+        }
+
+        protected override void OnClientTick(in SyncFrame frame)
+        {
+            if (!frame.InGame)
+                return;
+            ReconcileLocalClaim();
+        }
+
+        /// <summary>Client: a manning claim is only valid while the local game still considers
+        /// the player to be at that register. Vanilla can clear m_IsMannedByPlayer without ever
+        /// running OnPressEsc (notably ForceResetCounter on a day rollover), and an overlapping
+        /// trade/UI interaction can swallow the exit entirely. Either leaves _localManned and the
+        /// host's per-connection claim stuck: the player walks around while the counter stays
+        /// reserved, and the cursor/UI mode is never restored. Detect and release it here.</summary>
+        private void ReconcileLocalClaim()
+        {
+            int idx = _localManned;
+            if (idx < 0)
+                return;
+            var sm = Sm();
+            if (sm == null || sm.m_CashierCounterList == null || idx >= sm.m_CashierCounterList.Count)
+            {
+                CoopPlugin.Log.LogWarning(
+                    $"RegisterSync client: releasing register claim at counter {idx} (counter list changed)");
+                ReleaseLocalClaim(idx);
+                return;
+            }
+            var counter = sm.m_CashierCounterList[idx];
+            if (counter == null || !counter.IsMannedByPlayer())
+            {
+                CoopPlugin.Log.LogWarning(
+                    $"RegisterSync client: releasing stale register claim at counter {idx} (vanilla register state cleared)");
+                ReleaseLocalClaim(idx);
+            }
         }
 
         /// <summary>Disable Harmony callbacks before a session's module state is torn down.</summary>
@@ -443,6 +479,13 @@ namespace CardShopCoop.Sync
                 return;
             if (!__instance.IsMannedByPlayer())
                 return; // the block prefix stopped the vanilla entry
+            // IsMannedByPlayer is a plain field: it can still read true from an earlier
+            // interaction after vanilla's register mode was torn down by anything other than
+            // OnPressEsc (notably ForceResetCounter on a day rollover). Claim only when the
+            // vanilla body actually made THIS counter the local cash-counter, so a stale field
+            // can never register a phantom claim.
+            if (!IsLocalCashCounter(__instance))
+                return;
             var sm = t.Sm();
             if (sm == null)
                 return;
@@ -466,14 +509,39 @@ namespace CardShopCoop.Sync
             int idx = sm.m_CashierCounterList.IndexOf(__instance);
             if (idx < 0)
                 return;
-            t._localManned = -1;
-            t._pendingLocalChange.Remove(idx);
-            t.SendOp?.Invoke(new RegisterOpMessage { Index = (byte)idx, Op = OpExit });
+            t.ReleaseLocalClaim(idx);
+            CoopPlugin.Log.LogDebug($"RegisterSync client: left counter {idx}");
+        }
+
+        /// <summary>Client: drop the local register claim and tell the host, exactly once.
+        /// Shared by the vanilla Esc/movement exit and the stale-claim reconciler, so every
+        /// release path clears the same state and restores the cursor/UI mode. No-op when the
+        /// claim is not (or no longer) ours, so a later OnPressEsc cannot re-release it.</summary>
+        private void ReleaseLocalClaim(int idx)
+        {
+            if (_localManned != idx)
+                return;
+            _localManned = -1;
+            _pendingLocalChange.Remove(idx);
+            _deferredChange.Remove(idx);
+            SendOp?.Invoke(new RegisterOpMessage { Index = (byte)idx, Op = OpExit });
             // Vanilla's OnExitCashCounterMode does not clear m_IsInUIMode, and the card payment
             // path sets it. A lingering UI mode blocks InteractionPlayerController.Update before
             // it reaches its phone-mode branch, so the phone could not be closed. Clear it.
-            ClearClientUIMode(t, idx);
-            CoopPlugin.Log.LogDebug($"RegisterSync client: left counter {idx}");
+            ClearClientUIMode(this, idx);
+        }
+
+        /// <summary>Client: is this counter the game's current local cash-counter? True only
+        /// while the vanilla body actually entered register mode for it (m_CurrentCashierCounter
+        /// is set on entry and nulled by OnExitCashCounterMode).</summary>
+        private static bool IsLocalCashCounter(InteractableCashierCounter counter)
+        {
+            try
+            {
+                var ipc = CSingleton<InteractionPlayerController>.Instance;
+                return ipc != null && ReferenceEquals(FiCurrentCashCounter?.GetValue(ipc), counter);
+            }
+            catch (System.Exception e) { Swallow.Log(e); return false; }
         }
 
         /// <summary>Client: if the local player is stuck in game-UI mode from a register
