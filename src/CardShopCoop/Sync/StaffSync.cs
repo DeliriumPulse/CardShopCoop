@@ -378,12 +378,38 @@ namespace CardShopCoop.Sync
                 return;
             ClientWorkerLease.Add(index);
             var worker = NpcSync.GetWorkerPuppet(index);
-            if (worker == null)
+            // The puppet is built from the cloned prefab and can exist before its staff
+            // data does. WorkerInteractUIScreen.OpenScreen dereferences GetWorkerData()
+            // unconditionally, and Worker.OnMousePress has ALREADY shown the cursor and
+            // locked movement by the time OpenScreen runs - so a null here used to leave
+            // the joiner stuck in UI mode with no screen. Refuse to open until it is dressed.
+            if (worker == null || worker.GetWorkerData() == null)
+            {
+                CoopPlugin.Log.LogWarning(
+                    $"StaffSync: worker {index} UI not ready (puppet={worker != null}) - releasing interaction");
+                ReleaseClientWorker(index);
                 return;
+            }
             _allowClientWorkerOpen = true;
             try
             {
                 worker.OnMousePress();
+            }
+            catch (Exception e)
+            {
+                // OnMousePress enters UI mode before OpenScreen, so a throw leaves the cursor
+                // visible and movement locked. Run vanilla's own stop path to restore both,
+                // then hand the lease back so the host releases the worker.
+                CoopPlugin.Log.LogError($"StaffSync: opening worker {index} UI failed: {e}");
+                try
+                {
+                    worker.OnPressStopInteract();
+                }
+                catch (Exception restore)
+                {
+                    Swallow.Log(restore);
+                }
+                ReleaseClientWorker(index);
             }
             finally { _allowClientWorkerOpen = false; }
         }

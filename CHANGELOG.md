@@ -6,8 +6,30 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 ---
 
 ## 1.2.0
-**Boxes and furniture now stay in sync through pickups, throws, placement, and joining, and cards no longer vanish when a guest sets them out to sell or is holding them.**
+**Boxes and furniture now stay in sync through pickups, throws, placement, and joining, cards no longer vanish when a guest sets them out to sell or is holding them, and registers, workers, and served customers no longer get stuck or vanish during co-op.**
 
+- **Fixed: a customer who had just been served disappeared for a few seconds on the guest's
+  screen after the guest finished the sale.** When the guest runs a checkout, the game borrows a
+  real customer body to stand in for the served customer on the guest's machine, and the
+  customer's own mirrored body was only kept up to date if it had already been created. If the
+  customer was borrowed before their mirrored body existed, finishing the sale hid the borrowed
+  body with nothing to hand back to, so the customer stayed invisible until the next periodic
+  refresh rebuilt them. The mirrored body is now created and kept ready as soon as the customer
+  is borrowed, so they reappear the instant the sale ends.
+- **Fixed: after a guest interacted with a customer or a worker, the register could stay
+  reserved to that guest even though they were no longer standing at it.** The guest could walk
+  around freely while the counter stayed locked to them for the host, and the mouse cursor could
+  be left showing. The guest now notices that the game no longer has them at the register and
+  releases it automatically, restoring the cursor and freeing the counter for the host.
+- **Fixed: clicking a worker right after joining could leave the mouse cursor stuck with no
+  worker screen opening.** The mirrored worker did not have its staff data yet when the screen
+  tried to open, so the game showed the cursor and then failed before the screen appeared. The
+  worker screen now opens only once the mirrored worker has its data, and if opening ever fails
+  the mouse and movement are restored instead of staying stuck.
+- **Fixed: a worker's card-pack refill options did not match the host on the guest's screen and
+  could not be unticked there.** The guest's worker mirror was built without the list those
+  checkboxes use, so the boxes could not be changed and no change reached the host. That list is
+  now rebuilt from the game's own card-pack catalog and kept in step with the host.
 - **Fixed: a shelf placed during the session wouldn't let the other player stock it.** A brand-new
   shelf hadn't worked out how many items fit yet, so the game treated it as full for the other
   player only — your item jumped straight back into your hand while the shelf showed the product's
