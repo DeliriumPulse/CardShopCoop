@@ -89,6 +89,22 @@ Most of the 1.2.0 update is [Meepen](https://github.com/meepen)'s work. Thanks f
   `SpawnItem` being a save-loader not an adder, price tags living in separate canvas
   groups, and raw-`itemType`-indexed tables ~200k entries long under content mods.
 
+## Contributing
+
+Bug reports, multiplayer testing, documentation, and code contributions are welcome.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks, and pull request guidance.
+
+## Contributors
+
+Special thanks to [Meepen](https://github.com/meepen) for continued development,
+fixes, and testing, including most of the 1.2.0 update.
+
+[See everyone who has contributed](https://github.com/DeliriumPulse/CardShopCoop/graphs/contributors).
+
+<a href="https://github.com/DeliriumPulse/CardShopCoop/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=DeliriumPulse/CardShopCoop" alt="CardShopCoop contributors" />
+</a>
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
