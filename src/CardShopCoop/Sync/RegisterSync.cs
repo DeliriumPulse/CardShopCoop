@@ -7,6 +7,7 @@ using System.Reflection;
 using HarmonyLib;
 using UnityEngine;
 
+
 namespace CardShopCoop.Sync
 {
     /// <summary>
@@ -120,6 +121,25 @@ namespace CardShopCoop.Sync
             ReconcileLocalClaim();
         }
 
+        /// <summary>
+        /// Finds a money-change button by its monetary value instead of its list index.
+        /// Required because host and guest button orderings can differ, which would otherwise
+        /// misapply fractional change (e.g. a quarter becoming $25 on the host).
+        /// </summary>
+        private static InteractableCounterMoneyChange FindMoneyButtonByValue(List<InteractableCounterMoneyChange> money, double value)
+        {
+            if (money == null)
+                return null;
+            const double epsilon = 0.0001;
+            for (int i = 0; i < money.Count; i++)
+            {
+                var m = money[i];
+                if (m != null && System.Math.Abs(m.m_ValueDouble - value) < epsilon)
+                    return m;
+            }
+            return null;
+        }
+
         /// <summary>Client: a manning claim is only valid while the local game still considers
         /// the player to be at that register. Vanilla can clear m_IsMannedByPlayer without ever
         /// running OnPressEsc (notably ForceResetCounter on a day rollover), and an overlapping
@@ -199,8 +219,8 @@ namespace CardShopCoop.Sync
         private readonly Dictionary<int, int> _pendingLocalChange = new Dictionary<int, int>();
         // counter idx -> change clicks that arrived before the cart opened GivingChange. They
         // are replayed once the counter enters the change phase, so catch-up is order-proof.
-        private readonly Dictionary<int, List<KeyValuePair<int, bool>>> _deferredChange =
-            new Dictionary<int, List<KeyValuePair<int, bool>>>();
+        private readonly Dictionary<int, List<KeyValuePair<double, bool>>> _deferredChange =
+            new Dictionary<int, List<KeyValuePair<double, bool>>>();
 
         public override void Reset()
         {
@@ -1186,7 +1206,13 @@ namespace CardShopCoop.Sync
                         var money = counter.m_InteractableCounterMoneyChangeList;
                         if (buttonIndex < 0 || buttonIndex >= money.Count)
                             return false;
-                        var button = money[buttonIndex];
+                        // var button = money[buttonIndex];
+                        var button = FindMoneyButtonByValue(
+                            counter.m_InteractableCounterMoneyChangeList, message.ChangeValue);
+                        
+                        if (button == null)
+                            return false; // No matching denomination
+
                         if (message.TakingBack)
                             button.OnRightMouseButtonUp();
                         else
@@ -1341,23 +1367,23 @@ namespace CardShopCoop.Sync
                 // arrive after the clicks. Queue them and replay when the phase exists.
                 if (!_deferredChange.TryGetValue(message.Index, out var list))
                 {
-                    list = new List<KeyValuePair<int, bool>>();
+                    list = new List<KeyValuePair<double, bool>>();
                     _deferredChange[message.Index] = list;
                 }
-                list.Add(new KeyValuePair<int, bool>(message.ChangeIndex, message.TakingBack));
+                list.Add(new KeyValuePair<double, bool>(message.ChangeValue, message.TakingBack));
                 return;
             }
-            ReplayChange(counter, message.ChangeIndex, message.TakingBack);
+            ReplayChange(counter, message.ChangeValue, message.TakingBack);
         }
 
         /// <summary>Client: replay one money click on a counter that is already in the change
         /// phase. The applying guard stops the replay from emitting an op of its own.</summary>
-        private static void ReplayChange(InteractableCashierCounter counter, int changeIndex, bool takingBack)
+        private static void ReplayChange(InteractableCashierCounter counter, double ChangeValue, bool takingBack)
         {
             var money = counter.m_InteractableCounterMoneyChangeList;
-            if (money == null || changeIndex < 0 || changeIndex >= money.Count)
+            if (money == null)
                 return;
-            var button = money[changeIndex];
+            var button = FindMoneyButtonByValue(money, ChangeValue);
             if (button == null)
                 return;
             ApplyingAuthoritativePayment = true;
