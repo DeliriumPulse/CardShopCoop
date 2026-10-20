@@ -1492,6 +1492,14 @@ namespace CardShopCoop.Sync
                         return cand;
                     continue;
                 }
+                // Furniture boxes carry the host id of the object inside. Boxes from one
+                // order can share a delivery spot, so match that id before trying the nearest pose.
+                if (w.Family == BoxFamily.Furniture && w.ObjIndex > 0 && have.ObjIndex > 0)
+                {
+                    if (have.Kind == w.Kind && have.ObjIndex == w.ObjIndex)
+                        return cand;
+                    continue; // holds a different host object
+                }
                 float d = Vector3.Distance(BoxPlacement.PhysicsPosition(cand), w.Pos);
                 if (d < bestDist)
                 {

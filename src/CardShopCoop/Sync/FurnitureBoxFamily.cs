@@ -57,6 +57,8 @@ namespace CardShopCoop.Sync
 
         public static InteractableObject BoxedObject(InteractablePackagingBox box)
         {
+            if (!(box is InteractablePackagingBox_Shelf))
+                return null;
             try
             {
                 return BoxFields.BoxedObject?.GetValue(box) as InteractableObject;

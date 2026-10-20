@@ -382,13 +382,20 @@ namespace CardShopCoop.Sync
         {
             if (obj == null)
                 return;
+            // Mirror only: the host already placed it. Without the guard, PlacePrefix sends
+            // an OpPlace for this box, and a mismatched mirror makes the host place another box.
+            ApplyingRemote = true;
             try
             {
+                var engine = Engine;
+                if (engine != null && engine.TryResolveClientBoxId(obj, out ushort boxId))
+                    engine.ForgetClientBox(boxId);
                 bool vertical = obj.m_IsDecorationVertical;
                 PlaceFromBox(obj, pos, rot.eulerAngles.y, rot, vertical,
                     obj.GetIsVerticalSnapToWarehouseWall(), obj.GetVerticalSnapWallIndex());
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("FurnitureBoxOps place transition: " + e.Message); }
+            finally { ApplyingRemote = false; }
         }
 
         /// <summary>Population-sync bridge: box up a placed furniture object (placed ->
@@ -397,12 +404,14 @@ namespace CardShopCoop.Sync
         {
             if (obj == null || obj.GetIsBoxedUp() || obj.GetIsMovingObject())
                 return;
+            ApplyingRemote = true;
             try
             {
                 obj.BoxUpObject(holdBox: false);
                 BoxVisuals.ApplyOpenEvent(obj.GetPackagingBoxShelf(), false); // a fresh box-up is closed
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("FurnitureBoxOps boxup transition: " + e.Message); }
+            finally { ApplyingRemote = false; }
         }
 
         public static void AlignJustSpawnedBox(EObjectType objType, Vector3 position, Quaternion rotation)

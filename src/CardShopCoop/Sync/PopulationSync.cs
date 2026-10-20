@@ -511,6 +511,7 @@ namespace CardShopCoop.Sync
                 InteractableObject spawned;
                 if (e.IsBoxed && kind != 5)
                 {
+                    int countBefore = GetList(sm, kind)?.Count ?? 0;
                     CardShopCoop.Patches.GamePatches.ApplyingMirrorPurchase = true;
                     try
                     {
@@ -518,7 +519,7 @@ namespace CardShopCoop.Sync
                             (EObjectType)e.ObjType, e.BoxedPos, e.BoxedRot);
                     }
                     finally { CardShopCoop.Patches.GamePatches.ApplyingMirrorPurchase = false; }
-                    spawned = FindBoxedObjectAtPose(kind, e.ObjType, e.BoxedPos);
+                    spawned = FindBoxedObjectAtPose(kind, e.ObjType, e.BoxedPos, countBefore);
                 }
                 else
                 {
@@ -687,21 +688,32 @@ namespace CardShopCoop.Sync
             return entry.IsBoxed ? entry.BoxedPos : entry.Pos;
         }
 
-        private static InteractableObject FindBoxedObjectAtPose(int kind, int objType, Vector3 boxPos)
+        private static InteractableObject FindBoxedObjectAtPose(int kind, int objType, Vector3 boxPos,
+            int countBefore)
         {
-            // SpawnInteractableObjectInPackageBox does not return the object. Resolve
-            // the newly registered object by its type and delivery-box pose; the
-            // nearest match is deterministic because the host entry was just missing.
+            // SpawnInteractableObjectInPackageBox does not return the object. The game
+            // appends it to the list, so take the entry added by this spawn. Several
+            // boxes from one order can share a delivery spot, so the nearest pose alone
+            // can return an earlier box that is already bound to another host id.
             var sm = CSingleton<ShelfManager>.Instance;
             var list = GetList(sm, kind);
             InteractableObject found = null;
             float best = float.MaxValue;
             if (list == null)
                 return null;
+            for (int i = list.Count - 1; i >= countBefore && i >= 0; i--)
+            {
+                var obj = list[i] as InteractableObject;
+                if (obj != null && (int)obj.m_ObjectType == objType && IsBoxed(obj)
+                    && !PlacedObjectIdentity.TryGet(obj, out _))
+                    return obj;
+            }
+            // Fallback: the nearest boxed object of this type that has no host id yet.
             for (int i = 0; i < list.Count; i++)
             {
                 var obj = list[i] as InteractableObject;
-                if (obj == null || (int)obj.m_ObjectType != objType || !IsBoxed(obj))
+                if (obj == null || (int)obj.m_ObjectType != objType || !IsBoxed(obj)
+                    || PlacedObjectIdentity.TryGet(obj, out _))
                     continue;
                 var box = obj.GetPackagingBoxShelf();
                 if (box == null)
