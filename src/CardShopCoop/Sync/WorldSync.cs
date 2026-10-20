@@ -133,6 +133,7 @@ namespace CardShopCoop.Sync
             _hostAcks.Clear();
             _boxPulls.Clear();
             _boxPullSequence = 0;
+            HeldBoxPullAnimation.Clear();
             _sm = null;
         }
 
@@ -266,6 +267,7 @@ namespace CardShopCoop.Sync
                 ItemType = source.GetItemType(),
                 Sequence = ++_boxPullSequence
             });
+            HeldBoxPullAnimation.Note(id, source, source.GetItemType());
         }
 
         public void HostApplyBoxPull(ShelfBoxPullMessage message, int connId, BoxEngine boxes)

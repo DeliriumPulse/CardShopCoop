@@ -1329,7 +1329,30 @@ namespace CardShopCoop.Sync
                         && (w.Possession == BoxPossession.Held || w.Possession == BoxPossession.Placing)
                         && w.OwnerConn != CoopCore.LocalConnectionId;
                     if (!lostToAnotherOwner)
+                    {
+                        // A shelf-to-box pull (ShelfBoxPull) is run by the host only, so the
+                        // item it adds to the box in my hand arrives through this snapshot.
+                        // Take the host's contents when I have no edit of my own in flight:
+                        // no reserved transfer, and nothing changed since my last report.
+                        if (w.Family == BoxFamily.Item
+                            && !_transfers.IsAddReserved(w.Id) && !_transfers.IsTakeReserved(w.Id)
+                            && _baselineItemCount.TryGetValue(box, out var heldCount)
+                            && _baselineItemType.TryGetValue(box, out var heldType)
+                            && family.ReadItemCount(box) == heldCount && family.ReadItemType(box) == heldType
+                            && (w.ItemCount != heldCount || !family.ContentMatches(box, w)))
+                        {
+                            // fly the pulled item in from its shelf; anything else is a plain
+                            // contents-only apply (it never changes a held box's possession)
+                            if (!(box is InteractablePackagingBox_Item heldItems
+                                && EnumMap.TryFromWire(EnumKind.ItemType, w.ItemType, out int heldWireType)
+                                && HeldBoxPullAnimation.TryApply(w.Id, heldItems, (EItemType)heldWireType, w.ItemCount)))
+                                family.ApplyState(box, w, isOwner: true);
+                            _reportedContent[box] = family.ContentSignature(box);
+                            _baselineItemCount[box] = family.ReadItemCount(box);
+                            _baselineItemType[box] = family.ReadItemType(box);
+                        }
                         continue;
+                    }
                     BoxShared.DebugLog("box-rx",
                         $"id={w.Id} fam={w.Family} local-held but authoritative owner={w.OwnerConn}; releasing local hold");
                     CoopCore.ForceExitHoldBox(box);
