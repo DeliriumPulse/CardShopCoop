@@ -886,7 +886,13 @@ namespace CardShopCoop
                         int localHour = FiTimeHour?.GetValue(_lightManager) is int h ? h : -1;
                         int localMin = FiTimeMin?.GetValue(_lightManager) is int m2 ? m2 : 0;
                         int driftMin = Math.Abs((data.m_TimeHour * 60 + data.m_TimeMin) - (localHour * 60 + localMin));
-                        bool phaseDiffer = localIdx != data.m_TImeOfDayIndex;
+                        // The client's own EvaluateTimeClock moves m_TImeOfDayIndex as its clock
+                        // runs, but its lighting only changes through the restore below (the sun
+                        // lerp and skybox run at m_TimerLerpSpeed, which is 0 here). Compare
+                        // against the phase the lighting was last restored to, not the index.
+                        if (_clientLightPhase < 0 && localIdx == data.m_TImeOfDayIndex)
+                            _clientLightPhase = localIdx; // joined in this phase; lighting matches
+                        bool phaseDiffer = _clientLightPhase != data.m_TImeOfDayIndex;
 
                         // LightState is the complete authoritative snapshot. Apply its
                         // clock before evaluating brightness so a client that already ran
@@ -918,6 +924,7 @@ namespace CardShopCoop
                         {
                             FiFinishLoading?.SetValue(_lightManager, false);
                             MiLightInit?.Invoke(_lightManager, null);
+                            _clientLightPhase = data.m_TImeOfDayIndex;
                             CoopPlugin.Log.LogInfo($"lighting re-synced (phase {localIdx}->{data.m_TImeOfDayIndex}, drift {driftMin}min)");
                         }
                         FiHasDayEnded?.SetValue(_lightManager, false);

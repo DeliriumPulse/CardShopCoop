@@ -34,6 +34,7 @@ namespace CardShopCoop
             else
             {
                 _hostClockMinutes = -1f;
+                _clientLightPhase = -1;
                 if (_clientClockFrozen)
                 {
                     FiTimerLerpSpeed.SetValue(manager, _clientClockOriginalSpeed);
@@ -171,6 +172,7 @@ namespace CardShopCoop
             }
             finally
             {
+                _clientLightPhase = -1; // the reset restored the morning lighting itself
                 _clientDayResetInFlight = false;
                 _clientDayResetDeadline = 0f;
                 Patches.GamePatches.AllowNextDayStarted = false;
@@ -199,11 +201,16 @@ namespace CardShopCoop
             bool shop = manager.m_ShoplightGrp != null && manager.m_ShoplightGrp.activeSelf;
             bool night = manager.m_NightlightGrp != null && manager.m_NightlightGrp.activeSelf;
             bool sunlight = manager.m_SunlightGrp != null && manager.m_SunlightGrp.activeSelf;
-            if (!_observedLightState || shop != _observedShopLight || night != _observedNightLight || sunlight != _observedSunlight)
+            // a new time-of-day phase starts the evening/night lighting, which clients only
+            // pick up from a LightState, so send one now instead of on the 30 s heartbeat
+            int phase = FiTimeOfDayIdx?.GetValue(manager) is int idx ? idx : -1;
+            if (!_observedLightState || shop != _observedShopLight || night != _observedNightLight
+                || sunlight != _observedSunlight || phase != _observedPhase)
             {
                 _observedShopLight = shop;
                 _observedNightLight = night;
                 _observedSunlight = sunlight;
+                _observedPhase = phase;
                 _observedLightState = true;
                 ForceLightResend();
             }

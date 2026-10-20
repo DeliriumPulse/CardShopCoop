@@ -364,6 +364,7 @@ namespace CardShopCoop
         private bool _observedNightLight;
         private bool _observedSunlight;
         private bool _observedLightState;
+        private int _observedPhase;
         private bool _clientDayResetPending;
         private bool _clientDayResetInFlight;
         private float _clientDayResetDeadline;
@@ -372,6 +373,8 @@ namespace CardShopCoop
         // the host's clock at its last DayTime update, in minutes since midnight (-1 = none yet)
         private float _hostClockMinutes = -1f;
         private float _hostClockReceivedAt;
+        // the time-of-day phase the client's lighting was last restored to (-1 = unknown)
+        private int _clientLightPhase = -1;
         private int _lastLicenseHash;
         private float _licenseHeal;
 
