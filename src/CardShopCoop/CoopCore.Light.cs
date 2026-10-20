@@ -29,12 +29,80 @@ namespace CardShopCoop
                     _clientClockFrozen = true;
                 }
                 FiTimerLerpSpeed.SetValue(manager, 0f);
+                AdvanceClientClock(manager);
             }
-            else if (_clientClockFrozen)
+            else
             {
-                FiTimerLerpSpeed.SetValue(manager, _clientClockOriginalSpeed);
-                _clientClockFrozen = false;
+                _hostClockMinutes = -1f;
+                if (_clientClockFrozen)
+                {
+                    FiTimerLerpSpeed.SetValue(manager, _clientClockOriginalSpeed);
+                    _clientClockFrozen = false;
+                }
             }
+        }
+
+        // How far (game minutes) the client may run past the host's last DayTime update. The
+        // host sends one every 2 s, at 1 game minute per second.
+        private const float MaxClientClockLead = 2.5f;
+        // The client never reaches 21:00 on its own; ending the day is the host's call.
+        private const float LastClientClockMinute = 21f * 60f - 0.001f;
+
+        /// <summary>Client: run the frozen clock forward between host updates so the HUD
+        /// counts minute by minute instead of jumping 2 minutes every 2 seconds. Uses the same
+        /// gates as vanilla LightManager.Update, never goes backward, and sets the hour itself so
+        /// EvaluateTimeClock's rollover branch (which also ages grading jobs) never runs here.</summary>
+        private void AdvanceClientClock(LightManager manager)
+        {
+            if (_hostClockMinutes < 0f || !CPlayerData.m_IsShopOnceOpen
+                || _clientDayResetPending || _clientDayResetInFlight)
+                return;
+            try
+            {
+                if (FiHasDayEnded?.GetValue(manager) is bool ended && ended)
+                    return;
+                float target = _hostClockMinutes
+                    + (Time.unscaledTime - _hostClockReceivedAt) * _clientClockOriginalSpeed;
+                target = Mathf.Min(target, _hostClockMinutes + MaxClientClockLead, LastClientClockMinute);
+                if (target > ClientClockMinutes(manager))
+                    SetClientClock(manager, target, forceEvaluate: false);
+            }
+            catch (Exception e) { Swallow.Log(e); }
+        }
+
+        /// <summary>Client: apply the host's clock from DayTime or LightState. Snaps to the host
+        /// unless the client is only slightly ahead from running its own clock, so the HUD never
+        /// ticks backward; it then waits for the host within MaxClientClockLead.</summary>
+        private void ApplyHostClock(LightManager manager, int hour, float minFloat, bool dayChanged)
+        {
+            float host = hour * 60f + minFloat;
+            _hostClockMinutes = host;
+            _hostClockReceivedAt = Time.unscaledTime;
+            float ahead = ClientClockMinutes(manager) - host;
+            if (!dayChanged && hour < 21 && ahead > 0f && ahead <= MaxClientClockLead + 0.5f)
+                return;
+            SetClientClock(manager, host, forceEvaluate: dayChanged);
+        }
+
+        private static float ClientClockMinutes(LightManager manager)
+        {
+            int hour = FiTimeHour?.GetValue(manager) is int h ? h : 0;
+            float minFloat = FiTimeMinFloat?.GetValue(manager) is float m ? m : 0f;
+            return hour * 60f + minFloat;
+        }
+
+        private static void SetClientClock(LightManager manager, float minutes, bool forceEvaluate)
+        {
+            int hour = Mathf.FloorToInt(minutes / 60f);
+            float minFloat = minutes - hour * 60f;
+            int min = Mathf.Min(Mathf.FloorToInt(minFloat), 59);
+            bool changed = !(FiTimeHour?.GetValue(manager) is int oldHour && oldHour == hour)
+                || !(FiTimeMin?.GetValue(manager) is int oldMin && oldMin == min);
+            FiTimeHour?.SetValue(manager, hour);
+            FiTimeMin?.SetValue(manager, min);
+            FiTimeMinFloat?.SetValue(manager, minFloat);
+            if (changed || forceEvaluate)
+                MiEvaluateTimeClock?.Invoke(manager, null);
         }
 
         private void MarkClientDayResetPending()

@@ -200,10 +200,7 @@ namespace CardShopCoop
                             // Always apply the host clock, even while a morning reset is
                             // pending. The old gate let the local clock run unchecked until
                             // it reached night, then dropped every lighting correction.
-                            FiTimeHour?.SetValue(_lightManager, hour);
-                            FiTimeMin?.SetValue(_lightManager, min);
-                            FiTimeMinFloat?.SetValue(_lightManager, minFloat);
-                            MiEvaluateTimeClock?.Invoke(_lightManager, null);
+                            ApplyHostClock(_lightManager, hour, minFloat, dayChanged);
                             if (hour < 21)
                                 FiHasDayEnded?.SetValue(_lightManager, false);
 
@@ -895,9 +892,7 @@ namespace CardShopCoop
                         // clock before evaluating brightness so a client that already ran
                         // into night cannot remain dark while the reset latch is pending.
                         CPlayerData.m_LightTimeData = data;
-                        FiTimeHour?.SetValue(_lightManager, data.m_TimeHour);
-                        FiTimeMin?.SetValue(_lightManager, data.m_TimeMin);
-                        FiTimeMinFloat?.SetValue(_lightManager, data.m_TimeMinFloat);
+                        ApplyHostClock(_lightManager, data.m_TimeHour, data.m_TimeMinFloat, dayChanged: false);
                         FiTimeOfDayIdx?.SetValue(_lightManager, data.m_TImeOfDayIndex);
                         bool groupsDiffer = _lightManager.m_NightlightGrp == null
                             || _lightManager.m_ShoplightGrp == null

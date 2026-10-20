@@ -369,6 +369,9 @@ namespace CardShopCoop
         private float _clientDayResetDeadline;
         private bool _clientClockFrozen;
         private float _clientClockOriginalSpeed = 1f;
+        // the host's clock at its last DayTime update, in minutes since midnight (-1 = none yet)
+        private float _hostClockMinutes = -1f;
+        private float _hostClockReceivedAt;
         private int _lastLicenseHash;
         private float _licenseHeal;
 
