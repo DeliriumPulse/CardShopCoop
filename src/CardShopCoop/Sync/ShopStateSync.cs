@@ -646,6 +646,13 @@ namespace CardShopCoop.Sync
             ApplyTutorial(tutIndex, incomingTut);
         }
 
+        // The hints ShopRenamer.SetIsTutorial adds and its OnTriggerEnter removes.
+        private static readonly EGameAction[] TutorialMoveHints =
+        {
+            EGameAction.MoveForward, EGameAction.MoveLeft, EGameAction.MoveBackward,
+            EGameAction.MoveRight, EGameAction.Jump, EGameAction.Sprint, EGameAction.Crouch,
+        };
+
         /// <summary>Client: replay the host's authoritative task progress so the guest's
         /// tutorial panel advances in step. No-ops when nothing changed (so a routine
         /// ShopState heal doesn't churn the panel). Resets each subgroup's private progress
@@ -670,9 +677,27 @@ namespace CardShopCoop.Sync
                 CPlayerData.m_TutorialDataList = new System.Collections.Generic.List<TutorialData>();
             CPlayerData.m_TutorialDataList.Clear();
             CPlayerData.m_TutorialDataList.AddRange(incoming);
+            int prevIndex = CPlayerData.m_TutorialIndex;
             CPlayerData.m_TutorialIndex = tutIndex;
 
             var tm = UnityEngine.Object.FindObjectOfType<TutorialManager>(); // NOT CSingleton (fake-manager trap)
+            // A new save hides the HUD and shows movement hints and the "!" marker at the
+            // naming spot until the shop is named (TutorialManager.OnGameDataFinishLoaded,
+            // ShopRenamer.SetIsTutorial). The renamer clears them as the shop is named, but
+            // only on the host, so undo them here when the host's naming arrives.
+            if (prevIndex == 0 && tutIndex != 0)
+            {
+                try
+                {
+                    if (tm != null && tm.m_TutorialTargetIndicator != null)
+                        tm.m_TutorialTargetIndicator.SetActive(false);
+                    foreach (var action in TutorialMoveHints)
+                        InteractionPlayerController.RemoveToolTip(action);
+                    GameUIScreen.SetGameUIVisible(isVisible: true);
+                }
+                catch (Exception e) { CoopPlugin.Log.LogWarning("tutorial HUD show: " + e.Message); }
+            }
+
             if (tm == null || tm.m_TutorialSubGroupList == null)
                 return;
             foreach (var sg in tm.m_TutorialSubGroupList)
