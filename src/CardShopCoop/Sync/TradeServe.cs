@@ -507,8 +507,10 @@ namespace CardShopCoop.Sync
         }
 
         /// <summary>Client: SetCustomer(data) restores the display labels but vanilla does
-        /// not restore the editable sell-in input. Seed it from the authoritative ask so a
-        /// new customer cannot inherit the previous customer's bid.</summary>
+        /// not restore the editable sell-in input. Seed it from the host's current offer, the
+        /// value those labels show, so a new customer cannot inherit the previous customer's
+        /// bid. The input's text sits under the visible price, and accept commits it, so
+        /// seeding any other value shows through and sends a bid the player never saw.</summary>
         public static void ClientSetCustomerPostfix(CustomerTradeCardScreen __instance,
             Customer customer, CustomerTradeData customerTradeData)
         {
@@ -517,9 +519,14 @@ namespace CardShopCoop.Sync
                 return;
             try
             {
-                __instance.m_SetPriceInput.SetTextWithoutNotify(GameInstance.GetPriceString(
-                    customerTradeData.m_SellCardAskPrice,
-                    useDashAsZero: false, useCurrencySymbol: false));
+                // same formatting as vanilla OnInputTextUpdated
+                float priceSet = customerTradeData.m_PriceSet;
+                __instance.m_SetPriceInput.SetTextWithoutNotify(
+                    CSingleton<CGameManager>.Instance.m_CurrencyType == EMoneyCurrencyType.Yen
+                        ? GameInstance.GetPriceString(priceSet, useDashAsZero: false,
+                            useCurrencySymbol: false, useCentSymbol: false, "F0")
+                        : GameInstance.GetPriceString(priceSet, useDashAsZero: false,
+                            useCurrencySymbol: false));
             }
             catch (System.Exception e)
             {
