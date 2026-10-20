@@ -624,6 +624,10 @@ namespace CardShopCoop.Sync
                 // vanilla DelayGoNextDay keeps it up 0.5 s before and 2.5 s after GoNextDay;
                 // the host's new day reaches us around the GoNextDay moment
                 yield return new WaitForSeconds(2.5f);
+                // The host cleared last night's customers at GoNextDay. Drop the ones it has
+                // stopped sending while the screen is still black, not 6 s later.
+                NpcSync.DropStaleOnce(1.5f);
+                yield return null;
             }
             finally
             {

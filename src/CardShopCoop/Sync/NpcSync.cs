@@ -149,6 +149,7 @@ namespace CardShopCoop.Sync
                 _live = this;
             _cm = null;
             _inv = null;
+            s_staleTimeoutOnce = 0f;
             _missingHoldFieldLogged = false;
             _sendTimer = 0f;
             _nameRefreshIn = 0f;
@@ -712,6 +713,16 @@ namespace CardShopCoop.Sync
 
         public static int ExistingMirrorCount => _live == null ? 0 : _live._existing.Count;
 
+        private static float s_staleTimeoutOnce;
+
+        /// <summary>Client only. On the next puppet tick, despawn NPCs the host has not sent
+        /// for <paramref name="maxAge"/> seconds instead of the usual 6 s. The day transition
+        /// uses it so customers the host cleared at the new day do not walk on after the fade.</summary>
+        public static void DropStaleOnce(float maxAge)
+        {
+            s_staleTimeoutOnce = maxAge;
+        }
+
         public void ClearPuppets()
         {
             foreach (var p in _puppets.Values)
@@ -1173,6 +1184,8 @@ namespace CardShopCoop.Sync
             if (!inGame || dt <= 0f)
                 return;
             _now += dt;
+            float staleTimeout = s_staleTimeoutOnce > 0f ? s_staleTimeoutOnce : 6f;
+            s_staleTimeoutOnce = 0f;
 
             float renderTime = _now - InterpDelay;
             // frame-rate-independent blend factors (never dt*k, which overshoots at low fps)
@@ -1191,7 +1204,7 @@ namespace CardShopCoop.Sync
                 // generous: NPC state rides the UNRELIABLE lane, and flaky NATs starve
                 // it in bursts - a 1.5s timeout made whole crowds blink out and back
                 // for players on rough connections (first field report)
-                if (_now - p.LastSeen > 6f)
+                if (_now - p.LastSeen > staleTimeout)
                 {
                     if (p.Go != null)
                         Object.Destroy(p.Go);
@@ -1269,7 +1282,7 @@ namespace CardShopCoop.Sync
             foreach (var kv in _existing)
             {
                 var mirror = kv.Value;
-                if (_now - mirror.LastSeen > 6f)
+                if (_now - mirror.LastSeen > staleTimeout)
                 {
                     if (mirror.Customer != null)
                         mirror.Customer.gameObject.SetActive(false);
