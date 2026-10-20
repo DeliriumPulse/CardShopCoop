@@ -5499,6 +5499,15 @@ namespace CardShopCoop
                     {
                         CoopPlugin.Log.LogInfo($"{who} bought furniture: {(EObjectType)line.ItemType}");
                         ShelfManager.SpawnInteractableObjectInPackageBox((EObjectType)line.ItemType, line.Position, line.Rotation);
+                        // Vanilla's furniture checkout saves the object data a second later
+                        // (DelaySaveShelfData). Without it, CPlayerData.m_PlayTableSaveDataList
+                        // has no entry for a new play table, and UpdatePlayTableSaveData throws
+                        // when a customer sits, before the sitting pose is set.
+                        try
+                        {
+                            UnityEngine.Object.FindObjectOfType<ShelfManager>()?.SaveInteractableObjectData();
+                        }
+                        catch (Exception e) { Swallow.Log(e); }
                     }
                     else if (!CPlayerData.GetIsItemLicenseUnlocked(resolved[i]))
                     {
