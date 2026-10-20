@@ -670,6 +670,13 @@ namespace CardShopCoop
                 return;
             },
                 MessagePolicy.HostOnlyInGame, true, heal: () => _shopState.ForceResend());
+            _messageRouter.Register<TutorialProgressMessage>((context, message) =>
+            {
+                if (Role != CoopRole.Host || !InGameLevel())
+                    return;
+                _shopState.HostApplyTutorialProgress(message);
+            },
+                MessagePolicy.HostOnlyInGame, true, heal: () => _shopState.ForceResend());
             _messageRouter.Register<ShopStateMessage>((context, message) =>
             {
                 if (Role != CoopRole.Client || !InGameLevel())

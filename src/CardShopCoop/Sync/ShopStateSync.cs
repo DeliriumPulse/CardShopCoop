@@ -57,6 +57,8 @@ namespace CardShopCoop.Sync
             AccessTools.Field(typeof(TutorialSubGroup), "m_CurrentValue");
         private static readonly System.Reflection.FieldInfo FiSgFinish =
             AccessTools.Field(typeof(TutorialSubGroup), "m_IsTaskFinish");
+        private static readonly System.Reflection.FieldInfo FiTutorialFinished =
+            AccessTools.Field(typeof(TutorialManager), "m_FinishedTutorial");
 
         public Action<INetMessage> SendOp;         // set by CoopCore: client -> host
         public Action<INetMessage> BroadcastState; // set by CoopCore: host -> clients
@@ -178,6 +180,11 @@ namespace CardShopCoop.Sync
             // flips everyone's light (applied surgically in CoopCore's LightState handler).
             Try(h, typeof(InteractableLightSwitch), "OnMouseButtonUp",
                 prefix: new HarmonyMethod(typeof(ShopStateSync), nameof(LightSwitchPrefix)));
+
+            // Quests: the host's tutorial is the shared one, so a step the client's game
+            // counts locally must reach the host or the next ShopState echo erases it.
+            Try(h, typeof(TutorialManager), "AddTaskValue",
+                postfix: new HarmonyMethod(typeof(ShopStateSync), nameof(TutorialTaskPostfix)));
         }
 
         private static void Try(Harmony h, Type type, string method,
@@ -267,6 +274,36 @@ namespace CardShopCoop.Sync
             // result via LightState.
             RequestLightToggle();
             return false;
+        }
+
+        // Quest steps that run only in the client's game. Every other condition is already
+        // counted by the host (forwarded sign flip, CreditGuestCheckout, host-placed furniture
+        // from a client's box, host customers, license sync, and ApplyPurchaseRequest for
+        // restock orders), so forwarding those would count them twice.
+        private static readonly System.Collections.Generic.HashSet<ETutorialTaskCondition> ClientCountedTasks =
+            new System.Collections.Generic.HashSet<ETutorialTaskCondition>
+        {
+            ETutorialTaskCondition.PickupBox,
+            ETutorialTaskCondition.PutItemOnShelf,
+            ETutorialTaskCondition.SetItemPrice,
+            ETutorialTaskCondition.InteractCashierCounter,
+            ETutorialTaskCondition.OpenPack,
+            ETutorialTaskCondition.PutCardOnShelf,
+        };
+
+        public static void TutorialTaskPostfix(ETutorialTaskCondition tutorialTaskCondition, float valueAdd)
+        {
+            if (CoopCore.Role != CoopRole.Client || ApplyingRemote
+                || !ClientCountedTasks.Contains(tutorialTaskCondition))
+                return;
+            try
+            {
+                // vanilla ignored the step once the tutorial is done; so does the host
+                if (FiTutorialFinished?.GetValue(CSingleton<TutorialManager>.Instance) is bool done && done)
+                    return;
+            }
+            catch (Exception e) { Swallow.Log(e); }
+            _instance?.SendOp?.Invoke(new TutorialProgressMessage { Condition = tutorialTaskCondition, Value = valueAdd });
         }
 
         public static bool WarehouseSignPrefix()
@@ -365,6 +402,22 @@ namespace CardShopCoop.Sync
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("ShopStateSync op " + op + ": " + e.Message); }
             ForceResend(); // echo promptly even if the op was refused (re-aligns the joiner)
+        }
+
+        /// <summary>Host: add a client's locally counted quest step to the shared tutorial.
+        /// Vanilla only ever adds +1 or -1 (a display card taken back off its shelf) for
+        /// these conditions, so anything else is rejected.</summary>
+        public void HostApplyTutorialProgress(TutorialProgressMessage message)
+        {
+            if (message == null || !ClientCountedTasks.Contains(message.Condition)
+                || float.IsNaN(message.Value) || Mathf.Abs(message.Value) > 1f)
+                return;
+            try
+            {
+                TutorialManager.AddTaskValue(message.Condition, message.Value);
+            }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("tutorial progress: " + e.Message); }
+            ForceResend(); // echo promptly so the client's panel doesn't snap back first
         }
 
         /// <summary>Host: run the guest's forwarded shop-light toggle in the real sim. The

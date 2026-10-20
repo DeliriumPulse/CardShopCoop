@@ -5485,6 +5485,7 @@ namespace CardShopCoop
             // delivery when the wallet is checked again after spawning.
             _pendingReduceThisFrame += total;
             double deliveredTotal = 0.0;
+            int restockedBoxes = 0;
             for (int i = 0; i < request.Lines.Count; i++)
             {
                 var line = request.Lines[i];
@@ -5494,6 +5495,7 @@ namespace CardShopCoop
                     {
                         RestockManager.SpawnPackageBoxItemMultipleFrame(resolved[i], line.Count);
                         CEventManager.QueueEvent(new CEventPlayer_AddShopExp(line.Count * 5));
+                        restockedBoxes += line.Count;
                     }
                     else if (request.Kind == 1)
                     {
@@ -5514,6 +5516,17 @@ namespace CardShopCoop
                     failures.Add($"'{item}' ({e.Message})");
                     CoopPlugin.Log.LogWarning($"purchase delivery failed for conn {connectionId}, line {i} ({item}): {e.Message}");
                 }
+            }
+
+            // Vanilla's phone and scanner checkouts count the order's boxes toward the
+            // restock quest; the client's checkout was replaced by this request.
+            if (restockedBoxes > 0)
+            {
+                try
+                {
+                    TutorialManager.AddTaskValue(ETutorialTaskCondition.RestockItem, restockedBoxes);
+                }
+                catch (Exception e) { Swallow.Log(e); }
             }
 
             // Release the reservation for failed lines; the remaining reservation is the
