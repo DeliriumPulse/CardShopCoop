@@ -5492,6 +5492,12 @@ namespace CardShopCoop
                 {
                     if (request.Kind == 0)
                     {
+                        // Vanilla phone checkout updates the average cost before spawning;
+                        // the client's local checkout did, so the host must as well.
+                        var rd = CatalogAt(resolved[i]);
+                        CPlayerData.UpdateAverageItemCost(rd.itemType,
+                            line.Count * RestockManager.GetMaxItemCountInBox(rd.itemType, rd.isBigBox),
+                            CPlayerData.GetItemCost(rd.itemType));
                         RestockManager.SpawnPackageBoxItemMultipleFrame(resolved[i], line.Count);
                         CEventManager.QueueEvent(new CEventPlayer_AddShopExp(line.Count * 5));
                     }
