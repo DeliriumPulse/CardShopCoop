@@ -67,7 +67,7 @@ namespace CardShopCoop.Net.Messages
 
     }
 
-    /// <summary>One NPC snapshot within an NpcState batch. Flags is the raw wire byte
+    /// <summary>One NPC snapshot within an NpcState batch. Flags is the raw wire value
     /// (the game's NpcFlags is a private nested enum in NpcSync).</summary>
     public sealed class NpcEntry
     {
@@ -79,7 +79,7 @@ namespace CardShopCoop.Net.Messages
         public Vector3 Position;
         public float Yaw;
         public float Speed;
-        public byte Flags;
+        public ushort Flags;
         public int ActionSequence;
         public byte ActionKind;
         public bool HoldBig;

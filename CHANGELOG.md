@@ -5,6 +5,18 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.3.0
+**Customers now react to the deodorant spray on every player's screen.**
+
+- **Fixed: a customer sprayed with deodorant only reacted on the host's screen.** Whether the
+  host or a joining player did the spraying, everyone else saw the customer carry on as if
+  nothing happened (the stink cloud still cleared, but there was no reaction). The reaction now
+  plays for every player, including sprays from the automatic deodorant sprayer.
+
+**Both players must update.**
+
+---
+
 ## 1.2.0
 **Boxes and furniture now stay in sync through pickups, throws, placement, and joining, cards no longer vanish when a guest sets them out to sell or is holding them, and registers, workers, and served customers no longer get stuck or vanish during co-op.**
 

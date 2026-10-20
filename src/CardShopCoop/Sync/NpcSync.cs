@@ -48,6 +48,8 @@ namespace CardShopCoop.Sync
         private static readonly int HashIsSitting = Animator.StringToHash("IsSitting");
         private static readonly int HashIsPlaying = Animator.StringToHash("IsPlaying");
         private static readonly int HashIsHoldingBox = Animator.StringToHash("IsHoldingBox");
+        // Customer-only parameter: worker animators lack it, so it stays out of CollectFlags.
+        private static readonly int HashIsBeingSprayed = Animator.StringToHash("IsBeingSprayed");
         private static readonly System.Reflection.MethodInfo MiEvaluateWorkerAttribute =
             HarmonyLib.AccessTools.Method(typeof(Worker), "EvaluateWorkerAttribute");
         private static readonly System.Reflection.MethodInfo MiEvaluateSkillLevel =
@@ -56,7 +58,7 @@ namespace CardShopCoop.Sync
             HarmonyLib.AccessTools.Field(typeof(Worker), "m_CurrentHoldItemBox");
 
         [System.Flags]
-        private enum NpcFlags : byte
+        private enum NpcFlags : ushort
         {
             None = 0,
             HoldingBag = 1,
@@ -67,6 +69,7 @@ namespace CardShopCoop.Sync
             Smelly = 32,
             Exclaim = 64,   // the red "!" trade-prompt mesh is showing
             Female = 128,   // puppet should spawn from the female prefab (workers esp.)
+            BeingSprayed = 256, // customer's deodorant-spray reaction (animator IsBeingSprayed)
         }
 
         // ---------------- host: collect & serialize ----------------
@@ -237,6 +240,14 @@ namespace CardShopCoop.Sync
                         flags |= NpcFlags.Exclaim;
                 }
                 catch (System.Exception e) { Swallow.Log(e); }
+                // vanilla DeodorantSprayCheck holds this for 1.5-3.5s, long enough to survive a
+                // dropped unreliable batch; it covers host, forwarded-client and cleanser sprays
+                try
+                {
+                    if (c.m_Anim != null && c.m_Anim.GetBool(HashIsBeingSprayed))
+                        flags |= NpcFlags.BeingSprayed;
+                }
+                catch (System.Exception e) { Swallow.Log(e); }
                 WriteEntry(chunks, hostTime, KindCustomer, (ushort)i, cc.CharacterName,
                     c.transform, c.m_CurrentMoveSpeed, flags, _customerGenerations[i], grabSequence, actionKind);
             }
@@ -353,7 +364,7 @@ namespace CardShopCoop.Sync
                 Position = p,
                 Yaw = t.eulerAngles.y,
                 Speed = moveSpeed,
-                Flags = (byte)flags,
+                Flags = (ushort)flags,
                 ActionSequence = actionSequence,
                 ActionKind = actionKind,
                 HoldBig = holdBig,
@@ -1117,6 +1128,7 @@ namespace CardShopCoop.Sync
             customer.m_Anim.SetBool(HashIsSitting, (flags & NpcFlags.IsSitting) != 0);
             customer.m_Anim.SetBool(HashIsPlaying, (flags & NpcFlags.IsPlaying) != 0);
             customer.m_Anim.SetBool(HashIsHoldingBox, (flags & NpcFlags.IsHoldingBox) != 0);
+            customer.m_Anim.SetBool(HashIsBeingSprayed, (flags & NpcFlags.BeingSprayed) != 0);
             if (customer.m_ShoppingBagTransform != null)
                 customer.m_ShoppingBagTransform.gameObject.SetActive((flags & NpcFlags.HoldingBag) != 0);
             if (customer.m_CustomerCash != null)
@@ -1242,6 +1254,8 @@ namespace CardShopCoop.Sync
                             p.Anim.SetBool(HashIsSitting, (p.Flags & NpcFlags.IsSitting) != 0);
                             p.Anim.SetBool(HashIsPlaying, (p.Flags & NpcFlags.IsPlaying) != 0);
                             p.Anim.SetBool(HashIsHoldingBox, (p.Flags & NpcFlags.IsHoldingBox) != 0);
+                            if (p.Kind == KindCustomer)
+                                p.Anim.SetBool(HashIsBeingSprayed, (p.Flags & NpcFlags.BeingSprayed) != 0);
                         }
                         catch (System.Exception e) { Swallow.Log(e); }
                     }
