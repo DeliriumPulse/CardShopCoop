@@ -189,7 +189,10 @@ namespace CardShopCoop
                     // through a new morning while the host was still waiting to open shop.
                     CPlayerData.m_IsShopOnceOpen = shopOnceOpen;
                     if (dayChanged)
+                    {
                         MarkClientDayResetPending();
+                        Sync.ReportSync.ShowClientDayTransition();
+                    }
                     try
                     {
                         if (_lightManager == null)
@@ -876,6 +879,7 @@ namespace CardShopCoop
                             {
                                 CPlayerData.m_CurrentDay = lightState.Day;
                                 MarkClientDayResetPending();
+                                Sync.ReportSync.ShowClientDayTransition();
                                 TryStartClientDayReset();
                                 return;
                             }

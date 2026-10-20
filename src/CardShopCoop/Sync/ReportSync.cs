@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using HarmonyLib;
+using I2.Loc;
 using UnityEngine;
 
 namespace CardShopCoop.Sync
@@ -586,6 +587,50 @@ namespace CardShopCoop.Sync
                 catch (System.Exception e) { Swallow.Log(e); }
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("ReportSync close screen: " + e.Message); }
+        }
+
+        /// <summary>Client: play the "Day N -> Day N+1" loading screen when the host's new day
+        /// arrives. Vanilla shows it from OnPressGoNextDay, which is blocked on a joiner (only
+        /// the host may advance the day), so the client never saw the transition.</summary>
+        public static void ShowClientDayTransition()
+        {
+            if (CoopCore.Role != CoopRole.Client)
+                return;
+            try
+            {
+                // same fake-singleton rule as the other screen helpers
+                if (_screen == null)
+                    _screen = UnityEngine.Object.FindObjectOfType<EndOfDayReportScreen>();
+                if (_screen == null || _screen.m_LoadingScreenGrp == null || s_dayTransitionShowing)
+                    return;
+                // m_CurrentDay is already the new day; vanilla labels the screen before
+                // advancing, as Day (old + 1) -> Day (old + 2)
+                int day = CPlayerData.m_CurrentDay;
+                _screen.m_LoadingCurrentDayText.text = LocalizationManager.GetTranslation("Day XXX").Replace("XXX", day.ToString());
+                _screen.m_LoadingNextDayText.text = LocalizationManager.GetTranslation("Day XXX").Replace("XXX", (day + 1).ToString());
+                _screen.StartCoroutine(ClientDayTransitionRoutine(_screen));
+            }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("ReportSync day transition: " + e.Message); }
+        }
+
+        private static bool s_dayTransitionShowing;
+
+        private static System.Collections.IEnumerator ClientDayTransitionRoutine(EndOfDayReportScreen screen)
+        {
+            s_dayTransitionShowing = true;
+            try
+            {
+                screen.m_LoadingScreenGrp.SetActive(true);
+                // vanilla DelayGoNextDay keeps it up 0.5 s before and 2.5 s after GoNextDay;
+                // the host's new day reaches us around the GoNextDay moment
+                yield return new WaitForSeconds(2.5f);
+            }
+            finally
+            {
+                s_dayTransitionShowing = false;
+                if (screen != null && screen.m_LoadingScreenGrp != null)
+                    screen.m_LoadingScreenGrp.SetActive(false);
+            }
         }
     }
 }
