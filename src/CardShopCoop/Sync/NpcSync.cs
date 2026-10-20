@@ -149,7 +149,7 @@ namespace CardShopCoop.Sync
                 _live = this;
             _cm = null;
             _inv = null;
-            s_staleTimeoutOnce = 0f;
+            s_fastStaleRemaining = 0f;
             _missingHoldFieldLogged = false;
             _sendTimer = 0f;
             _nameRefreshIn = 0f;
@@ -713,14 +713,16 @@ namespace CardShopCoop.Sync
 
         public static int ExistingMirrorCount => _live == null ? 0 : _live._existing.Count;
 
-        private static float s_staleTimeoutOnce;
+        private const float FastStaleTimeout = 0.5f;
+        private static float s_fastStaleRemaining;
 
-        /// <summary>Client only. On the next puppet tick, despawn NPCs the host has not sent
-        /// for <paramref name="maxAge"/> seconds instead of the usual 6 s. The day transition
-        /// uses it so customers the host cleared at the new day do not walk on after the fade.</summary>
-        public static void DropStaleOnce(float maxAge)
+        /// <summary>Client only. For the next <paramref name="seconds"/>, despawn NPCs the host
+        /// has not sent for 0.5 s instead of the usual 6 s (the host sends every 0.125 s). The
+        /// day transition uses it so customers the host cleared during the fade, including
+        /// right at its end, do not linger on the client after it.</summary>
+        public static void FastStaleFor(float seconds)
         {
-            s_staleTimeoutOnce = maxAge;
+            s_fastStaleRemaining = seconds;
         }
 
         public void ClearPuppets()
@@ -1184,8 +1186,12 @@ namespace CardShopCoop.Sync
             if (!inGame || dt <= 0f)
                 return;
             _now += dt;
-            float staleTimeout = s_staleTimeoutOnce > 0f ? s_staleTimeoutOnce : 6f;
-            s_staleTimeoutOnce = 0f;
+            float staleTimeout = 6f;
+            if (s_fastStaleRemaining > 0f)
+            {
+                staleTimeout = FastStaleTimeout;
+                s_fastStaleRemaining -= dt;
+            }
 
             float renderTime = _now - InterpDelay;
             // frame-rate-independent blend factors (never dt*k, which overshoots at low fps)
