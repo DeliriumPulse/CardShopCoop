@@ -162,9 +162,24 @@ namespace CardShopCoop.Util
         {
             var parts = new List<string>();
             foreach (var kv in BepInEx.Bootstrap.Chainloader.PluginInfos)
+            {
+                if (IsClientOnlyTooling(kv.Key))
+                    continue;
                 parts.Add(kv.Key + "=" + kv.Value.Metadata.Version);
+            }
             parts.Sort(StringComparer.Ordinal);
             return parts;
+        }
+
+        /// <summary>Plugins that only draw local UI or developer tooling and never touch game
+        /// state, so one player having them installed cannot desync the other. Both sides run
+        /// the same CardShopCoop build (the handshake enforces that), so excluding them here
+        /// keeps the two PluginHash values comparable. Keep this list tight: anything that
+        /// changes items, prices, cards or saves must stay in the parity set.</summary>
+        internal static bool IsClientOnlyTooling(string guid)
+        {
+            return !string.IsNullOrEmpty(guid)
+                && guid.Equals("com.bepis.bepinex.configurationmanager", StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>EPL's custom-item ID registry on disk. Nothing about our IDENTITY reads this

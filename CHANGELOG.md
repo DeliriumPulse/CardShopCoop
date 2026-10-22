@@ -5,6 +5,23 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.10.1.0 — Steam invite joins and friendlier mod checks
+
+- Accepting a Steam invite while the game was closed now actually joins the host's
+  shop once the main menu is up. Before, the invite was recognised but the join
+  never started, so the guest just sat at the menu. (Upstream issue #15.)
+- BepInEx Configuration Manager no longer counts as a "mod set differs" mismatch.
+  It only draws a local settings window and cannot affect the shared shop, so one
+  player having it installed no longer blocks the other from joining. Gameplay
+  mods still have to match exactly on both PCs.
+- The guest-coin fix from 1.10.0.1 (a 25¢ coin showing as $25 on the host, upstream
+  issue #13) is carried forward. It is still waiting on a two-PC cash checkout test.
+
+Validation: Release build with zero warnings/errors; 378 automated checks passed.
+Both of the fixes above touch the Steam startup and join handshake, which the
+checks do not cover — a live Steam invite and a join with Configuration Manager
+on one side still need to be tried. Wire stays 110. **Both players must update.**
+
 ## 1.10.0.1 — stronger item syncing and session reliability
 
 - Guest shelf transfers now merge their requested amount with current host stock.

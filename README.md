@@ -1,6 +1,6 @@
 # CardShopCoop
 
-## Unofficial custom build 1.10.0.1
+## Unofficial custom build 1.10.1.0
 
 This workspace contains a personal test build based on DeliriumPulse/CardShopCoop
 v1.2.0, with fixes for guest joining, character appearance, checkout, and input after
@@ -23,7 +23,7 @@ Planned reliability work is tracked in the [multiplayer improvement queue](docs/
    the **same currency** on both PCs before joining. Different currencies are rejected
    with a message naming the host's currency.
 5. Start the game and check `BepInEx/LogOutput.log` for
-   `Loading [CardShopCoop 1.10.0.1]`. There should be only one CardShopCoop DLL.
+   `Loading [CardShopCoop 1.10.1.0]`. There should be only one CardShopCoop DLL.
 6. Host: load your shop, then F2 -> Host via Steam and send a fresh invitation.
    Guest: accept from the main menu. The co-op window closes once the world is ready.
 
@@ -59,7 +59,7 @@ Open **F2 -> Session -> Connection help** (scroll down if needed).
   targeted box repairs, invalid item replies, and queued shared-wallet debits.
   Queue metrics unavailable for a transport are marked unavailable.
 
-Version 1.10.0.1 uses wire 110. Install this exact version on both PCs; the earlier
+Version 1.10.1.0 uses wire 110. Install this exact version on both PCs; the earlier
 1.9.2.x packages cannot join it. The connection improvements do not add host approval
 prompts. Automatic reconnect is not enabled; an ended session still needs a fresh join.
 

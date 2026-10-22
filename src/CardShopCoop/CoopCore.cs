@@ -4353,7 +4353,7 @@ namespace CardShopCoop
         /// <summary>Drives the -coopautohost / -coopautojoin command-line flows.</summary>
         private void AutoTick(float dt)
         {
-            if (_autoHostSlot < 0 && _autoJoinIp == null)
+            if (_autoHostSlot < 0 && _autoJoinIp == null && _autoJoinSteamLobby == 0)
                 return;
             if (_autoPhase >= 99)
                 return;
