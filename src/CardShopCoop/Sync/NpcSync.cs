@@ -238,7 +238,7 @@ namespace CardShopCoop.Sync
                 }
                 catch (System.Exception e) { Swallow.Log(e); }
                 WriteEntry(chunks, hostTime, KindCustomer, (ushort)i, cc.CharacterName,
-                    c.transform, c.m_CurrentMoveSpeed, flags, _customerGenerations[i], grabSequence, actionKind);
+                    c.transform, c.m_CurrentMoveSpeed, flags, _customerGenerations[i], grabSequence, actionKind, c.m_Anim);
             }
             Util.PerfProbe.End("npc-customers", tCustomers);
 
@@ -354,6 +354,7 @@ namespace CardShopCoop.Sync
                 Yaw = t.eulerAngles.y,
                 Speed = moveSpeed,
                 Flags = (byte)flags,
+                Animation = NpcAnimationPlayback.Capture(speedFromAnim),
                 ActionSequence = actionSequence,
                 ActionKind = actionKind,
                 HoldBig = holdBig,
@@ -600,6 +601,7 @@ namespace CardShopCoop.Sync
         {
             public GameObject Go;
             public Animator Anim;
+            public NpcAnimationLayer[] Animation;
             public CC.CharacterCustomization Custom;
             public GameObject Bag;
             public GameObject Cash;
@@ -934,6 +936,9 @@ namespace CardShopCoop.Sync
                     if (existing != null)
                     {
                         existing.LastSeen = _now;
+                        if (existing.BufCount > 0 && snapTime <= existing.Buf[existing.BufHead].Time + 0.0005f)
+                            continue;
+                        NpcAnimationPlayback.Apply(existing.Customer != null ? existing.Customer.m_Anim : null, ent.Animation);
                         if (existing.BufCount == 0 || snapTime > existing.Buf[existing.BufHead].Time + 0.0005f)
                         {
                             existing.BufHead = (existing.BufHead + 1) & 3;
@@ -1011,6 +1016,7 @@ namespace CardShopCoop.Sync
                         if (visual != null)
                         {
                             visual.LastSeen = _now;
+                            visual.Animation = ent.Animation;
                             visual.Flags = flags;
                             if (visual.BufCount == 0 || snapTime > visual.Buf[visual.BufHead].Time + 0.0005f)
                             {
@@ -1075,6 +1081,9 @@ namespace CardShopCoop.Sync
                     Spawn(p, p.CharName, pos, female, kind, index); // retry a spawn that failed (e.g. manager not ready)
 
                 // reject stale/duplicate packets (unreliable channel can reorder)
+                if (p.BufCount > 0 && snapTime <= p.Buf[p.BufHead].Time + 0.0005f)
+                    continue;
+                p.Animation = ent.Animation;
                 if (p.BufCount == 0 || snapTime > p.Buf[p.BufHead].Time + 0.0005f)
                 {
                     p.BufHead = (p.BufHead + 1) & 3;
@@ -1253,6 +1262,7 @@ namespace CardShopCoop.Sync
                     Toggle(p.Exclaim, (p.Flags & NpcFlags.Exclaim) != 0);
                     p.AppliedFlags = (int)p.Flags;
                 }
+                NpcAnimationPlayback.Apply(p.Anim, p.Animation);
                 if (p.Kind == KindWorker)
                 {
                     if ((p.Flags & NpcFlags.IsHoldingBox) != 0)
@@ -1598,11 +1608,20 @@ namespace CardShopCoop.Sync
             // the original Animator disabled beside a replacement Animator in the same
             // hierarchy; GetComponentInChildren alone can select the wrong one.
             p.Anim = worker != null && worker.m_Anim != null
-                ? worker.m_Anim : clone.GetComponentInChildren<Animator>(true);
+                ? worker.m_Anim : cust != null && cust.m_Anim != null
+                    ? cust.m_Anim : clone.GetComponentInChildren<Animator>(true);
+            if (p.Anim != null)
+            {
+                p.Anim.enabled = true;
+                p.Anim.applyRootMotion = false;
+                p.Anim.cullingMode = AnimatorCullingMode.AlwaysAnimate;
+                p.Anim.keepAnimatorStateOnDisable = true;
+            }
             p.CharName = charName;
             p.PrevRenderedPos = pos;
             p.RenderYaw = 0f;
             p.AnimSpeed = 0f;
+            p.AppliedAnimSpeed = float.NaN;
             p.AppliedFlags = -1;
         }
     }

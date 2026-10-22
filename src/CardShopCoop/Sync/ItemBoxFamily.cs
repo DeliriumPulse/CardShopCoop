@@ -209,6 +209,19 @@ namespace CardShopCoop.Sync
 
         public void ApplyState(InteractablePackagingBox box, in BoxWire w, bool isOwner)
         {
+            try
+            {
+                ApplyStateInner(box, w, isOwner);
+            }
+            finally
+            {
+                if (w.Possession != BoxPossession.Removed && box is InteractablePackagingBox_Item item)
+                    ItemBoxLabel.Refresh(item);
+            }
+        }
+
+        private void ApplyStateInner(InteractablePackagingBox box, in BoxWire w, bool isOwner)
+        {
             var b = box as InteractablePackagingBox_Item;
             if (b == null)
                 return;
@@ -218,7 +231,11 @@ namespace CardShopCoop.Sync
             {
                 case BoxPossession.Held:
                     if (isOwner)
+                    {
+                        if (BoxVisuals.ReadOpen(box))
+                            b.m_ItemCompartment?.SetVisibilityHalfItemMesh(true);
                         return;
+                    }
                     BoxLifecycle.Apply(box, w.Possession);
                     // Hides the box, its world label, and its price tag together.
                     BoxVisuals.SetVisible(box, false);
@@ -379,19 +396,14 @@ namespace CardShopCoop.Sync
         /// next snapshot retries.</summary>
         private static void ApplyStored(InteractablePackagingBox_Item b, in BoxWire w)
         {
-            // Cheap path FIRST, before any scene search: if the box already sits at the
-            // requested slot, the host pose is already the slot's. Without this, every
-            // snapshot re-resolved the rack (a full FindObjectOfType) for every stored box,
-            // which stalled the client on every box change.
+            // Rack identities survive list reordering; indices alone can match the wrong rack.
+            var rack = ResolveWarehouseCompartment(w.StoreShelfId, w.StoreShelf, w.StoreComp);
             if (b.m_IsStored)
             {
                 var current = b.GetBoxStoredCompartment();
-                if (current != null
-                    && current.GetWarehouseIndex() == w.StoreShelf
-                    && current.GetIndex() == w.StoreComp)
+                if (rack != null && current == rack)
                     return; // already correctly stored; the slot owns the pose
             }
-            var rack = ResolveWarehouseCompartment(w.StoreShelfId, w.StoreShelf, w.StoreComp);
             if (rack == null)
             {
                 BoxLifecycle.ApplyEnabled(b, false);
@@ -471,10 +483,13 @@ namespace CardShopCoop.Sync
                 var sm = Sm();
                 if (sm == null)
                     return null;
-                if (shelfId != 0
-                    && PlacedObjectIdentity.TryResolve(sm, 1, shelfId, out var identified)
-                    && identified is WarehouseShelf resolved)
-                    return resolved.GetWarehouseCompartment(compIdx);
+                if (shelfId != 0)
+                {
+                    if (PlacedObjectIdentity.TryResolve(sm, 1, shelfId, out var identified)
+                        && identified is WarehouseShelf resolved)
+                        return resolved.GetWarehouseCompartment(compIdx);
+                    return null; // Wait for population binding; an index may name a different rack.
+                }
                 var list = sm.m_WarehouseShelfList;
                 for (int i = 0; i < list.Count; i++)
                 {

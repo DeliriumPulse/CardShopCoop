@@ -69,8 +69,10 @@ namespace CardShopCoop.Sync
         /// <summary>Host: send the outcome of one client shelf transfer back to its sender so the
         /// requester can roll the unaccepted part out of its hand.</summary>
         public Action<ShelfTransferResultMessage, int> SendResult;
+        public Action<int> TransferHistoryMissing;
         public Action RequestResync;
         public Action<ShelfBoxPullMessage> SendBoxPull;
+        public Action<ShelfBoxCueMessage, int> SendBoxCue;
         private uint _boxPullSequence;
         private readonly ShelfBoxPull _boxPulls = new ShelfBoxPull();
         private bool _resyncRequested;
@@ -78,12 +80,20 @@ namespace CardShopCoop.Sync
         private const float ResyncCooldownSeconds = 2f;
 
         private readonly PendingTransferLedger<int> _transfers = new PendingTransferLedger<int>();
+        private readonly TransferRetryQueue<Entry> _retries = new TransferRetryQueue<Entry>();
+        internal int PendingTransferCount => _transfers.Count;
+        internal int TransferRetryCount => _retries.TotalRetries;
+        internal double OldestPendingTransferSeconds => _transfers.OldestPendingSeconds;
+        internal int InvalidTransferResultCount
+        {
+            get; private set;
+        }
         /// <summary>Local mutations held while an earlier transfer for the same key is
         /// outstanding. EscrowTake records whether the mutation was a hand take (must be
         /// reconciled out of the hand) or a container/restock edit (must not touch the hand).</summary>
         private struct QueuedMutation
         {
-            public Entry Entry; public bool EscrowTake;
+            public Entry Entry; public bool EscrowTake; public Item Item;
         }
         private readonly Dictionary<int, Queue<QueuedMutation>> _queued = new Dictionary<int, Queue<QueuedMutation>>();
         private struct DirtyTake
@@ -91,6 +101,7 @@ namespace CardShopCoop.Sync
             public ShelfCompartment Comp; public int Base; public int Type; public Item Item;
         }
         private readonly List<DirtyTake> _dirtyTakes = new List<DirtyTake>();
+        private readonly List<Item> _untrackedTakes = new List<Item>();
         private readonly HostTransferAcks _hostAcks = new HostTransferAcks();
 
         public WorldSync()
@@ -126,8 +137,11 @@ namespace CardShopCoop.Sync
             _clampWarned.Clear();
             _snapshotErrors.Clear();
             _transfers.Clear();
+            _retries.Clear();
+            InvalidTransferResultCount = 0;
             _queued.Clear();
             _dirtyTakes.Clear();
+            _untrackedTakes.Clear();
             _resyncRequested = false;
             _lastResyncRequestAt = -999f;
             _hostAcks.Clear();
@@ -147,8 +161,9 @@ namespace CardShopCoop.Sync
             _clampWarned.Clear();
             _snapshotErrors.Clear();
             _sm = null;
-            _queued.Clear();
-            _dirtyTakes.Clear();
+            // A local pickup may already be in the hand. Keep its obligation across a
+            // structure change; Tick will either find its new identity or roll it back.
+            // Queued edits likewise need their earlier transfer's result to resolve them.
         }
 
         /// <summary>Request a same-frame scan after a vanilla inventory/shelf mutation.
@@ -161,12 +176,35 @@ namespace CardShopCoop.Sync
         {
             if (!inGame)
                 return;
+            if (_untrackedTakes.Count > 0)
+            {
+                var untracked = _untrackedTakes.ToArray();
+                _untrackedTakes.Clear();
+                for (int i = 0; i < untracked.Length; i++)
+                    RejectUntrackedTake(untracked[i]);
+            }
             if (_dirtyTakes.Count > 0)
             {
                 var pending = _dirtyTakes.ToArray();
                 _dirtyTakes.Clear();
                 for (int i = 0; i < pending.Length; i++)
-                    LocalCompartmentMutation(pending[i].Comp, pending[i].Base, pending[i].Type, -1, pending[i].Item);
+                {
+                    if (CoopCore.Role == CoopRole.Client && !TryGetKey(pending[i].Comp, out _))
+                        RejectUntrackedTake(pending[i].Item);
+                    else
+                        LocalCompartmentMutation(pending[i].Comp, pending[i].Base, pending[i].Type,
+                            -1, pending[i].Item, Mathf.Max(0, pending[i].Base - 1));
+                }
+            }
+            if (CoopCore.Role == CoopRole.Client)
+            {
+                foreach (var queue in _queued.Values)
+                    foreach (var edit in queue)
+                        if (edit.EscrowTake)
+                            HandEscrow.KeepRecentTake(edit.Item);
+                if (OnLocalChanges != null)
+                    _retries.ResendDue(Time.realtimeSinceStartupAsDouble, 8,
+                        (_, entry) => OnLocalChanges(new List<Entry> { entry }));
             }
             if (_resyncRequested && Time.time - _lastResyncRequestAt >= ResyncCooldownSeconds)
             {
@@ -252,13 +290,20 @@ namespace CardShopCoop.Sync
         {
             if (CoopCore.Role != CoopRole.Client || box == null || source == null || boxes == null
                 || !BoxVisuals.ReadOpen(box) || !source.m_CanPutItem || source.GetItemCount() <= 0
-                || source.GetWarehouseShelf() != null || !TryGetKey(source, out int key)
-                || !boxes.TryGetClientId(box, out ushort id) || SendBoxPull == null)
+                || source.GetWarehouseShelf() != null || SendBoxPull == null)
                 return;
+            if (!TryGetKey(source, out int key) || !boxes.TryGetClientId(box, out ushort id))
+            {
+                CoopCore.Instance?.ReportInteraction("This shelf or box has no matching host identity. Use Refresh guest objects in the co-op window, then try again.");
+                return;
+            }
             // Let existing optimistic hand operations settle before asking to move this stock.
             if (_transfers.IsAddReserved(key) || _transfers.IsTakeReserved(key)
                 || _dirtyTakes.Exists(t => t.Comp == source))
+            {
+                CoopCore.Instance?.ReportInteraction("This shelf is still syncing an earlier item transfer. It will unlock automatically when that transfer finishes.");
                 return;
+            }
             SendBoxPull(new ShelfBoxPullMessage
             {
                 ShelfKey = key,
@@ -285,7 +330,24 @@ namespace CardShopCoop.Sync
             _applyingRemote = true;
             try
             {
-                _boxPulls.Apply(connId, message.Sequence, source, box, message.ItemType);
+                var moving = source != null && source.GetItemCount() > 0 ? source.GetLastItem() : null;
+                Vector3 from = moving != null ? moving.transform.position : Vector3.zero;
+                Vector3 scale = moving != null ? moving.transform.lossyScale : Vector3.one;
+                Quaternion rotation = moving != null ? moving.transform.rotation : Quaternion.identity;
+                if (_boxPulls.Apply(connId, message.Sequence, source, box, message.ItemType))
+                {
+                    var target = moving != null ? AccessTools.Field(typeof(Item), "m_TargetTransform").GetValue(moving) as Transform : null;
+                    SendBoxCue?.Invoke(new ShelfBoxCueMessage
+                    {
+                        BoxId = message.BoxId,
+                        Sequence = message.Sequence,
+                        ItemType = message.ItemType,
+                        From = from,
+                        Scale = scale,
+                        Rotation = rotation,
+                        DestinationLocal = target != null ? box.transform.InverseTransformPoint(target.position) : Vector3.up * 0.15f
+                    }, connId);
+                }
             }
             finally
             {
@@ -319,7 +381,25 @@ namespace CardShopCoop.Sync
             });
         }
 
-        private void LocalCompartmentMutation(ShelfCompartment comp, int baseCount, int transferType, int delta, Item takeItem)
+        public void QueueUntrackedTake(Item item)
+        {
+            if (CoopCore.Role == CoopRole.Client && item != null)
+                _untrackedTakes.Add(item);
+        }
+
+        private void RejectUntrackedTake(Item item)
+        {
+            if (item == null)
+                return;
+            HandEscrow.RejectUntrackedTake(item);
+            CoopCore.Instance?.ReportInteraction("This pickup could not match a shared shelf or box. It was returned; use Refresh guest objects in the co-op window and try again.");
+            CoopPlugin.Log.LogWarning("Guest pickup had no shared shelf or box identity; rolled back the local hand item and requested object refresh");
+            RequestResyncCoalesced();
+            CoopCore.Instance?.Boxes?.RequestResyncCoalesced();
+        }
+
+        private void LocalCompartmentMutation(ShelfCompartment comp, int baseCount, int transferType, int delta,
+            Item takeItem, int? recordedCount = null)
         {
             if (_applyingRemote || comp == null || CoopCore.Role == CoopRole.None)
                 return;
@@ -332,7 +412,7 @@ namespace CardShopCoop.Sync
             if (!TryGetKey(comp, out int key))
                 return;
             int type = (int)comp.GetItemType();
-            var e = new Entry { Key = key, Type = type, Count = comp.GetItemCount(), BaseCount = baseCount, TransferType = transferType };
+            var e = new Entry { Key = key, Type = type, Count = recordedCount ?? comp.GetItemCount(), BaseCount = baseCount, TransferType = transferType };
             if (CoopCore.Role == CoopRole.Client && delta != 0)
             {
                 // Only a take that actually moved an item into the hand may escrow hand items.
@@ -345,17 +425,21 @@ namespace CardShopCoop.Sync
                     if (!_queued.TryGetValue(key, out var q))
                         _queued[key] = q = new Queue<QueuedMutation>();
                     if (q.Count < PendingTransferLedger<int>.MaxOutstanding)
-                        q.Enqueue(new QueuedMutation { Entry = e, EscrowTake = escrowTake });
+                        q.Enqueue(new QueuedMutation { Entry = e, EscrowTake = escrowTake, Item = takeItem });
                     else
+                    {
                         CoopPlugin.Log.LogError($"WorldSync: queued-transfer cap reached key={key:X}; dropping the local edit and requesting resync");
+                        FailClosedMutation(comp, key, delta, transferType, escrowTake, takeItem);
+                    }
                     return;
                 }
-                e.TransferSeq = _transfers.Begin(key, delta, transferType, out e.TransferType, escrowTake);
+                e.TransferSeq = _transfers.Begin(key, delta, transferType, out e.TransferType, escrowTake, takeItem);
                 if (e.TransferSeq == 0)
                 {
-                    FailClosedMutation(comp, key, delta, transferType, escrowTake);
+                    FailClosedMutation(comp, key, delta, transferType, escrowTake, takeItem);
                     return;
                 }
+                _retries.Register(e.TransferSeq, e, Time.realtimeSinceStartupAsDouble);
             }
             else
             {
@@ -370,13 +454,19 @@ namespace CardShopCoop.Sync
         /// refused restock is returned to the hand; a refused hand take is removed from the hand;
         /// a refused container move is left to the resync (its item is in another container, not
         /// the hand). Must never leave an unreported mutation in place.</summary>
-        private void FailClosedMutation(ShelfCompartment comp, int key, int delta, int transferType, bool escrowTake)
+        private void FailClosedMutation(ShelfCompartment comp, int key, int delta, int transferType,
+            bool escrowTake, Item takeItem = null)
         {
             _applyingRemote = true;
             try
             {
                 if (delta < 0 && escrowTake)
-                    HandEscrow.RollbackUnreservedTake(transferType, -delta);
+                {
+                    if (takeItem != null && delta == -1)
+                        HandEscrow.RejectUntrackedTake(takeItem);
+                    else
+                        HandEscrow.RollbackUnreservedTake(transferType, -delta);
+                }
                 else if (delta > 0)
                 {
                     int returned = comp != null ? HandEscrow.EscrowAdded(comp, transferType, delta) : 0;
@@ -397,16 +487,24 @@ namespace CardShopCoop.Sync
                 _queued.Remove(key);
             var e = qe.Entry;
             int delta = e.Count - e.BaseCount;
-            e.TransferSeq = _transfers.Begin(key, delta, e.TransferType, out e.TransferType, qe.EscrowTake);
+            e.TransferSeq = _transfers.Begin(key, delta, e.TransferType, out e.TransferType,
+                qe.EscrowTake, qe.Item);
             if (e.TransferSeq == 0)
             {
                 // The remaining entries were derived against a baseline that this failed (and now
                 // rolled-back) edit changed; drop them and let the authoritative resync re-derive.
                 var comp = Resolve(ResolveShelfManager(), key);
-                FailClosedMutation(comp, key, delta, e.TransferType, qe.EscrowTake);
+                FailClosedMutation(comp, key, delta, e.TransferType, qe.EscrowTake, qe.Item);
+                while (q.Count > 0)
+                {
+                    var dropped = q.Dequeue();
+                    if (dropped.EscrowTake && dropped.Item != null)
+                        HandEscrow.RejectUntrackedTake(dropped.Item);
+                }
                 _queued.Remove(key);
                 return;
             }
+            _retries.Register(e.TransferSeq, e, Time.realtimeSinceStartupAsDouble);
             OnLocalChanges?.Invoke(new List<Entry> { e });
         }
 
@@ -438,7 +536,9 @@ namespace CardShopCoop.Sync
                             continue;
                         }
                         if (CoopCore.Role == CoopRole.Client
-                            && (_transfers.IsAddReserved(e.Key) || _transfers.IsTakeReserved(e.Key)))
+                            && (_transfers.IsAddReserved(e.Key) || _transfers.IsTakeReserved(e.Key)
+                                || _dirtyTakes.Exists(take => take.Comp == comp)
+                                || (_queued.TryGetValue(e.Key, out var waiting) && waiting.Count > 0)))
                             continue;
                         // PARTIAL-CLAMP SUPPRESSION: this exact request already ran and came up
                         // short, and the compartment still holds exactly what that rebuild left -
@@ -535,131 +635,103 @@ namespace CardShopCoop.Sync
             return authoritative;
         }
 
-        private Entry? ApplyTransferRequest(Entry e, int connId)
+        private Entry? ReadCurrentState(int key)
         {
-            if (_hostAcks.TryGet(connId, e.TransferSeq, out int priorAccepted))
-            {
-                CoopPlugin.Log.LogInfo($"WorldSync: replaying deduplicated transfer conn={connId} seq={e.TransferSeq}");
-                SendResult?.Invoke(new ShelfTransferResultMessage { Key = e.Key, TransferSeq = e.TransferSeq, AcceptedDelta = priorAccepted }, connId);
-                return null;
-            }
-            int accepted = 0;
-            Entry? actual = null;
             try
             {
                 var sm = ResolveShelfManager();
-                var comp = sm != null ? Resolve(sm, e.Key) : null;
-                if (comp != null)
+                var comp = sm != null ? Resolve(sm, key) : null;
+                return comp == null ? (Entry?)null : new Entry
                 {
+                    Key = key,
+                    Type = (int)comp.GetItemType(),
+                    Count = comp.GetItemCount()
+                };
+            }
+            catch (Exception e)
+            {
+                CoopPlugin.Log.LogWarning("WorldSync: could not read transfer state: " + e.Message);
+                return null;
+            }
+        }
+
+        private Entry? ApplyTransferRequest(Entry e, int connId)
+        {
+            if (_hostAcks.IsExpired(connId, e.TransferSeq))
+            {
+                TransferHistoryMissing?.Invoke(connId);
+                return null;
+            }
+            if (_hostAcks.TryGet(connId, e.TransferSeq, out int priorAccepted))
+            {
+                SendResult?.Invoke(new ShelfTransferResultMessage
+                {
+                    Key = e.Key,
+                    TransferSeq = e.TransferSeq,
+                    AcceptedDelta = priorAccepted,
+                    State = ReadCurrentState(e.Key)
+                }, connId);
+                return null;
+            }
+            int accepted = 0;
+            bool validDelta = ItemTransferRules.TryDelta(e.BaseCount, e.Count, out int requested);
+            string reason = validDelta ? "accepted" : "invalid shelf counts";
+            ShelfCompartment comp = null;
+            int before = -1;
+            try
+            {
+                var sm = ResolveShelfManager();
+                comp = sm != null ? Resolve(sm, e.Key) : null;
+                if (comp == null)
+                    reason = "shelf identity missing on host";
+                else if (validDelta)
+                {
+                    before = comp.GetItemCount();
                     int hostType = (int)comp.GetItemType();
-                    int hostCount = comp.GetItemCount();
-                    int requested = e.Count - e.BaseCount;
-                    bool baseValid = e.BaseCount == hostCount;
-                    if (!baseValid)
+                    int capacity = before > 0 ? comp.GetMaxItemCount() : 0;
+                    if (e.TransferType < 0 || !CanResolve(e.TransferType))
+                        reason = "item type unavailable on host";
+                    else if (!ItemTransferRules.TryPlan(before, hostType, e.TransferType,
+                        requested, capacity, out accepted, out int targetType))
+                        reason = "item type differs from shelf";
+                    else if (accepted != 0)
                     {
-                        // Applying this delta would make a stale client baseline consume or
-                        // create stock unrelated to its request.  Return host truth and reject;
-                        // the client will reconcile its escrow and request a coalesced resync.
-                        CoopPlugin.Log.LogWarning(
-                            $"WorldSync: rejected transfer with stale base key={e.Key:X} base={e.BaseCount} host={hostCount}");
-                        actual = new Entry { Key = e.Key, Type = hostType, Count = hostCount };
-                        accepted = 0;
+                        int targetCount = before + accepted;
+                        if (targetCount == 0)
+                            targetType = e.Type == hostType ? hostType : (int)EItemType.None;
+                        _applyingRemote = true;
+                        try
+                        {
+                            ApplyCompartment(comp, targetType, targetCount);
+                        }
+                        finally { _applyingRemote = false; }
+                        accepted = comp.GetItemCount() - before;
+                        if (accepted != requested)
+                            reason = requested < 0 ? "insufficient current stock" : "shelf capacity/readback";
                     }
-                    if (baseValid)
-                    {
-                        int applyType = hostType;
-                        int applyCount = hostCount;
-                        if (requested != 0)
-                        {
-                            // A one-sided content pack maps the moved type to None (-1) on the wire.
-                            // Never merge that into the host's stock: it would build phantom None
-                            // items or delete the wrong type. Refuse so the reporter keeps its item.
-                            bool transferKnown = e.TransferType != (int)EItemType.None
-                                && CanResolve(e.TransferType);
-                            // An empty compartment is rebindable: vanilla's locked label
-                            // (CGameManager.m_LockItemLabel) leaves a stale type after the last
-                            // item leaves, and ShelfCompartment.CheckItemType rebinds a 0-count
-                            // compartment to whatever arrives next. Only a non-empty compartment
-                            // constrains the incoming type.
-                            bool typeOk = transferKnown
-                                && (hostCount <= 0 || hostType == (int)EItemType.None
-                                    || hostType == e.TransferType);
-                            if (typeOk && requested < 0)
-                            {
-                                accepted = -Mathf.Min(-requested, hostCount);
-                                applyCount = hostCount + accepted;
-                                applyType = applyCount <= 0 ? e.Type : hostType;
-                            }
-                            else if (typeOk)
-                            {
-                                // A shelf placed mid-session never ran CalculatePositionList, so its
-                                // empty compartments report m_MaxItemCount == 0 (and an empty
-                                // m_ItemPosList) until someone places the first item locally. Reading
-                                // that as "no room" rejected every client restock of a brand-new
-                                // shelf: capacity 0 accepted 0, so the host still stamped the item
-                                // label (applyCount 0 with a type) but kept no items, and the client
-                                // got its item bounced back to hand. Trust the add exactly like the
-                                // box path (ItemBoxFamily.ApplyContent): ApplyCompartment below
-                                // rebuilds through SetCompartmentItemType -> CalculatePositionList ->
-                                // SpawnItem, which computes the real capacity and clamps to it, and
-                                // the read-back then reports only what actually landed.
-                                int capacity = comp.GetMaxItemCount();
-                                if (capacity <= 0 || hostCount <= 0)
-                                {
-                                    // An empty compartment has no capacity for the incoming type
-                                    // yet (a stale locked label, or a shelf placed mid-session
-                                    // that never ran CalculatePositionList). Trust the add:
-                                    // ApplyCompartment below binds the type, measures the real
-                                    // capacity and clamps, and the read-back reports what landed.
-                                    capacity = hostCount + requested;
-                                    CoopPlugin.Log.LogDebug(
-                                        $"WorldSync: compartment {e.Key:X} empty/capacity not built; trusting add host={hostCount} requested={requested}");
-                                }
-                                accepted = Mathf.Min(requested, Mathf.Max(0, capacity - hostCount));
-                                applyCount = hostCount + accepted;
-                                // A 0-count compartment rebinds to the incoming type (vanilla
-                                // CheckItemType); a positive count with no label is an
-                                // inconsistent state that heals to the incoming type too.
-                                applyType = (hostCount <= 0 || hostType == (int)EItemType.None)
-                                    && e.TransferType >= 0 ? e.TransferType : hostType;
-                            }
-                        }
-                        if (applyCount < 0)
-                            applyCount = 0;
-                        bool resolvable = applyCount <= 0 || applyType == (int)EItemType.None || CanResolve(applyType);
-                        if (resolvable)
-                        {
-                            _applyingRemote = true;
-                            try
-                            {
-                                ApplyCompartment(comp, applyType, applyCount);
-                            }
-                            finally { _applyingRemote = false; }
-                            int actualType = (int)comp.GetItemType();
-                            int actualCount = comp.GetItemCount();
-                            // Report what actually landed (the rebuild can clamp to this machine's
-                            // real slot count), not what was requested.
-                            accepted = actualCount - hostCount;
-                            actual = new Entry { Key = e.Key, Type = actualType, Count = actualCount };
-                        }
-                        else
-                        {
-                            accepted = 0; // can't build this type here; refuse so the reporter keeps its item
-                        }
-                    }
+                    else
+                        reason = requested < 0 ? "shelf is empty" : "shelf is full";
                 }
             }
             catch (Exception ex)
             {
                 CoopPlugin.Log.LogWarning($"WorldSync transfer {e.Key:X}: {ex.Message}");
-                accepted = 0;
+                // A vanilla call may throw after changing inventory. Report its measured
+                // result when it is within this operation, never blindly replay the move.
+                var afterFault = ReadCurrentState(e.Key);
+                int measured = before >= 0 && afterFault.HasValue ? afterFault.Value.Count - before : 0;
+                accepted = ItemTransferRules.ValidResult(e.Key, e.Key, requested, measured) ? measured : 0;
+                reason = "host apply fault: " + ex.GetType().Name;
             }
+            var actual = ReadCurrentState(e.Key);
+            ItemTransferDiagnostics.HostShelf(connId, requested, accepted, reason);
             _hostAcks.Store(connId, e.TransferSeq, accepted);
             SendResult?.Invoke(new ShelfTransferResultMessage
             {
                 Key = e.Key,
                 TransferSeq = e.TransferSeq,
                 AcceptedDelta = accepted,
+                State = actual
             }, connId);
             return actual;
         }
@@ -673,7 +745,17 @@ namespace CardShopCoop.Sync
                 return;
             if (!_transfers.TryGet(msg.TransferSeq, out var pending))
                 return;
+            if (!ItemTransferRules.ValidResult(pending.Target, msg.Key, pending.RequestedDelta, msg.AcceptedDelta))
+            {
+                InvalidTransferResultCount++;
+                CoopPlugin.Log.LogWarning("WorldSync: ignored transfer reply with mismatched target or invalid accepted amount");
+                RequestResyncCoalesced();
+                return;
+            }
+            _retries.Remove(msg.TransferSeq);
             int rejected = pending.RequestedDelta - msg.AcceptedDelta;
+            if (rejected != 0)
+                CoopCore.Instance?.ReportInteraction("The host could not accept the full shelf transfer. Stock or space changed; its state is being reconciled.");
             bool fault = false;
             bool escrowResolved = true;
             bool reconciliationAttempted = false;
@@ -771,9 +853,13 @@ namespace CardShopCoop.Sync
                 _transfers.TryResolve(msg.TransferSeq, out _);
             // Only a diverging (rejected/partial) resolution needs authoritative truth; a fully
             // accepted transfer must not trigger a full all-module resync per item.
-            if (rejected != 0)
+            bool hasState = msg.State.HasValue && msg.State.Value.Key == pending.Target
+                && msg.State.Value.Count >= 0;
+            if (rejected != 0 && !hasState)
                 RequestResyncCoalesced();
             FlushQueued(pending.Target);
+            if (hasState)
+                ApplyRemote(new List<Entry> { msg.State.Value });
         }
 
         public void HostReleaseConn(int connId)

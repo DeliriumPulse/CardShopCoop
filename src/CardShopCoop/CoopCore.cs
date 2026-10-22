@@ -292,6 +292,8 @@ namespace CardShopCoop
         private Vector3 _lastSentCamPos;
         private Quaternion _lastSentCamRot;
         private byte _lastSentHold;
+        private bool _lastSentCrouching;
+        private bool _lastSentSpraying;
         private int _lastSentHoldSig;
         private bool _hasSentState;
         private float _stateKeepalive;
@@ -305,6 +307,7 @@ namespace CardShopCoop
         // passed against its stale (0.5s-lagged) wallet mirror before the shared balance
         // goes negative. Reset once per frame before the message drain.
         private double _pendingReduceThisFrame = 0.0;
+        private readonly QueuedSpendLedger _queuedSpend = new QueuedSpendLedger();
 
 
         // one-time link confirmation logging
@@ -519,6 +522,9 @@ namespace CardShopCoop
             _messageRouter.Register<PurchaseRequestMessage>((context, message) => ApplyPurchaseRequest(context.ConnectionId, message),
                 retryable: true, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
             _messageRouter.Register<PurchaseResultMessage>((context, message) => ApplyPurchaseResult(message));
+            _messageRouter.Register<ShopPurchaseCueMessage>((context, message) => SoundManager.PlayAudio("SFX_CustomerBuy", 0.6f));
+            _messageRouter.Register<DayActionMessage>((context, message) => ApplyDayAction(context.ConnectionId, message));
+            _messageRouter.Register<DayActionReplyMessage>((context, message) => ApplyDayActionReply(message));
             _messageRouter.Register<SprayHitMessage>((context, message) => ApplySprayHit(message),
                 retryable: true, heal: () => { _coinHeal = 999f; _progressHeal = 999f; });
             _messageRouter.Register<GradedRemoveMessage>((context, message) => ApplyGradedRemove(context.ConnectionId, message),
@@ -526,7 +532,21 @@ namespace CardShopCoop
             _ui = new UI.CoopUI();
             _world.OnLocalChanges = OnLocalWorldChanges;
             _world.SendResult = (result, connId) => Send(connId, result);
+            _world.TransferHistoryMissing = RejectExpiredItemTransfer;
+            _boxEngine.TransferHistoryMissing = RejectExpiredItemTransfer;
+            _boxEngine.RequestBoxRepair = id => Send(1, new BoxRepairRequestMessage { BoxId = id });
+            _messageRouter.Register<BoxRepairRequestMessage>((context, message) =>
+            {
+                if (Role == CoopRole.Host && InGameLevel())
+                    _boxEngine.HostRepairBox(message.BoxId);
+            }, MessagePolicy.HostOnlyInGame, false, heal: () => { });
             _world.SendBoxPull = message => Send(1, message);
+            _world.SendBoxCue = (message, connection) => Send(connection, message);
+            _messageRouter.Register<ShelfBoxCueMessage>((context, message) =>
+            {
+                if (_boxEngine.TryGetClientBox(message.BoxId, out var box))
+                    ShelfBoxTransferVisual.Play(box, message);
+            });
             _world.RequestResync = () =>
             {
                 CoopPlugin.Log.LogWarning("WorldSync requested authoritative shelf resync");
@@ -643,6 +663,7 @@ namespace CardShopCoop
             _shopState.BroadcastState = Broadcast;
             _settings.SendOp = Send(1);
             _settings.BroadcastState = Broadcast;
+            _grading.PurchaseAccepted = connection => Send(connection, new ShopPurchaseCueMessage());
             _market.BroadcastState = Broadcast;
             _market.RequestResync = () =>
             {
@@ -808,14 +829,29 @@ namespace CardShopCoop
             {
                 CoopPlugin.Log.LogInfo("Steam bridge ready - lobbies, invites and P2P available.");
                 _steam.Init();
-                _steam.OnError = err => { ErrorLine = err; CoopPlugin.Log.LogWarning(err); };
+                _steam.OnError = err =>
+                {
+                    ErrorLine = err;
+                    CoopPlugin.Log.LogWarning(err);
+                };
                 _steam.OnLobbyLive = lobby =>
                 {
+                    if (Role != CoopRole.Host || !IsSteamSession)
+                        return;
                     StatusLine = "Hosting via Steam - click 'Invite friend'";
                     // The id is the one thing a support log needs from this line: it is what
                     // the joiner's "+connect_lobby <id>" and invite-accept both name, so
                     // without it the two halves of a failed join cannot be matched up.
                     CoopPlugin.Log.LogInfo("steam: lobby live " + lobby);
+                };
+                _steam.OnSessionStartFailed = err =>
+                {
+                    if (!IsSteamSession || (Role != CoopRole.Host
+                        && !(Role == CoopRole.Client && _joinWatchdog.Current == JoinWatchdog.Stage.Lobby)))
+                        return;
+                    ErrorLine = err;
+                    CoopPlugin.Log.LogWarning(err);
+                    Shutdown(err);
                 };
                 _steam.OnConnectedToHost = () =>
                 {
@@ -912,6 +948,7 @@ namespace CardShopCoop
                 // bridge's lobby-entered callback wires the host connection into it.
                 _net = LagTransport.Wrap(_steam.CreateTransport(false, new PingMessage()));
                 StatusLine = "Joining Steam lobby...";
+                _joinWatchdog.StartLobby(Time.realtimeSinceStartupAsDouble);
                 _steam.Join(lobby);
             }
             catch (Exception e)
@@ -972,6 +1009,8 @@ namespace CardShopCoop
 
         private void SendHello()
         {
+            _joinWatchdog.Start(Time.realtimeSinceStartupAsDouble);
+            _sessionCurrency = CaptureCurrency();
             // Logged on BOTH sides of every Hello (the host logs the pair when it reads
             // them): when a cross-play session misbehaves, the two logs together say
             // immediately whether the two PCs are even on the same game build.
@@ -991,8 +1030,9 @@ namespace CardShopCoop
                 CoopPlugin.Log.LogWarning("enum lines for Hello: " + e.Message);
                 gzEnum = Msg.Gzip(new byte[0]);
             }
-            Send(1, new HelloMessage
+            _pendingHello = new HelloMessage
             {
+                Currency = _sessionCurrency,
                 WireVersion = Msg.WireVersion,
                 Version = CoopPlugin.Version,
                 PlayerName = EffectivePlayerName,
@@ -1008,7 +1048,61 @@ namespace CardShopCoop
                 EnumBlob = gzEnum,
                 GameVersion = Application.version ?? "",
                 UnityVersion = Application.unityVersion ?? "",
-            });
+            };
+            Send(1, _pendingHello);
+        }
+
+        private readonly JoinWatchdog _joinWatchdog = new JoinWatchdog();
+        private HelloMessage _pendingHello;
+        private CurrencyProfile _sessionCurrency;
+
+        internal static CurrencyProfile CaptureCurrency()
+        {
+            return new CurrencyProfile
+            {
+                CurrencyId = (int)CSingleton<CGameManager>.Instance.m_CurrencyType,
+                ConversionRate = GameInstance.GetCurrencyConversionRate()
+            };
+        }
+
+        private static string CurrencyMismatch(CurrencyProfile host)
+        {
+            string name = host == null ? "unknown" : ((EMoneyCurrencyType)host.CurrencyId).ToString();
+            return "Checkout currency differs. Set both games to the host's currency (" + name
+                + ") in Settings, then rejoin. Currency conversion rates must also match.";
+        }
+
+        internal static bool ValidateSessionCurrency()
+        {
+            var core = Instance;
+            if (core == null || Role == CoopRole.None || core._sessionCurrency == null
+                || CurrencyProfile.Matches(core._sessionCurrency, CaptureCurrency()))
+                return true;
+            core.ErrorLine = "Currency changed during co-op. The session ended to prevent incorrect checkout amounts. "
+                + "Set both games to the same currency and rejoin.";
+            core.Shutdown(core.ErrorLine);
+            return false;
+        }
+
+        private bool CheckJoinProgress()
+        {
+            if (Role != CoopRole.Client)
+                return true;
+            double now = Time.realtimeSinceStartupAsDouble;
+            if (_joinWatchdog.TimedOut(now))
+            {
+                string stage = _joinWatchdog.Current.ToString();
+                ErrorLine = "Join stalled during " + stage + ". Check both players' CardShopCoop logs; "
+                    + "load the host's shop first, use the same mod/game versions, then rejoin.";
+                Shutdown("join timed out during " + stage);
+                return false;
+            }
+            if (_pendingHello != null && _joinWatchdog.RetryHello(now))
+            {
+                CoopPlugin.Log.LogInfo("join: retrying Hello while waiting for the host's world");
+                Send(1, _pendingHello);
+            }
+            return true;
         }
 
         // Bye must actually reach the peer before the connection dies; on Steam, sends
@@ -1020,6 +1114,13 @@ namespace CardShopCoop
             CoopPlugin.Log.LogWarning($"rejected connection {connId}: {reason}");
             Send(connId, new ByeMessage { Reason = reason });
             _pendingKicks.Add(new KeyValuePair<int, float>(connId, 1.5f));
+        }
+
+        private void RejectExpiredItemTransfer(int connection)
+        {
+            if (_pendingKicks.Exists(kick => kick.Key == connection))
+                return;
+            RejectConn(connection, "An item request is older than the retained synchronization history. Please return to the main menu and rejoin for a fresh shop state; the old request was not replayed.");
         }
 
         private void RelayTagToOthers(int senderConn, byte kind, int extra = -1)
@@ -1089,6 +1190,7 @@ namespace CardShopCoop
 
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
+            _queuedSpend.Clear();
             if (ClientReloading && scene.name != "Title")
             {
                 _clientWorldArrived = true;
@@ -1213,6 +1315,7 @@ namespace CardShopCoop
             _localModelAuto = false;
             RecordLocalModelChange();
             var custom = GetLocalCustomization();
+            AvatarManager.ApplyStoredHairColors(custom);
             _localPlayerModel = _avatars.CaptureLocalModel(custom, _localPlayerModel.Female, _localPlayerModel.ModelIndex);
             _localPlayerModelReady = true;
             _lastCommittedPlayerModel = ClonePlayerModel(_localPlayerModel);
@@ -1532,6 +1635,7 @@ namespace CardShopCoop
             }
             else if (Role == CoopRole.Client && _net != null)
             {
+                _appearanceDelivery.Sent(ModelSignature(_localPlayerModel), Time.realtimeSinceStartupAsDouble);
                 Send(1, new PlayerModelRequestMessage
                 {
                     Female = _localPlayerModel.Female,
@@ -1539,6 +1643,13 @@ namespace CardShopCoop
                     CustomizationJson = _localPlayerModel.CustomizationJson
                 });
             }
+        }
+
+        private readonly AppearanceDelivery _appearanceDelivery = new AppearanceDelivery();
+
+        private static string ModelSignature(PlayerModelEntry model)
+        {
+            return (model.Female ? "F:" : "M:") + model.ModelIndex + ":" + (model.CustomizationJson ?? "");
         }
 
         private void ApplyPlayerModelRequest(int connId, PlayerModelRequestMessage request)
@@ -1588,9 +1699,9 @@ namespace CardShopCoop
                     continue;
                 if (entry.Id == _selfId)
                 {
-                    _localPlayerModel = ClonePlayerModel(entry);
-                    _localPlayerModelReady = true;
-                    _localModelAuto = false;
+                    // The guest owns its wardrobe. A delayed echo (including a join
+                    // snapshot) must never replace a newer local edit.
+                    _appearanceDelivery.Acknowledge(ModelSignature(entry));
                     continue;
                 }
                 int avatarId = entry.Id == 0 ? 1 : 1000 + entry.Id;
@@ -1633,6 +1744,13 @@ namespace CardShopCoop
             float elapsed = Time.realtimeSinceStartup - _reloadStartedAt;
             ClientReloading = false;
             _clientWorldArrived = false;
+            _joinWatchdog.Reset();
+            _pendingHello = null;
+            _ui.Visible = false;
+            SyncWindowUIMode();
+            StatusLine = "Joined shop - ready to play";
+            EnsureLocalPlayerModel();
+            SubmitLocalPlayerModel();
             CoopPlugin.Log.LogInfo($"Join world load completed in {elapsed:F2}s; resuming co-op sync");
 
             // The join-time authoritative snapshots are emitted during world transfer, before
@@ -1790,7 +1908,7 @@ namespace CardShopCoop
                 new Sync.CoopModuleEntry(_shopState, "shopState", 4, -1, Sync.ShopStateSync.ApplyPatches),
                 new Sync.CoopModuleEntry(_settings, "settings", 5, -1, Sync.SettingsSync.ApplyPatches),
                 new Sync.CoopModuleEntry(_market, "market", 6, 0, Sync.MarketSync.ApplyPatches),
-                new Sync.CoopModuleEntry(_report, "report", 7, -1, Sync.ReportSync.ApplyPatches),
+                new Sync.CoopModuleEntry(_report, "report", 7, 5, Sync.ReportSync.ApplyPatches),
                 new Sync.CoopModuleEntry(_containers, "containers", 8, 3, Sync.ContainerSync.ApplyPatches),
                 new Sync.CoopModuleEntry(_tournament, "tournament", 9, -1, Sync.TournamentSync.ApplyPatches),
                 new Sync.CoopModuleEntry(_register, "register", 10, 4, Sync.RegisterSync.ApplyPatches),
@@ -2068,6 +2186,9 @@ namespace CardShopCoop
                 : (Camera.main != null ? Camera.main.transform.eulerAngles.y : playerTf.eulerAngles.y);
             Transform camera = _playerCamTf != null ? _playerCamTf : Camera.main != null ? Camera.main.transform : null;
             byte hold = ComputeHoldState();
+            bool crouching = _playerIpc != null && _playerIpc.IsCrouching();
+            bool spraying = hold == 5 && _playerIpc.m_DeodorantSprayVFX != null
+                && _playerIpc.m_DeodorantSprayVFX.isEmitting;
             Vector3 cameraPos = camera != null ? camera.position : pos;
             Quaternion cameraRot = camera != null ? camera.rotation : Quaternion.Euler(0f, yaw, 0f);
             int holdSig = HoldPayloadSignature();
@@ -2078,10 +2199,12 @@ namespace CardShopCoop
                 || (pos - _lastSentPos).sqrMagnitude > 0.0004f   // > 2 cm
                 || Mathf.Abs(Mathf.DeltaAngle(yaw, _lastSentCamYaw)) > 1f
                 || hold != _lastSentHold
+                || crouching != _lastSentCrouching
+                || spraying != _lastSentSpraying
                 || (cameraPos - _lastSentCamPos).sqrMagnitude > 0.0004f
                 || Quaternion.Angle(cameraRot, _lastSentCamRot) > 0.5f
                 || holdSig != _lastSentHoldSig;
-            if (!changed && _stateKeepalive < 5f)
+            if (!changed && _stateKeepalive < (spraying ? 0.25f : 5f))
             {
                 _stateTimer = 0f; // consumed this interval
                 return;
@@ -2102,6 +2225,8 @@ namespace CardShopCoop
             _lastSentCamPos = cameraPos;
             _lastSentCamRot = cameraRot;
             _lastSentHold = hold;
+            _lastSentCrouching = crouching;
+            _lastSentSpraying = spraying;
             _lastSentHoldSig = holdSig;
             _hasSentState = true;
             BroadcastTransient(new PlayerStateMessage
@@ -2112,6 +2237,8 @@ namespace CardShopCoop
                 CameraRotation = cameraRot,
                 Speed = speed,
                 Hold = hold,
+                Crouching = crouching,
+                Spraying = spraying,
                 HoldTypes = hold == 3 ? null : new List<int>(_holdTypesBuf),
                 HoldCards = hold == 3 ? new List<CardData>(_holdCardsBuf) : null
             });
@@ -2486,6 +2613,7 @@ namespace CardShopCoop
         private readonly List<CardData> _holdCardsBuf = new List<CardData>(4);
         private static readonly FieldInfo FiHoldCard3dList = HarmonyLib.AccessTools.Field(typeof(InteractionPlayerController), "m_CurrentHoldingCard3dList");
         private static readonly FieldInfo FiViewAlbum = HarmonyLib.AccessTools.Field(typeof(InteractionPlayerController), "m_IsViewCardAlbumMode");
+        private static readonly FieldInfo FiActiveSpray = HarmonyLib.AccessTools.Field(typeof(InteractionPlayerController), "m_CurrentHoldSprayItem");
 
         /// <summary>What the local player carries: 0 none / 1 box / 2 items / 3 cards / 4 binder.
         /// Items fill the type buffer, cards the CardData buffer - both render as the REAL
@@ -2514,6 +2642,11 @@ namespace CardShopCoop
                         catch { _holdTypesBuf.Add(0); }
                     }
                     return 1; // carrying a box
+                }
+                if (FiActiveSpray?.GetValue(_playerIpc) is Item spray && spray != null)
+                {
+                    _holdTypesBuf.Add((int)spray.GetItemType());
+                    return 5; // The active can is removed from vanilla's ordinary held-item list.
                 }
                 if (FiHoldItemList?.GetValue(_playerIpc) is List<Item> items && items.Count > 0)
                 {
@@ -2948,6 +3081,29 @@ namespace CardShopCoop
                 return;
             Send(1, new SprayHitMessage { Position = pos, Range = range, Potency = potency });
         }
+
+        /// <summary>Reserve money for a guest-requested purchase before its queued coin
+        /// event is applied. CEventManager processes coin events later in its own Update,
+        /// so checking only m_CoinAmountDouble lets several accepted guest requests spend
+        /// the same visible balance in one frame.</summary>
+        public bool TryReserveGuestSpend(double amount)
+        {
+            if (Role != CoopRole.Host || double.IsNaN(amount) || double.IsInfinity(amount) || amount < 0.0)
+                return false;
+            double available = _queuedSpend.Available(CPlayerData.m_CoinAmountDouble, _pendingReduceThisFrame);
+            if (amount > available + 0.0001)
+                return false;
+            _pendingReduceThisFrame += amount;
+            return true;
+        }
+
+        internal void ObserveQueuedSpend(CEventPlayer_ReduceCoin coinEvent)
+        {
+            if (Role == CoopRole.Host && coinEvent != null && _queuedSpend.Track(coinEvent, coinEvent.m_CoinValue))
+                _pendingReduceThisFrame = Math.Max(0, _pendingReduceThisFrame - coinEvent.m_CoinValue);
+        }
+
+        internal void ObserveAppliedSpend(CEventPlayer_ReduceCoin coinEvent) => _queuedSpend.Applied(coinEvent);
 
         public void SendDecorationPlacement(EDecoObject type, Vector3 pos, Quaternion rot)
         {
@@ -3456,11 +3612,20 @@ namespace CardShopCoop
 
         private void Shutdown(string reason)
         {
+            CaptureEndedSession(reason);
+            _queuedSpend.Clear();
+            _pendingReduceThisFrame = 0;
+            _tutorialContributions.Clear();
+            _tutorialSequence = 0;
             if (_localPlayerModel != null)
                 Util.PlayerModelStore.Save(_localPlayerModel);
             _localModelSavePending = false;
             PlayerModelGeneration++;
             IsTearingDown = true;
+            _joinWatchdog.Reset();
+            _pendingHello = null;
+            _appearanceDelivery.Reset();
+            _sessionCurrency = null;
             // Harmony callbacks can arrive while transport and world teardown are in progress.
             // Drop all static module entry points first so they cannot touch the old instance
             // state (or a newly loaded world's objects).
@@ -3567,7 +3732,7 @@ namespace CardShopCoop
             // lobby-entered path wires the transport and raises OnConnectedToHost BEFORE
             // CoopCore's role guard on that handler gets to run, so the only thing that
             // actually closes the stray-enter window is Leave() clearing the lobby's
-            // _joining flag and dropping _tx. Clear Role first and there is a gap in which
+            // request generation and dropping _tx. Clear Role first and there is a gap in which
             // a late lobby-enter callback can still land on a live bridge with the role
             // already reset - a connection nobody owns.
             _steam?.Leave();
@@ -3756,6 +3921,9 @@ namespace CardShopCoop
                 CoopPlugin.Log.LogInfo("Dispatch session gate opened after entering the game world");
             }
 
+            if (!ValidateSessionCurrency())
+                return;
+            TickInteractionDiagnostics();
             Guarded("net-pump", _actNetPump);
 
             // The game forces Application.runInBackground=false (changeFramerate coroutine),
@@ -3846,7 +4014,10 @@ namespace CardShopCoop
             // shelf/box lists.  BundleDone can set ClientReloading during the dispatch pass
             // below; the second check after Dispatch handles that same-frame transition.
             if (ClientReloading && !TryFinishClientReload())
+            {
+                CheckJoinProgress();
                 return;
+            }
 
             // Drain with coalescing: after any hitch the backlog holds dozens of stale
             // full-state packets; applying each in one frame turns one slow frame into
@@ -4016,7 +4187,7 @@ namespace CardShopCoop
                     consumed = i + 1;
                     bool retryable = _messageRouter.IsRetryable(current.Type);
                     CoopPlugin.Log.LogError($"Dispatch conn={current.ConnId} type={current.Type} "
-                        + (retryable ? "delta/op" : "snapshot") + " failed: " + e);
+                        + (retryable ? "retryable message" : "non-retryable message") + " failed: " + e);
                     if (retryable && current.DispatchAttempts < MaxDispatchRetries)
                     {
                         current.DispatchAttempts++;
@@ -4032,6 +4203,11 @@ namespace CardShopCoop
                         CoopPlugin.Log.LogError($"Dispatch conn={current.ConnId} type={current.Type} "
                             + detail + "; requesting authoritative heal");
                         _messageRouter.Heal(current.Type);
+                        if (Role == CoopRole.Host && MessageRetryRules.IsNonIdempotent(current.Type))
+                            Guarded("failed-operation-notice", () => Send(current.ConnId, new ToastMessage
+                            {
+                                Text = "This action could not finish cleanly. Its current state is being refreshed; it was not automatically repeated."
+                            }));
                     }
                 }
                 if (_net == null)
@@ -4051,6 +4227,12 @@ namespace CardShopCoop
             }
             if (_net == null)
                 return;
+
+            if (!CheckJoinProgress())
+                return;
+            if (Role == CoopRole.Client && !ClientReloading
+                && _appearanceDelivery.NeedsRetry(Time.realtimeSinceStartupAsDouble))
+                SubmitLocalPlayerModel();
 
             float dt = Time.deltaTime;
 
@@ -4397,6 +4579,7 @@ namespace CardShopCoop
                             Broadcast(new LightStateMessage
                             {
                                 LightJson = lightJson,
+                                Environment = EnvironmentSync.Capture(_lightManager),
                                 Day = CPlayerData.m_CurrentDay,
                                 HasDay = true,
                             });
@@ -4630,12 +4813,24 @@ namespace CardShopCoop
                 }
                 catch (System.Exception e) { Swallow.Log(e); }
                 bool shopOnceOpen = CPlayerData.m_IsShopOnceOpen;
-                Broadcast(new DayTimeMessage { Day = day, Hour = hour, Minute = min, MinuteFloat = minFloat, ShopOnceOpen = shopOnceOpen });
+                Broadcast(new DayTimeMessage
+                {
+                    Day = day,
+                    Hour = hour,
+                    Minute = min,
+                    MinuteFloat = minFloat,
+                    ShopOnceOpen = shopOnceOpen,
+                    Environment = EnvironmentSync.Capture(_lightManager)
+                });
             }
         }
 
         private bool Dispatch(InMsg msg)
         {
+            // A rejected peer has a short drain window so its Bye can be delivered.
+            // Do not accept more mutations while that already-ended session drains.
+            if (Role == CoopRole.Host && _pendingKicks.Exists(kick => kick.Key == msg.ConnId))
+                return true;
             if (msg.Message != null)
             {
                 bool routed = _messageRouter.Dispatch(new MessageContext
@@ -4655,6 +4850,10 @@ namespace CardShopCoop
                 case MsgType.Hello:
                     {
                         if (Role != CoopRole.Host)
+                            break;
+                        // A retry must not snapshot/send the world twice: interleaved
+                        // Welcome/SaveChunk streams corrupt the receiver's download.
+                        if (PeerNames.ContainsKey(msg.ConnId))
                             break;
                         if (msg.Message is HelloMessage hello)
                         {
@@ -4695,6 +4894,12 @@ namespace CardShopCoop
                             if (HostPassword.Length > 0 && password != HostPassword)
                             {
                                 RejectConn(msg.ConnId, "wrong password");
+                                break;
+                            }
+                            var hostCurrency = CaptureCurrency();
+                            if (!CurrencyProfile.Matches(hostCurrency, hello.Currency))
+                            {
+                                RejectConn(msg.ConnId, CurrencyMismatch(hostCurrency));
                                 break;
                             }
                             // Cross-play between the Steam and Game Pass releases works ONLY when
@@ -4916,6 +5121,7 @@ namespace CardShopCoop
                             }
 
                             _peerWireNames[msg.ConnId] = name;
+                            _sessionCurrency = hostCurrency;
                             _peerSteamIds[msg.ConnId] = hello.SteamId;
                             name = ResolvePeerName(hello.SteamId, name);
                             PeerNames[msg.ConnId] = name;
@@ -4951,11 +5157,19 @@ namespace CardShopCoop
                                 Shutdown("invalid world download lengths");
                                 break;
                             }
+                            if (!CurrencyProfile.Matches(CaptureCurrency(), welcome.Currency))
+                            {
+                                ErrorLine = CurrencyMismatch(welcome.Currency);
+                                Shutdown(ErrorLine);
+                                break;
+                            }
+                            _sessionCurrency = welcome.Currency;
                             string hostName = ResolvePeerName(welcome.SteamId, welcome.HostName ?? "");
                             _saveExpected = welcome.SaveLength;
                             _hostSlot = welcome.HostSlot;
                             _bundleExpected = welcome.BundleLength;
                             _selfId = welcome.SelfId;
+                            _joinWatchdog.Progress(JoinWatchdog.Stage.Download, Time.realtimeSinceStartupAsDouble);
                             // ID TRANSLATION IS BUILT HERE. "Welcome is the first message of the
                             // session, so every later message is already translated" was the comment
                             // that used to sit here and it is FALSE - do not rely on it.
@@ -5012,6 +5226,11 @@ namespace CardShopCoop
                         if (msg.Message is SaveChunkMessage saveChunk)
                         {
                             var bytes = saveChunk.Data ?? new byte[0];
+                            if (saveChunk.Offset != _saveBuf.Length)
+                            {
+                                Shutdown("shop download chunk missing or out of order; please rejoin");
+                                break;
+                            }
                             if (_saveExpected >= 0 && _saveBuf.Length + bytes.Length > _saveExpected)
                             {
                                 CoopPlugin.Log.LogError($"Save download exceeded advertised length {_saveExpected}; rejecting session");
@@ -5019,6 +5238,8 @@ namespace CardShopCoop
                                 break;
                             }
                             _saveBuf.Write(bytes, 0, bytes.Length);
+                            _receivedSaveBytes = _saveBuf.Length;
+                            _joinWatchdog.Progress(JoinWatchdog.Stage.Download, Time.realtimeSinceStartupAsDouble);
                             if (_saveExpected > 0)
                                 StatusLine = $"downloading shop... {Math.Min(100, _saveBuf.Length * 100 / _saveExpected)}%";
                         }
@@ -5065,6 +5286,11 @@ namespace CardShopCoop
                         if (msg.Message is BundleChunkMessage bundleChunk)
                         {
                             var bytes = bundleChunk.Data ?? new byte[0];
+                            if (bundleChunk.Offset != _bundleBuf.Length)
+                            {
+                                Shutdown("mod data download chunk missing or out of order; please rejoin");
+                                break;
+                            }
                             if (_bundleExpected >= 0 && _bundleBuf.Length + bytes.Length > _bundleExpected)
                             {
                                 CoopPlugin.Log.LogError($"Bundle download exceeded advertised length {_bundleExpected}; rejecting session");
@@ -5072,6 +5298,8 @@ namespace CardShopCoop
                                 break;
                             }
                             _bundleBuf.Write(bytes, 0, bytes.Length);
+                            _receivedBundleBytes = _bundleBuf.Length;
+                            _joinWatchdog.Progress(JoinWatchdog.Stage.Download, Time.realtimeSinceStartupAsDouble);
                             if (_bundleExpected > 0)
                                 StatusLine = $"downloading mod data... {Math.Min(100, _bundleBuf.Length * 100 / _bundleExpected)}%";
                         }
@@ -5085,6 +5313,7 @@ namespace CardShopCoop
                         _bundleBuf = null;
                         _worldRequested = true;
                         int transferGen = SessionGeneration;
+                        int clientSlot = SaveTransfer.CoopSlot;
                         byte[] saveBytes = _pendingSave;
                         _pendingSave = null;
                         StatusLine = "World received - loading...";
@@ -5102,7 +5331,7 @@ namespace CardShopCoop
                         // regardless of whether the host's copy differs, so any mtime-based test warns
                         // every single time and means nothing (see FileStamp).
                         string goStore = Path.Combine(Path.Combine(Application.persistentDataPath, "Grading - Overhaul"),
-                            "GradingOverhaul_" + SaveTransfer.CoopSlot + ".json");
+                            "GradingOverhaul_" + clientSlot + ".json");
                         string goBefore = FileStamp(goStore);
                         try
                         {
@@ -5118,7 +5347,7 @@ namespace CardShopCoop
                             Shutdown("bad sidecar download");
                             break;
                         }
-                        SidecarTransfer.ApplyBundleAsync(bundle, _hostSlot, SaveTransfer.CoopSlot, transferGen,
+                        SidecarTransfer.ApplyBundleAsync(bundle, _hostSlot, clientSlot, transferGen,
                             () =>
                             {
                                 if (FileStamp(goStore) != goBefore)
@@ -5126,7 +5355,7 @@ namespace CardShopCoop
                                         + goStore + " - your own SOLO save slots are untouched, but graded cards in THIS co-op slot are now judged "
                                         + "against the host's burned serials and cert bindings, and any this PC issued itself can be flagged FAKE on the next load. "
                                         + "The previous file was kept once as .coopbak beside it.");
-                                SaveTransfer.ApplyAndLoadAsync(saveBytes, transferGen,
+                                SaveTransfer.ApplyAndLoadAsync(saveBytes, transferGen, clientSlot,
                                     () => { },
                                     e =>
                                     {
@@ -5148,6 +5377,7 @@ namespace CardShopCoop
                         // as player trash actions, wiping the HOST's boxes (first field
                         // report). Suppress until vanilla reports that the world is settled.
                         ClientReloading = true;
+                        _joinWatchdog.Progress(JoinWatchdog.Stage.Loading, Time.realtimeSinceStartupAsDouble);
                         _clientWorldArrived = false;
                         _reloadStartedAt = Time.realtimeSinceStartup;
                         _reloadStartedFrame = Time.frameCount;
@@ -5214,20 +5444,13 @@ namespace CardShopCoop
                 // client's rename (slot 6 -> its coop slot) stays symmetric.
                 rawSave = SaveTransfer.BuildHostPayload();
                 hostSlot = SaveTransfer.HostSnapshotSlot;
-                try
-                {
-                    rawBundle = SidecarTransfer.BuildBundle(hostSlot);
-                }
-                catch (Exception e)
-                {
-                    CoopPlugin.Log.LogWarning("Sidecar bundle failed (sending base save only): " + e.Message);
-                    rawBundle = new byte[0];
-                }
+                rawBundle = SidecarTransfer.BuildBundle(hostSlot);
             }
             catch (Exception e)
             {
                 ErrorLine = "Could not snapshot the shop: " + e.Message;
                 CoopPlugin.Log.LogError(e);
+                RejectConn(connId, "Host could not prepare the shop. Finish loading the shop, close any day report, and host again. " + e.Message);
                 return;
             }
 
@@ -5241,6 +5464,10 @@ namespace CardShopCoop
             byte[] gzHostEnum = GzipLines(SafeEnumLines());
             byte[] gzHostCards = GzipLines(SafeCardsList());
             PlayerModelStateMessage modelState = Role == CoopRole.Host ? BuildPlayerModelState() : null;
+            string hostName = EffectivePlayerName;
+            ulong hostSteamId = _steam == null ? 0 : _steam.LocalSteamId;
+            int sendGeneration = SessionGeneration;
+            CurrencyProfile hostCurrency = CaptureCurrency();
 
             var net = _net;
             new Thread(() =>
@@ -5250,14 +5477,17 @@ namespace CardShopCoop
                 {
                     byte[] payload = Msg.Gzip(rawSave);
                     byte[] bundle = rawBundle.Length > 0 ? Msg.Gzip(rawBundle) : rawBundle;
+                    if (!IsSessionGeneration(sendGeneration))
+                        return;
                     CoopPlugin.Log.LogInfo($"transfer: save {payload.Length / 1024} KB, mod data {bundle.Length / 1024} KB (compressed)");
 
                     net.Send(connId, new WelcomeMessage
                     {
+                        Currency = hostCurrency,
                         WireVersion = Msg.WireVersion,
                         Version = CoopPlugin.Version,
-                        HostName = EffectivePlayerName,
-                        SteamId = _steam == null ? 0 : _steam.LocalSteamId,
+                        HostName = hostName,
+                        SteamId = hostSteamId,
                         SaveLength = payload.Length,
                         HostSlot = hostSlot,
                         BundleLength = bundle.Length,
@@ -5291,6 +5521,11 @@ namespace CardShopCoop
                 catch (Exception e)
                 {
                     CoopPlugin.Log.LogError("World send failed: " + e.Message);
+                    TryEnqueueMainThread(() =>
+                    {
+                        if (IsSessionGeneration(sendGeneration) && _net == net)
+                            RejectConn(connId, "Host could not send the shop: " + e.Message);
+                    });
                 }
             })
             {
@@ -5354,7 +5589,7 @@ namespace CardShopCoop
         {
             _diagRecvStates++;
             _avatars.UpdateState(avatarId, state.Position, state.Yaw,
-                state.Hold, state.CameraPosition, state.CameraRotation, state.HoldTypes, state.HoldCards);
+                state.Hold, state.CameraPosition, state.CameraRotation, state.HoldTypes, state.HoldCards, state.Crouching, state.Spraying);
             string peerName = null;
             if (!PeerNames.TryGetValue(avatarId, out peerName) && avatarId >= 1000)
                 _rosterNames.TryGetValue(avatarId - 1000, out peerName);
@@ -5469,7 +5704,7 @@ namespace CardShopCoop
                 total += linePrice;
             }
 
-            double available = CPlayerData.m_CoinAmountDouble - _pendingReduceThisFrame;
+            double available = _queuedSpend.Available(CPlayerData.m_CoinAmountDouble, _pendingReduceThisFrame);
             if (total > available + 0.0001)
             {
                 CoopPlugin.Log.LogInfo($"purchase from conn {connectionId} declined: need {total:F2}, available {available:F2}");
@@ -5485,6 +5720,7 @@ namespace CardShopCoop
             // delivery when the wallet is checked again after spawning.
             _pendingReduceThisFrame += total;
             double deliveredTotal = 0.0;
+            int deliveredStockBoxes = 0;
             for (int i = 0; i < request.Lines.Count; i++)
             {
                 var line = request.Lines[i];
@@ -5494,6 +5730,7 @@ namespace CardShopCoop
                     {
                         RestockManager.SpawnPackageBoxItemMultipleFrame(resolved[i], line.Count);
                         CEventManager.QueueEvent(new CEventPlayer_AddShopExp(line.Count * 5));
+                        deliveredStockBoxes += line.Count;
                     }
                     else if (request.Kind == 1)
                     {
@@ -5514,6 +5751,17 @@ namespace CardShopCoop
                     failures.Add($"'{item}' ({e.Message})");
                     CoopPlugin.Log.LogWarning($"purchase delivery failed for conn {connectionId}, line {i} ({item}): {e.Message}");
                 }
+            }
+
+            // Guest shopping bypasses the vanilla checkout method which normally
+            // credits RestockItem. Credit only stock lines actually delivered.
+            if (deliveredStockBoxes > 0)
+            {
+                try
+                {
+                    TutorialManager.AddTaskValue(ETutorialTaskCondition.RestockItem, deliveredStockBoxes);
+                }
+                catch (Exception e) { CoopPlugin.Log.LogWarning("Guest purchase tutorial update: " + e.Message); }
             }
 
             // Release the reservation for failed lines; the remaining reservation is the
@@ -5543,7 +5791,13 @@ namespace CardShopCoop
             if (Role != CoopRole.Client || result == null)
                 return;
             if (result.Success)
+            {
                 Patches.GamePatches.ClientPurchaseAccepted(result.Kind);
+                // All three vanilla checkout paths play this cue, but the guest
+                // prefixes bypass them. Play only on acceptance, never on snapshots.
+                if (result.Kind <= 2)
+                    SoundManager.PlayAudio("SFX_CustomerBuy", 0.6f);
+            }
             RegisterLine = result.Text ?? "";
             RegisterLineTimer = 8f;
             CoopPlugin.Log.LogInfo("host says: " + RegisterLine);
@@ -5574,7 +5828,7 @@ namespace CardShopCoop
                 case 2:
                     if (value <= 0f)
                         break;
-                    double balance = CPlayerData.m_CoinAmountDouble - _pendingReduceThisFrame;
+                    double balance = _queuedSpend.Available(CPlayerData.m_CoinAmountDouble, _pendingReduceThisFrame);
                     if ((double)value > balance + 0.0001)
                     {
                         Send(connectionId, new ToastMessage { Text = "purchase declined - the shared wallet is short" });

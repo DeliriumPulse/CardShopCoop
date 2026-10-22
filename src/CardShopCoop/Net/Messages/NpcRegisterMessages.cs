@@ -80,10 +80,18 @@ namespace CardShopCoop.Net.Messages
         public float Yaw;
         public float Speed;
         public byte Flags;
+        public NpcAnimationLayer[] Animation;
         public int ActionSequence;
         public byte ActionKind;
         public bool HoldBig;
         public int HoldItemType;
+    }
+
+    public sealed class NpcAnimationLayer
+    {
+        public int State;
+        public float Time;
+        public float Weight;
     }
 
     // ---- RegisterState --------------------------------------------------------
@@ -179,6 +187,8 @@ namespace CardShopCoop.Net.Messages
     public sealed class RegisterRejectedMessage : INetMessage
     {
         public byte Index;
+        public int CustomerId;
+        public int CustomerGeneration;
 
         public MsgType Type
         {
@@ -201,6 +211,10 @@ namespace CardShopCoop.Net.Messages
     [NetworkMessage(MsgType.RegisterOp, Policy = MessagePolicy.Any)]
     public sealed class RegisterOpMessage : INetMessage
     {
+        public CurrencyProfile Currency;
+        public long Sequence;
+        public int CustomerId;
+        public int CustomerGeneration;
         public byte Index;
         public byte Op;
         public byte BagIndex;      // OpScanItem / OpScanCard

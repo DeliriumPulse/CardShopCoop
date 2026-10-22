@@ -21,13 +21,8 @@ namespace CardShopCoop.Sync
     /// the same snapshot is pushed with an open-screen flag so both screens show the
     /// same numbers at the same time.
     ///
-    /// Client: the report screen opens READ-ONLY. Its buttons must not advance anything -
-    /// the vanilla path would run LightManager.GoNextDay and charge the game-event host
-    /// fee through the forwarded ReduceCoin (a second, phantom charge). So BOTH the
-    /// click-anywhere continue and the visible next-day button are rerouted to
-    /// CloseClientReport(), which conveniently IS the vanilla bookkeeping (append
-    /// past-list, reset day collect) that keeps the phone's report history aligned with
-    /// the host's - and is what hands the joiner his movement back.
+    /// Client: both continue controls request one shared day advance. The host runs
+    /// the vanilla coroutine once, and its day-change mirror closes the guest recap.
     /// </summary>
     public class ReportSync : TickableCoopModule
     {
@@ -42,6 +37,7 @@ namespace CardShopCoop.Sync
         // host: set by patches (static, patches can't see the instance), drained by HostTick
         private static bool s_openPending;
         private static GameReportDataCollect s_openSnapshot; // struct copy: survives the reset on host continue
+        private static int s_openDay;
         private static bool s_reviewsDirty;
 
         // client: the report the open-screen broadcast displayed. If the HOST hits
@@ -58,6 +54,11 @@ namespace CardShopCoop.Sync
         // exists to prevent. When it is false we still CLOSE - the joiner gets his legs back -
         // we just let the live host-synced numbers be what CloseScreen files.
         private static bool s_haveOpenReport;
+        private static readonly DeferredDayReport<GameReportDataCollect> ClientDelivery =
+            new DeferredDayReport<GameReportDataCollect>();
+        private int _requestedOpenDay = -1;
+        private static int s_clientLiveReportDay = -1;
+        internal static bool HasClientReport => ClientDelivery.Day >= 0;
 
         // client UI state we must read before opening a fullscreen lock
         private static readonly System.Reflection.FieldInfo FiIsLerping =
@@ -68,8 +69,6 @@ namespace CardShopCoop.Sync
             ReflectionSurface.RequiredField(typeof(EndOfDayReportScreen), "m_IsHoldingMouseDown");
         private static readonly System.Reflection.FieldInfo FiMouseDownTime =
             ReflectionSurface.RequiredField(typeof(EndOfDayReportScreen), "m_MouseDownTime");
-        private static readonly System.Reflection.FieldInfo FiPhoneMode =
-            ReflectionSurface.RequiredField(typeof(InteractionPlayerController), "m_IsPhoneScreenMode");
         private static readonly System.Reflection.FieldInfo FiCashMode =
             ReflectionSurface.RequiredField(typeof(InteractionPlayerController), "m_IsCashCounterMode");
 
@@ -88,8 +87,16 @@ namespace CardShopCoop.Sync
 
         protected override void OnHostTick(in SyncFrame frame) => HostTick(frame.Dt, frame.InGame);
 
+        protected override void OnClientTick(in SyncFrame frame)
+        {
+            if (frame.InGame)
+                Guarded("deferred recap", TickClientReport);
+        }
+
         public override void Dispose()
         {
+            if (s_haveOpenReport || ClientDelivery.Opened)
+                StopReportSound();
             base.Dispose();
             ApplyingRemote = false;
             s_openPending = false;
@@ -97,12 +104,17 @@ namespace CardShopCoop.Sync
             s_reviewsDirty = false;
             s_clientOpenReport = default(GameReportDataCollect);
             s_haveOpenReport = false;
+            ClientDelivery.Reset();
+            s_clientLiveReportDay = -1;
+            _requestedOpenDay = -1;
             _screen = null;
             _ipc = null;
         }
 
         public override void Reset()
         {
+            if (s_haveOpenReport || ClientDelivery.Opened)
+                StopReportSound();
             _gate.Reset(-4.1f);
             _reviewSeq = -1;
             s_openPending = false;
@@ -112,6 +124,9 @@ namespace CardShopCoop.Sync
             // into the NEXT save's phone history the first time the joiner closes a report
             s_clientOpenReport = default(GameReportDataCollect);
             s_haveOpenReport = false;
+            ClientDelivery.Reset();
+            s_clientLiveReportDay = -1;
+            _requestedOpenDay = -1;
             _screen = null;
             _ipc = null;
         }
@@ -137,7 +152,7 @@ namespace CardShopCoop.Sync
                 prefix: new HarmonyMethod(typeof(ReportSync), nameof(ReviewAddPrefix)),
                 postfix: new HarmonyMethod(typeof(ReportSync), nameof(ReviewAddPostfix)));
 
-            // Client: continue closes read-only instead of advancing the world.
+            // Client: continue requests the shared day advance.
             Try(h, typeof(EndOfDayReportScreen), "OnPressGoNextButton",
                 prefix: new HarmonyMethod(typeof(ReportSync), nameof(NextButtonPrefix)));
 
@@ -183,6 +198,7 @@ namespace CardShopCoop.Sync
             }
             catch (System.Exception e) { Swallow.Log(e); return; }
             s_openSnapshot = CPlayerData.m_GameReportDataCollect; // value copy
+            s_openDay = CPlayerData.m_CurrentDay;
             s_openPending = true;
         }
 
@@ -211,16 +227,7 @@ namespace CardShopCoop.Sync
             catch (System.Exception e) { Swallow.Log(e); }
             if (lerping)
                 return true; // vanilla behavior: fast-forward the count-up
-            // Vanilla's other branch runs OnPressGoNextDay() whenever GetHasDayEnded() is
-            // true - and on a joiner it usually IS. The DayTime mirror clears
-            // m_HasDayEnded on the host's 2s beat, but LightManager.Update re-latches it
-            // every frame in between (EvaluateTimeClock clamps the mirrored clock to 21:00,
-            // which is the hour that sets the flag), so the vanilla path would advance the
-            // joiner's OWN day and charge the game-event host fee a second, phantom time
-            // through the forwarded ReduceCoin; in the one frame out of ~120 where the flag
-            // is momentarily clear it would instead do nothing at all, leaving him locked in
-            // the screen. Neither is what we want: close read-only instead.
-            CloseClientReport();
+            CoopCore.Instance?.RequestDayAction(true);
             return false;
         }
 
@@ -228,16 +235,8 @@ namespace CardShopCoop.Sync
         {
             if (CoopCore.Role != CoopRole.Client)
                 return true;
-            // This is the big visible "next day" button, and it used to be a silent
-            // no-op on a joiner: the ONLY way out of the recap was the click-anywhere
-            // raw-input reroute above, so a son who politely aimed at the button sat
-            // there with his movement locked (OpenScreen runs EnterLockMoveMode and only
-            // CloseScreen releases it) - and TryOpenReportScreen's IsActive() guard then
-            // swallowed every later night's report. So the button closes the recap too.
-            // It still must never reach the vanilla body: GoNextDay is the host's call,
-            // and the game-event host fee would be charged a second, phantom time
-            // through the forwarded ReduceCoin.
-            CloseClientReport();
+            // Never run the fee-charging coroutine on both machines.
+            CoopCore.Instance?.RequestDayAction(true);
             return false;
         }
 
@@ -248,6 +247,21 @@ namespace CardShopCoop.Sync
             if (!inGame || BroadcastState == null)
                 return;
 
+            if (_requestedOpenDay >= 0)
+            {
+                if (_requestedOpenDay != CPlayerData.m_CurrentDay || EndOfDayReportScreen.IsActive())
+                    _requestedOpenDay = -1;
+                else
+                {
+                    var player = UnityEngine.Object.FindObjectOfType<InteractionPlayerController>();
+                    if (CanOpenSharedReport(player))
+                    {
+                        _requestedOpenDay = -1;
+                        player.ShowGoNextDayScreen();
+                    }
+                }
+            }
+
             // the open-moment ships immediately (not on the 2s grid): the snapshot was
             // taken at OpenScreen time, so even a host racing to "next day" can't feed
             // the client a reset report
@@ -257,7 +271,7 @@ namespace CardShopCoop.Sync
                 var snap = s_openSnapshot;
                 Guarded("host", () =>
                 {
-                    BroadcastState(BuildState(snap, openScreen: true));
+                    BroadcastState(BuildState(snap, openScreen: true, s_openDay));
                 });
                 return;
             }
@@ -277,6 +291,33 @@ namespace CardShopCoop.Sync
                 var live = CPlayerData.m_GameReportDataCollect;
                 BroadcastState(BuildState(live, openScreen: false));
             });
+        }
+
+        public void ResendOpenReport()
+        {
+            if (CoopCore.Role == CoopRole.Host && EndOfDayReportScreen.IsActive())
+                BroadcastState?.Invoke(BuildState(s_openSnapshot, openScreen: true, s_openDay));
+        }
+
+        internal void DeferHostOpen(int day) => _requestedOpenDay = day;
+
+        internal static void DismissDayWarning(InteractionPlayerController player)
+        {
+            var warning = player?.m_ConfirmGoNextDayScreen;
+            if (warning != null && warning.IsScreenOpened())
+                warning.OnPressCancelBtn(); // releases its cursor/move locks before deferred opening
+        }
+
+        internal static bool CanOpenSharedReport(InteractionPlayerController player)
+        {
+            if (player == null || player.IsInUIMode())
+                return false;
+            var pause = UnityEngine.Object.FindObjectOfType<PauseScreen>();
+            var settings = UnityEngine.Object.FindObjectOfType<SettingScreen>();
+            var loading = UnityEngine.Object.FindObjectOfType<LoadingScreen>();
+            return (pause == null || !pause.m_ScreenGrp.activeSelf)
+                && (settings == null || !settings.m_ScreenGrp.activeSelf)
+                && (loading == null || !loading.m_ScreenGrp.activeSelf);
         }
 
         private static int HashState()
@@ -310,10 +351,11 @@ namespace CardShopCoop.Sync
             return h;
         }
 
-        private static ReportStateMessage BuildState(GameReportDataCollect r, bool openScreen)
+        private static ReportStateMessage BuildState(GameReportDataCollect r, bool openScreen, int? day = null)
         {
             var msg = new ReportStateMessage
             {
+                Day = day ?? CPlayerData.m_CurrentDay,
                 OpenScreen = openScreen,
                 CustomerVisited = r.customerVisited,
                 CheckoutCount = r.checkoutCount,
@@ -379,6 +421,8 @@ namespace CardShopCoop.Sync
 
         private void ClientApplyInner(ReportStateMessage message)
         {
+            if (message.Day < CPlayerData.m_CurrentDay)
+                return;
             bool openScreen = message.OpenScreen;
 
             var r = default(GameReportDataCollect);
@@ -409,7 +453,11 @@ namespace CardShopCoop.Sync
             // opens etc. are folded into the host numbers only where the host saw them;
             // m_GameReportDataCollectPermanent stays local so achievements keep their
             // per-player pacing)
-            CPlayerData.m_GameReportDataCollect = r;
+            if (message.Day == CPlayerData.m_CurrentDay)
+            {
+                CPlayerData.m_GameReportDataCollect = r;
+                s_clientLiveReportDay = message.Day;
+            }
 
             int totalCount = message.ReviewCount;
             float average = message.ReviewScoreAverage;
@@ -448,9 +496,41 @@ namespace CardShopCoop.Sync
 
             if (openScreen)
             {
-                s_clientOpenReport = r; // what CloseScreen must file into the history
-                TryOpenReportScreen();
+                TickClientReport();
+                ClientDelivery.Offer(message.Day, CPlayerData.m_CurrentDay, r);
+                TickClientReport();
             }
+        }
+
+        private static void TickClientReport()
+        {
+            if (ClientDelivery.Day < 0)
+                return;
+            if (_ipc == null)
+                _ipc = UnityEngine.Object.FindObjectOfType<InteractionPlayerController>();
+            if (ClientDelivery.Day <= CPlayerData.m_CurrentDay)
+                DismissDayWarning(_ipc);
+            var action = ClientDelivery.Next(CPlayerData.m_CurrentDay, !CanOpenSharedReport(_ipc));
+            if (action == ReportDeliveryAction.Archive)
+                CloseClientReport();
+            else if (action == ReportDeliveryAction.Open)
+                TryOpenReportScreen();
+        }
+
+        private static void ArchiveUnopenedReport()
+        {
+            if (ClientDelivery.Day < 0)
+                return;
+            var history = CPlayerData.m_GameReportDataCollectPastList;
+            history.Add(ClientDelivery.Value);
+            while (history.Count > 30)
+                history.RemoveAt(0);
+            if (s_clientLiveReportDay < CPlayerData.m_CurrentDay)
+            {
+                CPlayerData.m_GameReportDataCollect = default(GameReportDataCollect);
+                s_clientLiveReportDay = CPlayerData.m_CurrentDay;
+            }
+            ClientDelivery.Finish();
         }
 
         private static void TryOpenReportScreen()
@@ -469,14 +549,14 @@ namespace CardShopCoop.Sync
                 if (_ipc == null)
                     _ipc = UnityEngine.Object.FindObjectOfType<InteractionPlayerController>();
                 var pc = _ipc;
+                if (pc == null)
+                    return;
                 if (pc != null)
                 {
-                    // the phone owns the same cursor/move locks; fighting it corrupts UI
-                    // state, so a joiner mid-phone just keeps the data (report history
-                    // still updates) and skips the popup
+                    // Keep the recap pending until the phone/menu has released its locks.
                     try
                     {
-                        if (FiPhoneMode != null && (bool)FiPhoneMode.GetValue(pc))
+                        if (!CanOpenSharedReport(pc))
                             return;
                     }
                     catch (System.Exception e) { Swallow.Log(e); }
@@ -499,10 +579,14 @@ namespace CardShopCoop.Sync
                 }
                 // SaveGameData inside OpenScreen is already no-op'd for joiners by
                 // GamePatches.SaveGuardPrefix; everything else in there is pure UI
+                s_clientOpenReport = ClientDelivery.Value;
+                CPlayerData.m_GameReportDataCollect = s_clientOpenReport;
+                s_clientLiveReportDay = ClientDelivery.Day;
                 EndOfDayReportScreen.OpenScreen();
+                ClientDelivery.MarkOpened();
                 // ONLY here: the recap on screen is now the one whose numbers the caller
                 // just stored in s_clientOpenReport, so the close is allowed to file them.
-                // Every other way the screen could be up (the phone-mode bail above, a
+                // Every other way the screen could be up (a pending menu, a
                 // vanilla open) leaves this false and the close keeps the live numbers.
                 s_haveOpenReport = true;
             }
@@ -513,9 +597,21 @@ namespace CardShopCoop.Sync
         {
             if (CoopCore.Role != CoopRole.Client)
                 return;
+            StopReportSound();
+        }
+
+        private static void StopReportSound()
+        {
             try
             {
-                SoundManager.SetEnableSound_CoinIncrease(false);
+                // SoundManager survives scene changes. Its vanilla helper leaves the
+                // enabled latch set when SFX volume is zero, so clear both explicitly.
+                var sound = UnityEngine.Object.FindObjectOfType<SoundManager>()?.m_CoinIncrease;
+                if (sound != null)
+                {
+                    sound.Stop();
+                    sound.enabled = false;
+                }
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("report sound cleanup: " + e.Message); }
         }
@@ -537,16 +633,19 @@ namespace CardShopCoop.Sync
                 // that shadows the real screen for the rest of the run
                 if (_screen == null)
                     _screen = UnityEngine.Object.FindObjectOfType<EndOfDayReportScreen>();
-                if (_screen == null)
+                if (_screen == null || !EndOfDayReportScreen.IsActive())
+                {
+                    // The next day can arrive before the guest closes their phone. Keep
+                    // yesterday's real recap in history without touching today's counters.
+                    ArchiveUnopenedReport();
                     return;
-                if (!EndOfDayReportScreen.IsActive())
-                    return; // nothing open: don't file a phantom day
+                }
 
                 // Closing during the number lerp skips EndDayReportTextUI's normal cleanup,
                 // which otherwise leaves the looping coin-increase source enabled forever.
                 try
                 {
-                    SoundManager.SetEnableSound_CoinIncrease(false);
+                    StopReportSound();
                 }
                 catch (System.Exception e) { Swallow.Log(e); }
 
@@ -558,6 +657,9 @@ namespace CardShopCoop.Sync
                 // yesterday) day got filed into the joiner's phone history. Without it the
                 // live host-synced day-collect is what CloseScreen files: not the frozen
                 // open-moment snapshot, but real numbers instead of a phantom.
+                var liveReport = CPlayerData.m_GameReportDataCollect;
+                bool preserveLiveReport = ClientDelivery.Day >= 0 && ClientDelivery.Day < CPlayerData.m_CurrentDay
+                    && s_clientLiveReportDay == CPlayerData.m_CurrentDay;
                 if (s_haveOpenReport)
                     CPlayerData.m_GameReportDataCollect = s_clientOpenReport;
                 s_haveOpenReport = false;
@@ -565,6 +667,10 @@ namespace CardShopCoop.Sync
                 // past-list append, day-collect reset - plus the cursor hide and
                 // ExitLockMoveMode that unfreeze the joiner.
                 EndOfDayReportScreen.CloseScreen();
+                ClientDelivery.Finish();
+                if (preserveLiveReport)
+                    CPlayerData.m_GameReportDataCollect = liveReport;
+                s_clientLiveReportDay = CPlayerData.m_CurrentDay;
                 // Hand the screen back the way OpenScreen expects it. Its Update() early-
                 // returns on !m_IsActive BEFORE it reads the key-UP, and every joiner close
                 // path tears the screen down in the same frame as the key-DOWN (the

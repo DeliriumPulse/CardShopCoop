@@ -71,7 +71,7 @@ namespace CardShopCoop.Net
                 Type = metadata.Type,
                 Policy = policy == MessagePolicy.Any ? metadata.Policy : policy,
                 Handler = (context, message) => handler(context, (T)message),
-                Retryable = retryable,
+                Retryable = retryable && !MessageRetryRules.IsNonIdempotent(metadata.Type),
                 Heal = heal
             };
             _routes[typeof(T)] = route;

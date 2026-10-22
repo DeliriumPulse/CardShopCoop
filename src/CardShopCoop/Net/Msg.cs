@@ -97,6 +97,12 @@ namespace CardShopCoop.Net
         ShelfTransferResult = 99, // host -> sender: how much of a shelf item delta was accepted
         RegisterRejected = 100, // host -> client: a register op was rejected; reset that counter
         ShelfBoxPull = 101, // client -> host: move one shelf item directly into a held box
+        TutorialContribution = 102, // client -> host: direct-player starting task progress
+        ShopPurchaseCue = 103, // host -> requesting guest: accepted purchase sound
+        DayAction = 104, // guest -> host: open shared recap / advance this day
+        DayActionReply = 105, // host -> guest: vanilla unfinished-checkout warning
+        ShelfBoxCue = 106, // host -> guest: successful shelf-to-box transfer feedback
+        BoxRepairRequest = 107, // guest -> host: resend only this box's current state
     }
 
     /// <summary>One received message, already reassembled and decoded from the wire.

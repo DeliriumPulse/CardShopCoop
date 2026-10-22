@@ -27,6 +27,7 @@ namespace CardShopCoop.Net
             Buffer.BlockCopy(BitConverter.GetBytes(payload.Length + Msg.TypeSize), 0, frame, 0, Msg.FrameHeaderSize);
             frame[Msg.FrameHeaderSize] = (byte)message.Type;
             Buffer.BlockCopy(payload, 0, frame, Msg.FrameHeaderSize + Msg.TypeSize, payload.Length);
+            CardShopCoop.Util.MessageTrafficDiagnostics.Record(true, message.Type, frame.Length);
             return frame;
         }
     }

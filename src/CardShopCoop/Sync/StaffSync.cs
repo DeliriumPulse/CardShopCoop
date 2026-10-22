@@ -17,10 +17,9 @@ namespace CardShopCoop.Sync
     /// the host applies through the vanilla path (fee, roster flag, activation), so the
     /// wallet is charged exactly once, host-side.
     ///
-    /// Fire / give-bonus / task-assignment screens are NOT forwarded: they only open via
-    /// Worker.OnMousePress on a live Worker, and on the joiner real workers are swept
-    /// inactive while puppet clones are stripped of colliders and scripts - those screens
-    /// are physically unreachable, so ops for them would be dead code.
+    /// Guests use the native worker screens through their worker puppets. A temporary
+    /// interaction lease keeps simultaneous edits consistent and is released when the
+    /// player closes the screen, leaves, or the session ends.
     ///
     /// Host broadcasts the hired roster + per-worker save-data essentials, hash-gated
     /// (on change + a slow heal), into the client's CPlayerData mirrors so the joiner's
@@ -77,7 +76,7 @@ namespace CardShopCoop.Sync
         private bool _hireScreenSearched; // the screen may legitimately not exist yet
         private readonly SnapshotGate _gate = new SnapshotGate(1.0f, 15f, -0.7f);
         private readonly List<Entry> _buf = new List<Entry>(MaxWorkers);
-        private readonly Dictionary<int, int> _workerLeaseOwner = new Dictionary<int, int>();
+        private readonly WorkerInteractionLeases _workerLeases = new WorkerInteractionLeases();
         private static readonly Dictionary<int, bool> ClientWorkerBusy = new Dictionary<int, bool>();
         private static readonly HashSet<int> ClientWorkerLease = new HashSet<int>();
         private static bool _allowClientWorkerOpen;
@@ -119,14 +118,60 @@ namespace CardShopCoop.Sync
 
         public override void Reset()
         {
+            if (CoopCore.Role == CoopRole.Client && ClientWorkerLease.Count > 0)
+            {
+                try
+                {
+                    CloseClientWorkerScreens();
+                }
+                catch (Exception e) { CoopPlugin.Log.LogWarning("StaffSync worker UI teardown: " + e.Message); }
+            }
+            foreach (int index in _workerLeases.Reset())
+                ResumeWorker(index);
             _wm = null;
             _hireScreen = null;
             _hireScreenSearched = false;
             _gate.Reset(-0.7f);
-            _workerLeaseOwner.Clear();
             ClientWorkerBusy.Clear();
             ClientWorkerLease.Clear();
             _allowClientWorkerOpen = false;
+        }
+
+        private static void CloseClientWorkerScreens()
+        {
+            var interact = UnityEngine.Object.FindObjectOfType<WorkerInteractUIScreen>(true);
+            CloseClientWorkerScreen(interact, FiInteractWorker, interact?.m_ScreenGrp, () => interact.CloseScreen());
+            var options = UnityEngine.Object.FindObjectOfType<WorkerOptionUIScreen>(true);
+            CloseClientWorkerScreen(options, FiOptionWorker, options?.m_ScreenGrp, () => options.CloseScreen());
+            var prices = UnityEngine.Object.FindObjectOfType<WorkerOptionSetPriceUIScreen>(true);
+            CloseClientWorkerScreen(prices, FiPriceWorker, prices?.m_ScreenGrp, () => prices.CloseScreen());
+            var packs = UnityEngine.Object.FindObjectOfType<WorkerSetPackOpenerTypeOptionScreen>(true);
+            CloseClientWorkerScreen(packs, FiPackWorker, packs?.m_ScreenGrp, () => packs.CloseScreen());
+        }
+
+        private static void CloseClientWorkerScreen(Component screen, System.Reflection.FieldInfo field,
+            GameObject group, Action close)
+        {
+            if (screen == null || group == null || !group.activeSelf)
+                return;
+            var worker = WorkerFrom(field, screen);
+            if (worker == null || !ClientWorkerLease.Contains(worker.m_WorkerIndex))
+                return;
+            try
+            {
+                if (CoopCore.PlayerIpc != null)
+                    worker.OnPressStopInteract();
+            }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("StaffSync release worker UI: " + e.Message); }
+            try
+            {
+                close();
+            }
+            catch (Exception e)
+            {
+                group.SetActive(false);
+                CoopPlugin.Log.LogWarning("StaffSync close worker UI: " + e.Message);
+            }
         }
 
         public override void ForceResend()
@@ -355,8 +400,10 @@ namespace CardShopCoop.Sync
 
         private static IEnumerator ReleaseClientWorkerLater(int index)
         {
+            int generation = CoopCore.SessionGeneration;
             yield return null;
-            ReleaseClientWorker(index);
+            if (CoopCore.Role == CoopRole.Client && CoopCore.IsSessionGeneration(generation))
+                ReleaseClientWorker(index);
         }
 
         private static void ReleaseClientWorker(int index)
@@ -376,7 +423,8 @@ namespace CardShopCoop.Sync
                 ClientWorkerLease.Remove(index);
             if (!granted)
                 return;
-            ClientWorkerLease.Add(index);
+            if (!ClientWorkerLease.Add(index))
+                return; // A repeated grant must not reopen/toggle the native worker screen.
             var worker = NpcSync.GetWorkerPuppet(index);
             // The puppet is built from the cloned prefab and can exist before its staff
             // data does. WorkerInteractUIScreen.OpenScreen dereferences GetWorkerData()
@@ -443,7 +491,8 @@ namespace CardShopCoop.Sync
                 switch (op)
                 {
                     case OpHire:
-                        HostHire(message.Index);
+                        if (HostHire(message.Index))
+                            SendToClient?.Invoke(connId, new ShopPurchaseCueMessage());
                         break;
                     case OpUpdate:
                         HostUpdate(message, connId);
@@ -490,12 +539,15 @@ namespace CardShopCoop.Sync
         {
             if (!ValidWorkerIndex(index))
                 return false;
-            if (_workerLeaseOwner.TryGetValue(index, out int owner))
+            if (!_workerLeases.TryAcquire(index, connId, out bool alreadyOwned))
             {
-                if (owner == connId)
-                    return true;
                 SendInteraction(connId, index, false, true);
                 return false;
+            }
+            if (alreadyOwned)
+            {
+                SendInteraction(connId, index, true, true);
+                return true;
             }
             var worker = WorkerManager.GetWorkerList()[index];
             if (connId != 0)
@@ -512,7 +564,6 @@ namespace CardShopCoop.Sync
                 }
             }
             worker.m_IsPausingAction = true;
-            _workerLeaseOwner[index] = connId;
             SendInteraction(connId, index, true, true);
             BroadcastInteractionState(index, true);
             return true;
@@ -520,29 +571,40 @@ namespace CardShopCoop.Sync
 
         private void HostEndInteraction(int index, int connId)
         {
-            if (!_workerLeaseOwner.TryGetValue(index, out int owner) || owner != connId)
+            if (!_workerLeases.Release(index, connId))
                 return;
-            var workers = WorkerManager.GetWorkerList();
-            if (workers != null && index >= 0 && index < workers.Count && workers[index] != null)
-                workers[index].m_IsPausingAction = false;
-            _workerLeaseOwner.Remove(index);
+            ResumeWorker(index);
             BroadcastInteractionState(index, false);
+        }
+
+        private void ResumeWorker(int index)
+        {
+            try
+            {
+                // The static getter creates a fake singleton if the real manager has
+                // already been destroyed during a scene change. Resolve it first.
+                if (Wm() == null)
+                    return;
+                var workers = WorkerManager.GetWorkerList();
+                if (workers != null && index >= 0 && index < workers.Count && workers[index] != null)
+                    workers[index].m_IsPausingAction = false;
+            }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("StaffSync resume worker: " + e.Message); }
         }
 
         public void HostReleaseConn(int connId)
         {
-            var release = new List<int>();
-            foreach (var kv in _workerLeaseOwner)
-                if (kv.Value == connId)
-                    release.Add(kv.Key);
-            foreach (int index in release)
-                HostEndInteraction(index, connId);
+            foreach (int index in _workerLeases.ReleaseConnection(connId))
+            {
+                ResumeWorker(index);
+                BroadcastInteractionState(index, false);
+            }
         }
 
         private void HostUpdate(StaffOpMessage message, int connId)
         {
             int index = message.Index;
-            if (!_workerLeaseOwner.TryGetValue(index, out int leaseOwner) || leaseOwner != connId)
+            if (!_workerLeases.TryGetOwner(index, out int leaseOwner) || leaseOwner != connId)
                 return;
             var wm = Wm();
             if (wm == null || index < 0 || index >= wm.m_WorkerDataList.Count)
@@ -586,13 +648,13 @@ namespace CardShopCoop.Sync
             if (wm == null || workers == null || index < 0 || index >= workers.Count || workers[index] == null
                 || !CPlayerData.GetIsWorkerHired(index))
                 return;
-            if (!_workerLeaseOwner.TryGetValue(index, out int owner) || owner != connId)
+            if (!_workerLeases.TryGetOwner(index, out int owner) || owner != connId)
                 return;
             var w = workers[index];
             if (w.GetBonusBoostedCount() >= 3)
                 return;
             float fee = w.GetWorkerData().costPerDay;
-            if (CPlayerData.m_CoinAmountDouble < fee)
+            if (!(CoopCore.Instance?.TryReserveGuestSpend(fee) ?? false))
                 return;
             PriceChangeManager.AddTransaction(-fee, ETransactionType.WorkerSalary, 0);
             CEventManager.QueueEvent(new CEventPlayer_ReduceCoin(fee));
@@ -608,7 +670,7 @@ namespace CardShopCoop.Sync
             if (workers == null || index < 0 || index >= workers.Count || workers[index] == null
                 || !CPlayerData.GetIsWorkerHired(index))
                 return;
-            if (!_workerLeaseOwner.TryGetValue(index, out int owner) || owner != connId)
+            if (!_workerLeases.TryGetOwner(index, out int owner) || owner != connId)
                 return;
             workers[index].FireWorker();
             HostEndInteraction(index, connId);
@@ -619,33 +681,33 @@ namespace CardShopCoop.Sync
         /// panel UI, so a joiner's hire is indistinguishable from the host's own. The
         /// wallet is charged HERE and only here - the client path was blocked before
         /// its ReduceCoin could fire.</summary>
-        private void HostHire(int index)
+        private bool HostHire(int index)
         {
             try
             {
                 var wm = Wm();
                 if (wm == null || wm.m_WorkerDataList == null)
-                    return;
+                    return false;
                 if (index < 0 || index >= wm.m_WorkerDataList.Count || index >= CPlayerData.m_IsWorkerHired.Count)
                 {
                     CoopPlugin.Log.LogWarning("StaffSync: hire op for unknown worker " + index);
-                    return;
+                    return false;
                 }
                 // double-hire guard: duplicate ops, or both players racing the same panel
                 if (CPlayerData.GetIsWorkerHired(index))
-                    return;
+                    return false;
                 WorkerData workerData = WorkerManager.GetWorkerData(index);
                 if (CPlayerData.m_ShopLevel + 1 < workerData.shopLevelRequired)
-                    return;
+                    return false;
                 var gm = CSingleton<CGameManager>.Instance;
                 if (gm != null && gm.m_IsPrologue && !workerData.prologueShow)
-                    return;
-                if (CPlayerData.m_CoinAmountDouble < (double)workerData.hiringCost)
+                    return false;
+                if (!(CoopCore.Instance?.TryReserveGuestSpend(workerData.hiringCost) ?? false))
                 {
                     // the client pre-checked its mirror; losing this race is rare and the
                     // roster echo (still unhired) is the correction
                     CoopPlugin.Log.LogInfo("StaffSync: hire refused, not enough money for worker " + index);
-                    return;
+                    return false;
                 }
                 // vanilla hire path, faithfully (including the report counters and the
                 // achievement check the panel does)
@@ -665,8 +727,10 @@ namespace CardShopCoop.Sync
                 SoundManager.PlayAudio("SFX_CustomerBuy", 0.6f);
                 CoopPlugin.Log.LogInfo("StaffSync: joiner hired worker " + index);
                 ForceResend(); // the confirming echo rides the next tick
+                return true;
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("StaffSync host hire: " + e.Message); }
+            return false;
         }
 
         public void HostTick(float dt, bool inGame)

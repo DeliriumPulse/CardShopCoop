@@ -234,7 +234,9 @@ namespace CardShopCoop.Net.Messages
         public ECardExpansionType PendingGameEventExpansion;
         public List<float> GameEventPrices = new List<float>();
         public List<byte> CashierFlags = new List<byte>();
+        public List<ushort> CashierIds = new List<ushort>();
         public List<byte> TableNumbers = new List<byte>();
+        public List<ushort> TableIds = new List<ushort>();
         public List<DecoStockEntry> DecoStock = new List<DecoStockEntry>();
 
         public MsgType Type

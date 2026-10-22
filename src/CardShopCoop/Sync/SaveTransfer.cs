@@ -455,14 +455,18 @@ namespace CardShopCoop.Sync
         /// JsonUtility and CGameManager are Unity/game APIs and are not thread-safe.</summary>
         public static void ApplyAndLoadAsync(byte[] saveBytes, int sessionGen,
             Action completed, Action<Exception> failed)
+            => ApplyAndLoadAsync(saveBytes, sessionGen, CoopSlot, completed, failed);
+
+        public static void ApplyAndLoadAsync(byte[] saveBytes, int sessionGen, int clientSlot,
+            Action completed, Action<Exception> failed)
         {
             if (saveBytes == null || saveBytes.Length == 0)
                 throw new ArgumentException("Received save payload is empty", nameof(saveBytes));
 
             string root = Application.persistentDataPath;
-            string basePath = Path.Combine(root, "savedGames_Release" + CoopSlot);
+            string basePath = Path.Combine(root, "savedGames_Release" + clientSlot);
             string slotPath = basePath + ".json";
-            string backupPath = Path.Combine(root, "savedGames_ReleaseBackupFile" + CoopSlot + ".json");
+            string backupPath = Path.Combine(root, "savedGames_ReleaseBackupFile" + clientSlot + ".json");
             new System.Threading.Thread(() =>
             {
                 try
@@ -495,7 +499,7 @@ namespace CardShopCoop.Sync
                         }
                         try
                         {
-                            InjectAndForceLoad(saveBytes);
+                            InjectAndForceLoad(saveBytes, clientSlot);
                             completed?.Invoke();
                         }
                         catch (Exception e)
@@ -522,7 +526,7 @@ namespace CardShopCoop.Sync
             }.Start();
         }
 
-        private static void InjectAndForceLoad(byte[] saveBytes)
+        private static void InjectAndForceLoad(byte[] saveBytes, int clientSlot)
         {
             var gm = CSingleton<CGameManager>.Instance;
             gm.m_ForceNoCloudSaveLoad = true;
@@ -544,7 +548,7 @@ namespace CardShopCoop.Sync
                 }
             }
             CoopPlugin.Log.LogInfo($"Coop save received ({saveBytes.Length / 1024} KB){(injected ? " [in-memory]" : "")}, loading world...");
-            ForceLoadSlot(CoopSlot);
+            ForceLoadSlot(clientSlot);
         }
 
         /// <summary>Client: apply the received world into the co-op slot and load it.
@@ -575,6 +579,7 @@ namespace CardShopCoop.Sync
         /// Approach contributed by Jburne10.</summary>
         public static void ApplyAndLoad(byte[] saveBytes)
         {
+            int clientSlot = CoopSlot;
             var gm = CSingleton<CGameManager>.Instance;
             gm.m_ForceNoCloudSaveLoad = true; // keep Steam/Xbox cloud away from the borrowed world
 
@@ -625,21 +630,21 @@ namespace CardShopCoop.Sync
             // backup json) are precisely the ones the game falls back to when the load of the
             // file we DID replace goes wrong. Each delete is independent, so each gets its own
             // chance to succeed and its own warning when it doesn't.
-            string basePath = Application.persistentDataPath + "/savedGames_Release" + CoopSlot;
+            string basePath = Application.persistentDataPath + "/savedGames_Release" + clientSlot;
             TryDelete(basePath + ".gd");
-            TryDelete(SlotPath(CoopSlot));
-            TryDelete(Application.persistentDataPath + "/savedGames_ReleaseBackupFile" + CoopSlot + ".json");
+            TryDelete(SlotPath(clientSlot));
+            TryDelete(Application.persistentDataPath + "/savedGames_ReleaseBackupFile" + clientSlot + ".json");
 
             // A failed write is NOT fatal: on Game Pass the injected in-memory world above is
             // what the load path reads anyway, so we degrade to in-memory-only and carry on.
             try
             {
-                File.WriteAllBytes(SlotPath(CoopSlot), saveBytes);
+                File.WriteAllBytes(SlotPath(clientSlot), saveBytes);
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("coop: could not write co-op slot file: " + e.Message); }
 
             CoopPlugin.Log.LogInfo($"Coop save received ({saveBytes.Length / 1024} KB){(injected ? " [in-memory]" : "")}, loading world...");
-            ForceLoadSlot(CoopSlot);
+            ForceLoadSlot(clientSlot);
         }
 
         /// <summary>Delete one file if it is there, and let a failure be exactly that one file's

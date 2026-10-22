@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using UnityEngine;
 
 namespace CardShopCoop.Util
@@ -17,6 +18,7 @@ namespace CardShopCoop.Util
         private const double RepeatSeconds = 2.0;
 
         private static readonly Dictionary<string, double> _lastLog = new Dictionary<string, double>();
+        internal static readonly DiagnosticHistory RecentSpikes = new DiagnosticHistory();
 
         public static bool Enabled
         {
@@ -53,6 +55,8 @@ namespace CardShopCoop.Util
                     if (!_lastLog.TryGetValue(stage, out var last) || now - last >= RepeatSeconds)
                     {
                         _lastLog[stage] = now;
+                        RecentSpikes.Add(DateTime.UtcNow.ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture)
+                            + " UTC [perf] " + stage + " took " + ms.ToString("F1", CultureInfo.InvariantCulture) + " ms");
                         CoopPlugin.Log.LogWarning($"[perf] {stage} took {ms:F1} ms");
                     }
                 }
@@ -82,6 +86,8 @@ namespace CardShopCoop.Util
             if (_lastLog.TryGetValue(stage, out var last) && now - last < RepeatSeconds)
                 return;
             _lastLog[stage] = now;
+            RecentSpikes.Add(DateTime.UtcNow.ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture)
+                + " UTC [perf] " + stage + " took " + ms.ToString("F1", CultureInfo.InvariantCulture) + " ms");
             CoopPlugin.Log.LogWarning($"[perf] {stage} took {ms:F1} ms");
         }
     }

@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ManagedPath>$(GamePath)/Card Shop Simulator_Data/Managed</ManagedPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="CardShopCoop" HintPath="../../src/CardShopCoop/bin/Release/CardShopCoop.dll" />
+    <Reference Include="Assembly-CSharp" HintPath="$(ManagedPath)/Assembly-CSharp.dll" />
+    <Reference Include="UnityEngine.CoreModule" HintPath="$(ManagedPath)/UnityEngine.CoreModule.dll" />
+    <Reference Include="UnityEngine" HintPath="$(ManagedPath)/UnityEngine.dll" />
+    <Reference Include="UnityEngine.AnimationModule" HintPath="$(ManagedPath)/UnityEngine.AnimationModule.dll" />
+    <Reference Include="Newtonsoft.Json" HintPath="$(ManagedPath)/Newtonsoft.Json.dll" />
+    <Reference Include="BepInEx" HintPath="$(GamePath)/BepInEx/core/BepInEx.dll" />
+    <Reference Include="0Harmony" HintPath="$(GamePath)/BepInEx/core/0Harmony.dll" />
+  </ItemGroup>
+</Project>

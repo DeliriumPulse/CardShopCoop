@@ -33,6 +33,10 @@ namespace CardShopCoop.Sync
         {
             public GameObject Go;
             public Animator Anim;
+            public RemoteCrouchPose CrouchPose;
+            public bool Crouching;
+            public bool Spraying;
+            public RemoteSprayVisual SprayVisual;
             public bool HasMoveSpeed;
             public bool HasHoldingBox;
             public TMPro.TMP_Text NameTag;
@@ -43,6 +47,7 @@ namespace CardShopCoop.Sync
             public Vector3 TargetPos;
             public Vector3 Velocity;      // measured between packets, only used when the buffer runs dry
             public float LastStateTime;   // Time.time when TargetPos arrived
+            public float LastStateRealtime; // Effect expiry must also run when game time stops.
             public float TargetYaw;
             public Vector3 CameraPosition;
             public Quaternion CameraRotation = Quaternion.identity;
@@ -290,6 +295,7 @@ namespace CardShopCoop.Sync
                 if (data.ColorProperties != null)
                     data.ColorProperties.RemoveAll(p => p != null && p.propertyName != null && p.propertyName.StartsWith(ApparelTintPrefix, System.StringComparison.Ordinal));
                 custom.ApplyCharacterVars(data);
+                ApplyStoredHairColors(custom);
                 if (data.ColorProperties != null)
                     data.ColorProperties.AddRange(savedApparelTints);
                 ApplyStoredApparelTints(custom, savedApparelTints);
@@ -627,7 +633,53 @@ namespace CardShopCoop.Sync
                 || custom.StoredCharacterData == null)
                 return false;
             custom.setHairColor(new CC.CC_Property { propertyName = "_Hair_Color" }, color, slot, save: true);
+            ApplyStoredHairColors(custom);
             return true;
+        }
+
+        private static readonly FieldInfo HairObjectsField = typeof(CC.CharacterCustomization)
+            .GetField("HairObjects", BindingFlags.Instance | BindingFlags.NonPublic);
+
+        // The game's setter broadcasts material properties over the whole character.
+        // Later hair slots can overwrite an earlier slot's mesh color. Apply the final
+        // stored colors to each slot's actual renderers, including the inactive editor.
+        internal static void ApplyStoredHairColors(CC.CharacterCustomization custom)
+        {
+            var colors = custom?.StoredCharacterData?.HairColor;
+            var hairObjects = custom != null ? HairObjectsField?.GetValue(custom) as List<GameObject> : null;
+            if (colors == null || hairObjects == null || custom.HairTables == null)
+                return;
+            for (int slot = 0; slot < colors.Count && slot < hairObjects.Count && slot < custom.HairTables.Count; slot++)
+            {
+                if (colors[slot] == null || !ColorUtility.TryParseHtmlString("#" + colors[slot].stringValue, out var color))
+                    continue;
+                var hair = hairObjects[slot];
+                if (hair == null)
+                    continue; // a scalp-only or empty slot has no separate hair mesh
+                string tint = custom.HairTables[slot] != null ? custom.HairTables[slot].TintProperty : null;
+                foreach (var renderer in hair.GetComponentsInChildren<Renderer>(true))
+                {
+                    var materials = renderer.sharedMaterials;
+                    for (int index = 0; index < materials.Length; index++)
+                    {
+                        var material = materials[index];
+                        if (material == null)
+                            continue;
+                        var block = new MaterialPropertyBlock();
+                        renderer.GetPropertyBlock(block, index);
+                        bool assigned = false;
+                        foreach (string property in new[] { tint, "_Hair_Color", "_BaseColor", "_Color", "_Tint" })
+                        {
+                            if (string.IsNullOrEmpty(property) || !material.HasProperty(property))
+                                continue;
+                            block.SetColor(property, color);
+                            assigned = true;
+                        }
+                        if (assigned)
+                            renderer.SetPropertyBlock(block, index);
+                    }
+                }
+            }
         }
 
         public Color GetHairColor(CC.CharacterCustomization custom, int slot)
@@ -773,7 +825,7 @@ namespace CardShopCoop.Sync
 
         public void UpdateState(int connId, Vector3 pos, float yaw, byte holdState,
             Vector3 cameraPosition = default(Vector3), Quaternion cameraRotation = default(Quaternion),
-            List<int> holdTypes = null, List<CardData> holdCards = null)
+            List<int> holdTypes = null, List<CardData> holdCards = null, bool crouching = false, bool spraying = false)
         {
             if (!_avatars.TryGetValue(connId, out var av))
             {
@@ -801,12 +853,17 @@ namespace CardShopCoop.Sync
                 av.PreviousCameraRotation = cameraRotation;
             }
             av.LastStateTime = now;
+            av.LastStateRealtime = Time.unscaledTime;
             av.TargetPos = pos;
             av.TargetYaw = yaw;
             av.CameraPosition = cameraPosition;
             av.CameraRotation = cameraRotation == default(Quaternion) ? Quaternion.identity : cameraRotation;
             av.HasCamera = cameraRotation != default(Quaternion);
             av.HoldState = holdState;
+            av.Crouching = crouching;
+            av.Spraying = spraying;
+            if (av.CrouchPose != null)
+                av.CrouchPose.Crouching = crouching;
             // THE HOLD PAYLOAD IS ALREADY IN LOCAL IDS: CoopCore.ReadHoldPayload built it
             // with Msg.ReadItemType, which is the one and only translation boundary for
             // these values. Do NOT translate again here - a second FromWire on an
@@ -857,8 +914,8 @@ namespace CardShopCoop.Sync
             }
             else
                 av.PendingCardSig = "";
-            av.PendingItemSig = holdState == 2 && av.HoldTypes.Count > 0
-                ? string.Join(",", av.HoldTypes) : "";
+            av.PendingItemSig = (holdState == 2 || holdState == 5) && av.HoldTypes.Count > 0
+                ? holdState + ":" + string.Join(",", av.HoldTypes) : "";
 
             if (!av.EverPositioned && av.Go != null)
             {
@@ -1510,6 +1567,15 @@ namespace CardShopCoop.Sync
                     }
                 }
 
+                if (av.HoldState == 5 && av.SprayVisual == null)
+                {
+                    av.SprayVisual = av.Go.AddComponent<RemoteSprayVisual>();
+                    av.SprayVisual.Initialize(av.Anim);
+                }
+                if (av.SprayVisual != null)
+                    av.SprayVisual.SetState(av.HoldState == 5 && av.HeldItems.Count > 0 ? av.HeldItems[0] : null,
+                        av.Spraying && RemoteAudioRules.IsFresh(av.LastStateRealtime, Time.unscaledTime), av.CameraRotation);
+
                 if (cam != null)
                 {
                     if (av.NameTag != null)
@@ -1700,6 +1766,9 @@ namespace CardShopCoop.Sync
 
             av.Go = clone;
             av.Anim = clone.GetComponentInChildren<Animator>(true);
+            av.CrouchPose = clone.AddComponent<RemoteCrouchPose>();
+            av.CrouchPose.Initialize(av.Anim);
+            av.CrouchPose.Crouching = av.Crouching;
             av.EverPositioned = true;
             av.HasMoveSpeed = false;
             av.HasHoldingBox = false;

@@ -29,11 +29,17 @@ namespace CardShopCoop.Sync
         private const byte OpEquipDeco = 2;    // client->host: six ints (wall, wallB, floor, floorB, ceiling, ceilingB)
         private const byte OpGameEvent = 3;    // client->host: int pendingFormat, int pendingExpansion
         private const byte OpGameEventFee = 4; // client->host: int format, float fee
-        private const byte OpCashier = 5;      // client->host: byte counterIndex, byte flags (1 checkout, 2 trade)
+        private const byte OpCashier = 5;      // client->host: stable counter ObjectKey, flags (1 checkout, 2 trade)
         private const byte OpTableNumber = 6;  // client->host: byte tableIndex, int number
         private const byte OpBuyItemDeco = 7;
         private const byte OpPlaceItemDeco = 8;
         private const byte OpRemoveItemDeco = 9;
+        private const byte OpAutoTableNumber = 10;
+        private const byte OpClearTableNumber = 11;
+        private static readonly System.Reflection.FieldInfo CurrentNumberTable =
+            AccessTools.Field(typeof(SetPlayerTableNumberScreen), "m_CurrentPlayTable");
+        private static readonly System.Reflection.FieldInfo RequestedTableNumber =
+            AccessTools.Field(typeof(SetPlayerTableNumberScreen), "m_PlayTableNumber");
 
         /// <summary>Patches are static; they reach the live engine through here.</summary>
         public static SettingsSync Instance;
@@ -126,8 +132,9 @@ namespace CardShopCoop.Sync
             });
         }
 
-        public void HostApplyOp(SettingsOpMessage message)
+        public bool HostApplyOp(SettingsOpMessage message)
         {
+            bool purchased = false;
             byte op = message.Op;
             Guarded("apply", () =>
             {
@@ -137,7 +144,7 @@ namespace CardShopCoop.Sync
                         {
                             int cat = message.Category;
                             int idx = message.Index;
-                            HostBuyDeco(cat, idx);
+                            purchased = HostBuyDeco(cat, idx);
                             break;
                         }
                     case OpEquipDeco:
@@ -185,44 +192,62 @@ namespace CardShopCoop.Sync
                         }
                     case OpCashier:
                         {
-                            int idx = message.CashierIndex;
                             byte flags = message.CashierFlags;
-                            var counters = Sm()?.m_CashierCounterList;
-                            if (counters != null && idx < counters.Count && counters[idx] != null)
+                            if (message.ObjectKey >> 24 == 4 && PlacedObjectIdentity.TryResolve(Sm(), 4,
+                                PlacedObjectIdentity.ObjectIdFromObjectKey(message.ObjectKey), out var rawCounter)
+                                && rawCounter is InteractableCashierCounter counter)
                             {
                                 ApplyingRemote = true;
                                 try
                                 {
                                     bool checkout = (flags & 1) != 0;
                                     bool trade = (flags & 2) != 0;
-                                    if (counters[idx].CanCheckout() != checkout)
-                                        counters[idx].SetCanCheckout(checkout);
-                                    if (counters[idx].CanTradeCard() != trade)
-                                        counters[idx].SetCanTradeCard(trade);
+                                    if (counter.CanCheckout() != checkout)
+                                        counter.SetCanCheckout(checkout);
+                                    if (counter.CanTradeCard() != trade)
+                                        counter.SetCanTradeCard(trade);
                                 }
                                 finally { ApplyingRemote = false; }
                             }
                             break;
                         }
+                    case OpAutoTableNumber:
+                    case OpClearTableNumber:
                     case OpTableNumber:
                         {
-                            int idx = message.TableIndex;
-                            int number = message.TableNumber;
-                            var tables = Sm()?.m_PlayTableList;
-                            if (tables != null && idx < tables.Count && tables[idx] != null)
+                            var manager = Sm();
+                            if (message.ObjectKey >> 24 != 6 || !PlacedObjectIdentity.TryResolve(manager, 6,
+                                PlacedObjectIdentity.ObjectIdFromObjectKey(message.ObjectKey), out var raw)
+                                || !(raw is InteractablePlayTable table))
+                                break;
+                            var tables = manager.m_PlayTableList;
+                            var numbers = new int[tables.Count];
+                            for (int i = 0; i < numbers.Length; i++)
+                                numbers[i] = tables[i] != null ? tables[i].GetTournamentPlayTableNumber() : 0;
+                            var action = op == OpAutoTableNumber ? TableNumberAction.Auto
+                                : op == OpClearTableNumber ? TableNumberAction.Clear : TableNumberAction.Set;
+                            var plan = TableNumberRules.Plan(numbers, tables.IndexOf(table), action,
+                                message.TableNumber, CPlayerData.m_TournamentData.m_IsTournamentDay);
+                            if (plan == null)
+                                break;
+                            ApplyingRemote = true;
+                            try
                             {
-                                ApplyingRemote = true;
-                                try
+                                for (int i = 0; i < plan.Length; i++)
                                 {
-                                    if (tables[idx].GetTournamentPlayTableNumber() != number)
-                                        tables[idx].SetTournamentPlayTableNumber(Mathf.Max(0, number));
+                                    if (tables[i] == null || numbers[i] == plan[i])
+                                        continue;
+                                    tables[i].SetTournamentPlayTableNumber(plan[i]);
+                                    if (plan[i] > 0 && tables[i].GetHasStartPlayerPlayCard())
+                                        tables[i].ExitPlayerCardGame(false, false);
+                                    manager.UpdatePlayTableSaveData(tables[i]);
                                 }
-                                finally { ApplyingRemote = false; }
                             }
+                            finally { ApplyingRemote = false; }
                             break;
                         }
                     case OpBuyItemDeco:
-                        HostBuyItemDeco(message.DecoType);
+                        purchased = HostBuyItemDeco(message.DecoType);
                         break;
                     case OpPlaceItemDeco:
                         HostPlaceItemDeco(message.DecoType, message.Position, message.Rotation);
@@ -236,32 +261,33 @@ namespace CardShopCoop.Sync
                 }
             });
             // no explicit echo: the change lands in the very next hash-gated broadcast
+            return purchased;
         }
 
         /// <summary>Host: run the vanilla deco purchase for a joiner. The joiner was
         /// blocked BEFORE charging, so the ReduceCoin here is the only charge. Price
         /// comes from OUR data lists - never from the wire.</summary>
-        private void HostBuyDeco(int category, int index)
+        private bool HostBuyDeco(int category, int index)
         {
             var so = Inv()?.m_ObjectData_SO;
             if (so == null || category < 0 || category > 2)
-                return;
+                return false;
             List<ShopDecoData> list =
                 category == 0 ? so.m_WallDecoDataList :
                 category == 1 ? so.m_FloorDecoDataList : so.m_CeilingDecoDataList;
             if (index < 0 || index >= list.Count || list[index] == null)
-                return;
+                return false;
             // already owned (double-click / duplicate op): never charge twice
             bool owned =
                 category == 0 ? CPlayerData.IsDecoWallUnlocked(index) :
                 category == 1 ? CPlayerData.IsDecoFloorUnlocked(index) : CPlayerData.IsDecoCeilingUnlocked(index);
             if (owned)
-                return;
+                return false;
             float price = list[index].price;
-            if (CPlayerData.m_CoinAmountDouble < (double)price)
+            if (!(CoopCore.Instance?.TryReserveGuestSpend(price) ?? false))
             {
                 CoopPlugin.Log.LogInfo($"deco buy refused (funds): cat {category} idx {index}");
-                return;
+                return false;
             }
             // vanilla ShopBuyDecoUIScreen.OnPressBuyShopDeco body, minus the UI refresh
             CPlayerData.m_GameReportDataCollect.upgradeCost -= price;
@@ -275,6 +301,7 @@ namespace CardShopCoop.Sync
             else
                 CPlayerData.SetUnlockDecoCeiling(index, isUnlocked: true);
             CoopPlugin.Log.LogInfo($"partner bought deco: cat {category} idx {index} for {price}");
+            return true;
         }
 
         // ---------------- client ----------------
@@ -315,31 +342,32 @@ namespace CardShopCoop.Sync
                             CPlayerData.m_SetGameEventPriceList[i] = fee;
                     }
 
-                    var counters = Sm()?.m_CashierCounterList;
                     int cn = message.CashierFlags.Count;
                     for (int i = 0; i < cn; i++)
                     {
                         byte flags = message.CashierFlags[i];
-                        if (counters == null || i >= counters.Count || counters[i] == null)
+                        if (message.CashierIds == null || i >= message.CashierIds.Count
+                            || !PlacedObjectIdentity.TryResolve(Sm(), 4, message.CashierIds[i], out var rawCounter)
+                            || !(rawCounter is InteractableCashierCounter counter))
                             continue;
                         bool checkout = (flags & 1) != 0;
                         bool trade = (flags & 2) != 0;
                         // setters refresh the counter's own signage, so only call on change
-                        if (counters[i].CanCheckout() != checkout)
-                            counters[i].SetCanCheckout(checkout);
-                        if (counters[i].CanTradeCard() != trade)
-                            counters[i].SetCanTradeCard(trade);
+                        if (counter.CanCheckout() != checkout)
+                            counter.SetCanCheckout(checkout);
+                        if (counter.CanTradeCard() != trade)
+                            counter.SetCanTradeCard(trade);
                     }
 
-                    var tables = Sm()?.m_PlayTableList;
                     int tn = message.TableNumbers.Count;
                     for (int i = 0; i < tn; i++)
                     {
                         int number = message.TableNumbers[i];
-                        if (tables == null || i >= tables.Count || tables[i] == null)
+                        if (i >= message.TableIds.Count || !PlacedObjectIdentity.TryResolve(Sm(), 6,
+                            message.TableIds[i], out var raw) || !(raw is InteractablePlayTable table))
                             continue;
-                        if (tables[i].GetTournamentPlayTableNumber() != number)
-                            tables[i].SetTournamentPlayTableNumber(number);
+                        if (table.GetTournamentPlayTableNumber() != number)
+                            table.SetTournamentPlayTableNumber(number);
                     }
                     var stock = CPlayerData.m_DecorationInventoryList;
                     if (stock != null)
@@ -515,6 +543,7 @@ namespace CardShopCoop.Sync
                 if (counters[i] != null)
                     flags = (byte)((counters[i].CanCheckout() ? 1 : 0) | (counters[i].CanTradeCard() ? 2 : 0));
                 msg.CashierFlags.Add(flags);
+                msg.CashierIds.Add(PlacedObjectIdentity.AssignHost(counters[i]));
             }
             var tables = Sm()?.m_PlayTableList;
             int tn = tables == null ? 0 : Mathf.Min(tables.Count, 255);
@@ -522,6 +551,7 @@ namespace CardShopCoop.Sync
             {
                 int num = tables[i] != null ? tables[i].GetTournamentPlayTableNumber() : 0;
                 msg.TableNumbers.Add((byte)Mathf.Clamp(num, 0, 255)); // numbers never exceed the table count
+                msg.TableIds.Add(PlacedObjectIdentity.AssignHost(tables[i]));
             }
             var stock = CPlayerData.m_DecorationInventoryList;
             if (stock != null)
@@ -531,19 +561,21 @@ namespace CardShopCoop.Sync
             return msg;
         }
 
-        private static void HostBuyItemDeco(EDecoObject type)
+        private static bool HostBuyItemDeco(EDecoObject type)
         {
             var data = InventoryBase.GetItemDecoPurchaseData(type);
             var stock = CPlayerData.m_DecorationInventoryList;
             int id = (int)type;
-            if (data == null || stock == null || id < 0 || id >= stock.Count || CPlayerData.m_CoinAmountDouble < data.price)
-                return;
+            if (data == null || stock == null || id < 0 || id >= stock.Count
+                || !(CoopCore.Instance?.TryReserveGuestSpend(data.price) ?? false))
+                return false;
             CPlayerData.m_GameReportDataCollect.supplyCost -= data.price;
             CPlayerData.m_GameReportDataCollectPermanent.supplyCost -= data.price;
             PriceChangeManager.AddTransaction(-data.price, ETransactionType.BuyDecoration, 3, id);
             CEventManager.QueueEvent(new CEventPlayer_ReduceCoin(data.price));
             CPlayerData.AddDecoItemToInventory(type, 1);
             Instance?.BroadcastState?.Invoke(BuildStateMessage());
+            return true;
         }
 
         private static void HostPlaceItemDeco(EDecoObject type, Vector3 pos, Quaternion rot)
@@ -613,12 +645,16 @@ namespace CardShopCoop.Sync
                 if (counters[i] != null)
                     flags = (byte)((counters[i].CanCheckout() ? 1 : 0) | (counters[i].CanTradeCard() ? 2 : 0));
                 h = h * 31 + flags;
+                h = h * 31 + PlacedObjectIdentity.AssignHost(counters[i]);
             }
             var tables = Sm()?.m_PlayTableList;
             int tn = tables == null ? 0 : Mathf.Min(tables.Count, 255);
             h = h * 31 + tn;
             for (int i = 0; i < tn; i++)
+            {
+                h = h * 31 + PlacedObjectIdentity.AssignHost(tables[i]);
                 h = h * 31 + (tables[i] == null ? 0 : Mathf.Clamp(tables[i].GetTournamentPlayTableNumber(), 0, 255));
+            }
             var stock = CPlayerData.m_DecorationInventoryList;
             h = h * 31 + (stock == null ? 0 : stock.Count);
             if (stock != null)
@@ -681,6 +717,12 @@ namespace CardShopCoop.Sync
                 postfix: new HarmonyMethod(typeof(SettingsSync), nameof(CashierPostfix)));
             Try(h, typeof(InteractablePlayTable), "SetTournamentPlayTableNumber",
                 postfix: new HarmonyMethod(typeof(SettingsSync), nameof(TableNumberPostfix)));
+            Try(h, typeof(SetPlayerTableNumberScreen), "OnPressSetNextNumber",
+                prefix: new HarmonyMethod(typeof(SettingsSync), nameof(AutoTableNumberPrefix)));
+            Try(h, typeof(SetPlayerTableNumberScreen), "OnPressConfirm",
+                prefix: new HarmonyMethod(typeof(SettingsSync), nameof(ConfirmTableNumberPrefix)));
+            Try(h, typeof(SetPlayerTableNumberScreen), "OnPressClear",
+                prefix: new HarmonyMethod(typeof(SettingsSync), nameof(ClearTableNumberPrefix)));
         }
 
         public static bool BuyDecoPrefix(ShopBuyDecoUIScreen __instance, int shopDecoIndex, float price)
@@ -787,14 +829,10 @@ namespace CardShopCoop.Sync
             var inst = Instance;
             if (inst?.SendOp == null)
                 return;
-            var counters = Sm()?.m_CashierCounterList;
-            if (counters == null)
-                return;
-            int idx = counters.IndexOf(__instance);
-            if (idx < 0 || idx > 254)
+            if (!PlacedObjectIdentity.TryMakeObjectKey(4, __instance, out int key))
                 return;
             byte flags = (byte)((__instance.CanCheckout() ? 1 : 0) | (__instance.CanTradeCard() ? 2 : 0));
-            inst.SendOp(new SettingsOpMessage { Op = OpCashier, CashierIndex = (byte)idx, CashierFlags = flags });
+            inst.SendOp(new SettingsOpMessage { Op = OpCashier, ObjectKey = key, CashierFlags = flags });
         }
 
         public static void TableNumberPostfix(InteractablePlayTable __instance, int tableNumber)
@@ -810,7 +848,37 @@ namespace CardShopCoop.Sync
             int idx = tables.IndexOf(__instance);
             if (idx < 0 || idx > 254)
                 return;
-            inst.SendOp(new SettingsOpMessage { Op = OpTableNumber, TableIndex = (byte)idx, TableNumber = tableNumber });
+            if (PlacedObjectIdentity.TryMakeObjectKey(6, __instance, out int key))
+                inst.SendOp(new SettingsOpMessage { Op = OpTableNumber, ObjectKey = key, TableNumber = tableNumber });
+        }
+
+        public static bool AutoTableNumberPrefix(SetPlayerTableNumberScreen __instance)
+            => SendTableNumberAction(__instance, OpAutoTableNumber);
+
+        public static bool ConfirmTableNumberPrefix(SetPlayerTableNumberScreen __instance)
+            => SendTableNumberAction(__instance, OpTableNumber);
+
+        public static bool ClearTableNumberPrefix(SetPlayerTableNumberScreen __instance)
+            => SendTableNumberAction(__instance, OpClearTableNumber);
+
+        private static bool SendTableNumberAction(SetPlayerTableNumberScreen screen, byte op)
+        {
+            if (CoopCore.Role != CoopRole.Client || ApplyingRemote)
+                return true;
+            var table = CurrentNumberTable.GetValue(screen) as InteractablePlayTable;
+            if (table != null && PlacedObjectIdentity.TryMakeObjectKey(6, table, out int key))
+            {
+                Instance?.SendOp?.Invoke(new SettingsOpMessage
+                {
+                    Op = op,
+                    ObjectKey = key,
+                    TableNumber = (int)RequestedTableNumber.GetValue(screen)
+                });
+                screen.CloseScreen();
+            }
+            else
+                CoopCore.Instance?.ReportInteraction("This table is still syncing. Try again after refreshing guest objects.");
+            return false;
         }
 
         private static void Try(Harmony h, Type type, string method,

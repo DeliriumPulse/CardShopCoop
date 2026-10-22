@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/CardShopCoop/Sync/ItemTransferRules.cs" Link="ItemTransferRules.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/HandEscrow.cs" Link="HandEscrow.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/PendingTransferLedger.cs" Link="PendingTransferLedger.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/HostTransferAcks.cs" Link="HostTransferAcks.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/TransferRetryQueue.cs" Link="TransferRetryQueue.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/PlacedObjectIdentity.cs" Link="PlacedObjectIdentity.cs" />
+  </ItemGroup>
+</Project>

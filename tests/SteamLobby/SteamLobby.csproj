@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/CardShopCoop/Net/SteamLobby.cs" Link="SteamLobby.cs" />
+    <Compile Include="../../src/CardShopCoop/Net/LobbyRequestLifecycle.cs" Link="LobbyRequestLifecycle.cs" />
+    <Compile Include="../../src/CardShopCoop/Net/LobbyJoinAttempt.cs" Link="LobbyJoinAttempt.cs" />
+  </ItemGroup>
+</Project>

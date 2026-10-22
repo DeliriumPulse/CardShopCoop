@@ -16,7 +16,7 @@ namespace CardShopCoop.Net
     /// updates. All Steam calls happen in PumpMainThread; Send()/SendTransient() from
     /// worker threads only enqueue.
     /// </summary>
-    public class SteamTransport : ICoopTransport
+    public class SteamTransport : ICoopTransport, ITransportQueueDiagnostics
     {
         private const int Channel = 71; // stay clear of channel 0 (other mods)
 
@@ -37,10 +37,7 @@ namespace CardShopCoop.Net
         }
 
         private readonly ConcurrentQueue<Outgoing> _transientOutbox = new ConcurrentQueue<Outgoing>();
-        private readonly ConcurrentQueue<Outgoing> _reliableOutbox = new ConcurrentQueue<Outgoing>();
-        private Outgoing? _stalled; // reliable frame Steam refused; retried first
-        private int _stallRetries;  // consecutive refusals of _stalled; drop after N so one
-                                    // doomed (e.g. >1MB) frame can't wedge the whole lane
+        private readonly ReliableSendQueue _reliable = new ReliableSendQueue();
 
         // transient coalescing scratch, reused every pump (main thread only)
         private readonly List<Outgoing> _transientScratch = new List<Outgoing>(32);
@@ -103,7 +100,26 @@ namespace CardShopCoop.Net
         {
             if (_ids.TryGetValue(fail.m_steamIDRemote, out int cid))
             {
-                CoopPlugin.Log.LogWarning($"steam: session failed with {fail.m_steamIDRemote} (err {fail.m_eP2PSessionError})");
+                double silence = SecondsSinceLastRecv(cid);
+                bool stateAvailable = false;
+                P2PSessionState_t state = default(P2PSessionState_t);
+                try
+                {
+                    stateAvailable = SteamNetworking.GetP2PSessionState(fail.m_steamIDRemote, out state);
+                }
+                catch (Exception e)
+                {
+                    CoopPlugin.Log.LogWarning("steam: could not inspect failed session state: " + e.GetType().Name);
+                }
+                bool keep = SteamTimeoutDecision.KeepCurrentPeer(
+                    fail.m_eP2PSessionError == (byte)EP2PSessionError.k_EP2PSessionErrorTimeout,
+                    stateAvailable, state.m_bConnectionActive != 0, state.m_eP2PSessionError, silence);
+                if (keep)
+                {
+                    CoopPlugin.Log.LogWarning($"steam: ignored timeout callback for a still-active session (last received {silence:F1}s ago)");
+                    return;
+                }
+                CoopPlugin.Log.LogWarning($"steam: session failed with {fail.m_steamIDRemote} (err {fail.m_eP2PSessionError}, state available={stateAvailable}, active={state.m_bConnectionActive != 0}, state error={state.m_eP2PSessionError}, last received {silence:F1}s ago)");
                 Kick(cid);
             }
         }
@@ -123,12 +139,17 @@ namespace CardShopCoop.Net
         /// <summary>Client: bind connId 1 to the lobby owner. The first Send opens the session.</summary>
         public void ConnectToHost(CSteamID host)
         {
+            // A previous failed attempt may have left Steam's channel/session alive.
+            // Bind a fresh session to the selected lobby owner before the first Hello.
+            SteamNetworking.CloseP2PSessionWithUser(host);
+            SteamNetworking.AcceptP2PSessionWithUser(host);
             AddPeer(host);
         }
 
         private void SendFrame(int connId, byte[] frame)
         {
-            _reliableOutbox.Enqueue(new Outgoing { ConnId = connId, Frame = frame });
+            if (!_stopped)
+                _reliable.Enqueue(connId, frame);
         }
 
         public void Send(int connId, INetMessage message)
@@ -140,7 +161,7 @@ namespace CardShopCoop.Net
         private void BroadcastFrame(byte[] frame)
         {
             foreach (var kv in _peers)
-                _reliableOutbox.Enqueue(new Outgoing { ConnId = kv.Key, Frame = frame });
+                SendFrame(kv.Key, frame);
         }
 
         public void Broadcast(INetMessage message)
@@ -225,45 +246,17 @@ namespace CardShopCoop.Net
             }
             _transientScratch.Clear();
 
-            // ---- reliable lane (byte-budgeted per frame; a refused frame stalls until
-            // Steam accepts it). Plain Reliable (NOT WithBuffering, which adds ~200ms).
-            int budget = 1024 * 1024;
-            while (budget > 0)
-            {
-                Outgoing entry;
-                if (_stalled.HasValue)
+            // Each peer keeps its reliable FIFO and its own backpressure deadline.
+            // One slow player cannot stall replies and world updates for everyone else.
+            _reliable.Pump(1024 * 1024, 256 * 1024,
+                (connection, frame) => !_peers.TryGetValue(connection, out var remote)
+                    || SteamNetworking.SendP2PPacket(remote, frame, (uint)frame.Length,
+                        EP2PSend.k_EP2PSendReliable, Channel),
+                (connection, reason) =>
                 {
-                    entry = _stalled.Value;
-                    _stalled = null;
-                }
-                else if (!_reliableOutbox.TryDequeue(out entry))
-                    break;
-
-                if (!_peers.TryGetValue(entry.ConnId, out var sid))
-                {
-                    _stallRetries = 0;
-                    continue;
-                } // peer gone
-                if (!SteamNetworking.SendP2PPacket(sid, entry.Frame, (uint)entry.Frame.Length,
-                        EP2PSend.k_EP2PSendReliable, Channel))
-                {
-                    // Steam refused it. Transient backpressure clears in a frame or two, but a
-                    // frame Steam will NEVER accept (e.g. one that exceeds its ~1MB reliable
-                    // ceiling) would retry forever and strand every prices/licenses/shelf/state
-                    // packet behind it. Drop it after ~30 frames; change-gated state reheals.
-                    if (++_stallRetries > 30)
-                    {
-                        CoopPlugin.Log.LogWarning($"steam: dropping stuck reliable frame (size {entry.Frame.Length}); lane reconverges on next heal");
-                        _stalled = null;
-                        _stallRetries = 0;
-                        continue;
-                    }
-                    _stalled = entry; // retry next frame
-                    break;
-                }
-                _stallRetries = 0; // success: clear the refusal streak
-                budget -= entry.Frame.Length;
-            }
+                    CoopPlugin.Log.LogWarning($"steam: {reason}; disconnecting peer {connection}");
+                    Kick(connection);
+                });
 
             // ---- keepalive ----
             _keepaliveTimer += Time.unscaledDeltaTime;
@@ -304,6 +297,8 @@ namespace CardShopCoop.Net
 
         public int ConnectionCount => _peers.Count;
 
+        public List<PeerQueueStatus> GetSendQueueStatus() => _reliable.Snapshot();
+
         public double SecondsSinceLastRecv(int connId)
         {
             return _lastRecv.TryGetValue(connId, out double t)
@@ -327,6 +322,7 @@ namespace CardShopCoop.Net
             _ids.Remove(sid);
             _connIdsCache = null;
             _lastRecv.Remove(connId);
+            _reliable.RemovePeer(connId);
             Disconnects.Enqueue(connId);
         }
 
@@ -335,6 +331,7 @@ namespace CardShopCoop.Net
             if (_stopped)
                 return;
             _stopped = true;
+            _reliable.Clear();
             foreach (var kv in _peers)
                 SteamNetworking.CloseP2PSessionWithUser(kv.Value);
             _peers.Clear();
@@ -358,165 +355,6 @@ namespace CardShopCoop.Net
         public void Dispose()
         {
             Stop();
-        }
-    }
-
-    /// <summary>
-    /// Lobby lifecycle + invites. One long-lived instance: the GameLobbyJoinRequested
-    /// callback must be listening from startup so accepting a Steam invite at any moment
-    /// (or launching the game via an invite: +connect_lobby) starts the join flow.
-    /// </summary>
-    public class SteamLobby
-    {
-        private Callback<LobbyCreated_t> _cbCreated;
-        private Callback<LobbyEnter_t> _cbEnter;
-        private Callback<GameLobbyJoinRequested_t> _cbJoinRequested;
-        private CallResult<LobbyMatchList_t> _lobbyList;
-
-        public CSteamID LobbyId = CSteamID.Nil;
-        private bool _joining;
-        private bool _pendingPublic;
-        private string _pendingName = "";
-        private bool _pendingHasPw;
-
-        public Action<CSteamID> OnLobbyCreated;   // host: lobby is live
-        public Action<CSteamID> OnEnteredLobby;   // client: joined; arg = lobby owner
-        public Action<CSteamID> OnInviteAccepted; // local player accepted someone's invite
-        public Action<string> OnError;
-        public Action OnListUpdated;
-
-        public struct LobbyRow
-        {
-            public CSteamID Id;
-            public string Name;
-            public int Players;
-            public int Max;
-            public bool HasPw;
-            public string Ver;
-        }
-
-        public readonly List<LobbyRow> Lobbies = new List<LobbyRow>();
-        public bool ListRefreshing
-        {
-            get; private set;
-        }
-
-        public void Init()
-        {
-            _cbCreated = Callback<LobbyCreated_t>.Create(e =>
-            {
-                if (e.m_eResult != EResult.k_EResultOK)
-                {
-                    OnError?.Invoke("Steam lobby creation failed: " + e.m_eResult);
-                    return;
-                }
-                LobbyId = new CSteamID(e.m_ulSteamIDLobby);
-                SteamMatchmaking.SetLobbyData(LobbyId, "coopmod", "communitymultiplayer");
-                SteamMatchmaking.SetLobbyData(LobbyId, "coopver", CoopPlugin.Version);
-                string ownerName = CoopCore.Instance == null
-                    ? CoopPlugin.PlayerName.Value
-                    : CoopCore.Instance.EffectivePlayerName;
-                SteamMatchmaking.SetLobbyData(LobbyId, "name",
-                    string.IsNullOrEmpty(_pendingName) ? (ownerName + "'s shop") : _pendingName);
-                SteamMatchmaking.SetLobbyData(LobbyId, "pw", _pendingHasPw ? "1" : "0");
-                OnLobbyCreated?.Invoke(LobbyId);
-            });
-            _lobbyList = CallResult<LobbyMatchList_t>.Create((e, ioFail) =>
-            {
-                ListRefreshing = false;
-                Lobbies.Clear();
-                if (ioFail)
-                {
-                    OnError?.Invoke("Steam lobby list failed");
-                    return;
-                }
-                for (int i = 0; i < e.m_nLobbiesMatching; i++)
-                {
-                    var id = SteamMatchmaking.GetLobbyByIndex(i);
-                    if (id == CSteamID.Nil)
-                        continue;
-                    Lobbies.Add(new LobbyRow
-                    {
-                        Id = id,
-                        Name = SteamMatchmaking.GetLobbyData(id, "name"),
-                        Players = SteamMatchmaking.GetNumLobbyMembers(id),
-                        Max = SteamMatchmaking.GetLobbyMemberLimit(id),
-                        HasPw = SteamMatchmaking.GetLobbyData(id, "pw") == "1",
-                        Ver = SteamMatchmaking.GetLobbyData(id, "coopver"),
-                    });
-                }
-                OnListUpdated?.Invoke();
-            });
-            _cbEnter = Callback<LobbyEnter_t>.Create(e =>
-            {
-                if (!_joining)
-                    return; // our own host-side enter
-                _joining = false;
-                LobbyId = new CSteamID(e.m_ulSteamIDLobby);
-                var owner = SteamMatchmaking.GetLobbyOwner(LobbyId);
-                OnEnteredLobby?.Invoke(owner);
-            });
-            _cbJoinRequested = Callback<GameLobbyJoinRequested_t>.Create(e =>
-            {
-                OnInviteAccepted?.Invoke(e.m_steamIDLobby);
-            });
-        }
-
-        public bool SteamAvailable()
-        {
-            try
-            {
-                return SteamAPI.IsSteamRunning();
-            }
-            catch (System.Exception e) { Swallow.Log(e); return false; }
-        }
-
-        public void Host(bool isPublic, string lobbyName, bool hasPassword)
-        {
-            _pendingPublic = isPublic;
-            _pendingName = lobbyName ?? "";
-            _pendingHasPw = hasPassword;
-            SteamMatchmaking.CreateLobby(
-                isPublic ? ELobbyType.k_ELobbyTypePublic : ELobbyType.k_ELobbyTypeFriendsOnly, 4);
-        }
-
-        /// <summary>Fetch public lobbies of THIS mod (server-side filtered by our key).</summary>
-        public void RefreshList()
-        {
-            if (ListRefreshing)
-                return;
-            ListRefreshing = true;
-            SteamMatchmaking.AddRequestLobbyListStringFilter("coopmod", "communitymultiplayer", ELobbyComparison.k_ELobbyComparisonEqual);
-            SteamMatchmaking.AddRequestLobbyListResultCountFilter(100);
-            SteamMatchmaking.AddRequestLobbyListDistanceFilter(ELobbyDistanceFilter.k_ELobbyDistanceFilterWorldwide);
-            var call = SteamMatchmaking.RequestLobbyList();
-            _lobbyList.Set(call);
-        }
-
-        public void Join(CSteamID lobby)
-        {
-            _joining = true;
-            SteamMatchmaking.JoinLobby(lobby);
-        }
-
-        public void OpenInviteDialog()
-        {
-            if (LobbyId != CSteamID.Nil)
-                SteamFriends.ActivateGameOverlayInviteDialog(LobbyId);
-        }
-
-        public void Leave()
-        {
-            if (LobbyId != CSteamID.Nil)
-            {
-                try
-                {
-                    SteamMatchmaking.LeaveLobby(LobbyId);
-                }
-                catch (System.Exception e) { Swallow.Log(e); }
-                LobbyId = CSteamID.Nil;
-            }
-            _joining = false;
         }
     }
 
@@ -629,6 +467,10 @@ namespace CardShopCoop.Net
         {
             get; set;
         }
+        public Action<string> OnSessionStartFailed
+        {
+            get; set;
+        }
         public Action OnConnectedToHost
         {
             get; set;
@@ -642,13 +484,15 @@ namespace CardShopCoop.Net
         {
             _lobby.Init();
             _lobby.OnError = e => OnError?.Invoke(e);
+            _lobby.OnSessionStartFailed = e => OnSessionStartFailed?.Invoke(e);
             _lobby.OnLobbyCreated = id =>
             {
                 // Host side. The transport is always created BEFORE Host() is called
                 // (see CreateTransport's contract), so _tx is non-null here in every
                 // real flow; the guard is only for a Leave() racing the callback.
-                if (_tx != null)
-                    _tx.LobbyId = id;
+                if (_tx == null)
+                    return;
+                _tx.LobbyId = id;
                 // .m_SteamID, not the struct: the boundary is what keeps CoopCore's handler
                 // free of Steamworks metadata (see ISteamBridge).
                 OnLobbyLive?.Invoke(id.m_SteamID);
@@ -657,8 +501,8 @@ namespace CardShopCoop.Net
             {
                 // Client side. NOTE: the Role != Client guard that used to sit here now
                 // lives on CoopCore's OnConnectedToHost handler - the bridge has no idea
-                // what a CoopRole is. SteamLobby._joining already filters the host's own
-                // lobby-enter, so this only fires on a real join.
+                // what a CoopRole is. The call-specific result only fires on a real join,
+                // after validating Steam's response and the remote lobby owner.
                 if (_tx == null)
                     return;
                 _tx.LobbyId = _lobby.LobbyId;

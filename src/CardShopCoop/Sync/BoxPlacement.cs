@@ -375,9 +375,11 @@ namespace CardShopCoop.Sync
                     // extrapolate the pushed box's target along its streamed velocity, then
                     // glide toward it with a clamped correction (a generous max keeps lag to
                     // about a frame while smoothing the per-frame wire steps)
-                    motion.Target += motion.Velocity * frame;
+                    float prediction = BoxRecoveryRules.PredictionSeconds(Time.time - motion.LastUpdate);
+                    // Vertical prediction with collisions disabled can cross a thin floor.
+                    var predictedTarget = motion.Target + new Vector3(motion.Velocity.x, 0f, motion.Velocity.z) * prediction;
                     var current = PhysicsPosition(box);
-                    var next = Vector3.MoveTowards(current, motion.Target, DeadReckonMaxSpeed * frame);
+                    var next = Vector3.MoveTowards(current, predictedTarget, DeadReckonMaxSpeed * frame);
                     float curYaw = PhysicsRotation(box).eulerAngles.y;
                     ApplyPhysicsPose(box, next,
                         Mathf.LerpAngle(curYaw, motion.TargetYaw, Mathf.Clamp01(frame * 10f)));

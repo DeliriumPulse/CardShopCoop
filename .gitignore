@@ -18,3 +18,4 @@ tools/coop-vanilla-profile.ps1
 decompiled-grading/
 tests/**/bin/
 tests/**/obj/
+install-backups/

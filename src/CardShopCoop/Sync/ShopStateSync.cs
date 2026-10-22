@@ -338,12 +338,15 @@ namespace CardShopCoop.Sync
             return msg;
         }
 
-        public void HostApplyOp(ShopOpMessage message)
+        public bool HostApplyOp(ShopOpMessage message)
         {
             if (CoopCore.Role != CoopRole.Host)
-                return;
+                return false;
             byte op = message.Op;
             byte arg = message.Arg;
+            float billsBefore = TotalBills();
+            int roomsBefore = CPlayerData.m_UnlockRoomCount + CPlayerData.m_UnlockWarehouseRoomCount;
+            bool lotBefore = CPlayerData.m_IsWarehouseRoomUnlocked;
             try
             {
                 switch (op)
@@ -365,6 +368,18 @@ namespace CardShopCoop.Sync
             }
             catch (Exception e) { CoopPlugin.Log.LogWarning("ShopStateSync op " + op + ": " + e.Message); }
             ForceResend(); // echo promptly even if the op was refused (re-aligns the joiner)
+            // Send feedback only to the player who paid, and only when the game
+            // actually changed the bill/unlock. Periodic state refreshes stay silent.
+            return (op == OpPayBill && TotalBills() < billsBefore)
+                || (op == OpUnlock && (roomsBefore < CPlayerData.m_UnlockRoomCount + CPlayerData.m_UnlockWarehouseRoomCount
+                    || (!lotBefore && CPlayerData.m_IsWarehouseRoomUnlocked)));
+        }
+
+        private static float TotalBills()
+        {
+            return (CPlayerData.GetBill(EBillType.Rent)?.amountToPay ?? 0f)
+                + (CPlayerData.GetBill(EBillType.Electric)?.amountToPay ?? 0f)
+                + (CPlayerData.GetBill(EBillType.Employee)?.amountToPay ?? 0f);
         }
 
         /// <summary>Host: run the guest's forwarded shop-light toggle in the real sim. The
@@ -384,8 +399,18 @@ namespace CardShopCoop.Sync
                 CoopPlugin.Log.LogWarning("ShopStateSync: RentBillScreen not found; pay op dropped");
                 return;
             }
-            // the vanilla handlers hold all the rules: amount>0, coin check, transaction
-            // log, report bookkeeping, SetBill. A double-clicked op no-ops on the re-run.
+            // Reserve against other guest spending before vanilla queues its coin event.
+            // Vanilla still owns the transactions, report counters and clearing the bill.
+            BillPayment.TryPay(billType,
+                CPlayerData.GetBill(EBillType.Rent)?.amountToPay ?? 0f,
+                CPlayerData.GetBill(EBillType.Electric)?.amountToPay ?? 0f,
+                CPlayerData.GetBill(EBillType.Employee)?.amountToPay ?? 0f,
+                amount => CoopCore.Instance?.TryReserveGuestSpend(amount) ?? false,
+                kind => PayBillOnScreen(screen, kind));
+        }
+
+        private static void PayBillOnScreen(RentBillScreen screen, byte billType)
+        {
             switch (billType)
             {
                 case 0:
@@ -423,7 +448,7 @@ namespace CardShopCoop.Sync
                 float price = urm.m_ShopB_UnlockPrice;
                 if (CPlayerData.m_ShopLevel + 1 < urm.m_ShopB_UnlockLevelRequired)
                     return;
-                if (CPlayerData.m_CoinAmountDouble < (double)price)
+                if (!(CoopCore.Instance?.TryReserveGuestSpend(price) ?? false))
                     return;
                 PriceChangeManager.AddTransaction(0f - price, ETransactionType.ShopExpansion, 1, -1);
                 CEventManager.QueueEvent(new CEventPlayer_ReduceCoin(price));
@@ -442,7 +467,7 @@ namespace CardShopCoop.Sync
                 if (index >= urm.m_LockedWarehouseRoomBlockerList.Count)
                     return;
                 float cost = CPlayerData.GetUnlockWarehouseRoomCost(index);
-                if (CPlayerData.m_CoinAmountDouble < (double)cost)
+                if (!(CoopCore.Instance?.TryReserveGuestSpend(cost) ?? false))
                     return;
                 PriceChangeManager.AddTransaction(0f - cost, ETransactionType.ShopExpansion, 0, index);
                 CEventManager.QueueEvent(new CEventPlayer_ReduceCoin(cost));
@@ -458,7 +483,7 @@ namespace CardShopCoop.Sync
                 if (index >= urm.m_LockedRoomBlockerList.Count)
                     return;
                 float cost = CPlayerData.GetUnlockShopRoomCost(index);
-                if (CPlayerData.m_CoinAmountDouble < (double)cost)
+                if (!(CoopCore.Instance?.TryReserveGuestSpend(cost) ?? false))
                     return;
                 PriceChangeManager.AddTransaction(0f - cost, ETransactionType.ShopExpansion, 1, index);
                 CEventManager.QueueEvent(new CEventPlayer_ReduceCoin(cost));
@@ -652,6 +677,9 @@ namespace CardShopCoop.Sync
         /// then re-feeds the snapshot value ONCE, which sets rather than accumulates.</summary>
         private void ApplyTutorial(int tutIndex, System.Collections.Generic.List<TutorialData> incoming)
         {
+            var tm = UnityEngine.Object.FindObjectOfType<TutorialManager>();
+            if (tm == null || tm.m_TutorialSubGroupList == null)
+                return; // keep the old data so the next snapshot still rebuilds the UI
             var cur = CPlayerData.m_TutorialDataList;
             // skip if identical to what we already have (avoids UI churn every heal)
             bool same = tutIndex == CPlayerData.m_TutorialIndex && cur != null && cur.Count == incoming.Count;
@@ -672,9 +700,9 @@ namespace CardShopCoop.Sync
             CPlayerData.m_TutorialDataList.AddRange(incoming);
             CPlayerData.m_TutorialIndex = tutIndex;
 
-            var tm = UnityEngine.Object.FindObjectOfType<TutorialManager>(); // NOT CSingleton (fake-manager trap)
-            if (tm == null || tm.m_TutorialSubGroupList == null)
-                return;
+            // A guest can finish a local checklist ahead of the shared snapshot.
+            // Clear the game's sticky completion flag before reevaluating shared data.
+            AccessTools.Field(typeof(TutorialManager), "m_FinishedTutorial")?.SetValue(tm, false);
             foreach (var sg in tm.m_TutorialSubGroupList)
             {
                 if (sg == null)

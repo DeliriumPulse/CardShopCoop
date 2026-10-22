@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/CardShopCoop/Sync/RemoteAudioRules.cs" Link="RemoteAudioRules.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/RegisterVisitIdentity.cs" Link="RegisterVisitIdentity.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/DeferredDayReport.cs" Link="DeferredDayReport.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/TableNumberRules.cs" Link="TableNumberRules.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/RegisterChangeIdentity.cs" Link="RegisterChangeIdentity.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/SharedDayRules.cs" Link="SharedDayRules.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/BoxRecoveryRules.cs" Link="BoxRecoveryRules.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/LiveSaveSnapshot.cs" Link="LiveSaveSnapshot.cs" />
+    <Compile Include="../../src/CardShopCoop/Net/JoinWatchdog.cs" Link="JoinWatchdog.cs" />
+    <Compile Include="../../src/CardShopCoop/Net/SteamTimeoutDecision.cs" Link="SteamTimeoutDecision.cs" />
+    <Compile Include="../../src/CardShopCoop/Net/ReliableSendQueue.cs" Link="ReliableSendQueue.cs" />
+    <Compile Include="../../src/CardShopCoop/Net/SessionHealth.cs" Link="SessionHealth.cs" />
+    <Compile Include="../../src/CardShopCoop/Net/LobbyJoinAttempt.cs" Link="LobbyJoinAttempt.cs" />
+    <Compile Include="../../src/CardShopCoop/Net/LobbyRequestLifecycle.cs" Link="LobbyRequestLifecycle.cs" />
+    <Compile Include="../../src/CardShopCoop/Net/CurrencyProfile.cs" Link="CurrencyProfile.cs" />
+    <Compile Include="../../src/CardShopCoop/Util/SupportDiagnostics.cs" Link="SupportDiagnostics.cs" />
+    <Compile Include="../../src/CardShopCoop/UI/HsvPickerState.cs" Link="HsvPickerState.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/TutorialContributionLedger.cs" Link="TutorialContributionLedger.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/AppearanceDelivery.cs" Link="AppearanceDelivery.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/TransferRetryQueue.cs" Link="TransferRetryQueue.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/BillPayment.cs" Link="BillPayment.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/QueuedSpendLedger.cs" Link="QueuedSpendLedger.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/SidecarBundle.cs" Link="SidecarBundle.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/WorkerInteractionLeases.cs" Link="WorkerInteractionLeases.cs" />
+    <Compile Include="../../src/CardShopCoop/Sync/RegisterOperationLedger.cs" Link="RegisterOperationLedger.cs" />
+  </ItemGroup>
+</Project>

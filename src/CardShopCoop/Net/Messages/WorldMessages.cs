@@ -43,6 +43,7 @@ namespace CardShopCoop.Net.Messages
         public int Key;
         public uint TransferSeq;
         public int AcceptedDelta;
+        public WorldSync.Entry? State;
 
         public MsgType Type
         {
@@ -214,6 +215,7 @@ namespace CardShopCoop.Net.Messages
     public sealed class LightStateMessage : INetMessage
     {
         public string LightJson;
+        public EnvironmentState Environment;
         // LightTimeData has no day number, so carry it beside the payload. This lets the
         // client distinguish a real rollover from a large clock delta at 21:00.
         public int Day;

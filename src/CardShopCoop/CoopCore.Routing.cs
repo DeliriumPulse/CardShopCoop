@@ -173,6 +173,8 @@ namespace CardShopCoop
                     return;
                 {
                     int day = timeMessage.Day;
+                    if (day < CPlayerData.m_CurrentDay)
+                        return;
                     int hour = timeMessage.Hour;
                     int min = timeMessage.Minute;
                     float minFloat = timeMessage.MinuteFloat;
@@ -206,6 +208,10 @@ namespace CardShopCoop
                             MiEvaluateTimeClock?.Invoke(_lightManager, null);
                             if (hour < 21)
                                 FiHasDayEnded?.SetValue(_lightManager, false);
+
+                            if (!_clientDayResetInFlight && !dayChanged)
+                                EnvironmentSync.Apply(_lightManager, timeMessage.Environment);
+                            UpdateGuestDayPrompt(hour >= 21);
 
                             if (dayChanged || _clientDayResetPending)
                                 TryStartClientDayReset();
@@ -402,7 +408,11 @@ namespace CardShopCoop
                 if (Role != CoopRole.Client || !InGameLevel())
                     return;
                 if (message is BoxSnapshotMessage boxSnap)
+                {
                     _boxEngine.ClientApplySnapshot(boxSnap);
+                    if (boxSnap.Full && boxSnap.Boxes != null)
+                        _recovery.ReceivedSnapshot();
+                }
                 return;
             },
                 MessagePolicy.ClientOnlyInGame, false, heal: () => _boxEngine?.RequestResyncCoalesced());
@@ -416,10 +426,14 @@ namespace CardShopCoop
                 // state explicitly as well.
                 ModulesForceResend();
                 ModulesOnFullyJoin(context.ConnectionId);
+                Send(context.ConnectionId, BuildPlayerModelState());
                 _world.RequestResync?.Invoke();
                 return;
             },
                 MessagePolicy.HostOnlyInGame, true, heal: () => { _boxEngine?.RequestFullSnapshot(); _market.ForceResend(); });
+            _messageRouter.Register<TutorialContributionMessage>((context, message) =>
+                ApplyTutorialContribution(context.ConnectionId, message),
+                MessagePolicy.HostOnlyInGame, true, heal: () => _shopState.ForceResend());
             _messageRouter.Register<ShelfBoxPullMessage>((context, message) =>
             {
                 _world.HostApplyBoxPull(message, context.ConnectionId, _boxEngine);
@@ -666,7 +680,8 @@ namespace CardShopCoop
                 if (Role != CoopRole.Host || !InGameLevel())
                     return;
                 if (message is ShopOpMessage shopOp)
-                    _shopState.HostApplyOp(shopOp);
+                    if (_shopState.HostApplyOp(shopOp))
+                        Send(context.ConnectionId, new ShopPurchaseCueMessage());
                 return;
             },
                 MessagePolicy.HostOnlyInGame, true, heal: () => _shopState.ForceResend());
@@ -684,7 +699,8 @@ namespace CardShopCoop
                 if (Role != CoopRole.Host || !InGameLevel())
                     return;
                 if (message is SettingsOpMessage settingsOp)
-                    _settings.HostApplyOp(settingsOp);
+                    if (_settings.HostApplyOp(settingsOp))
+                        Send(context.ConnectionId, new ShopPurchaseCueMessage());
                 return;
             },
                 MessagePolicy.HostOnlyInGame, true, heal: () => _settings.ForceResend());
@@ -919,13 +935,19 @@ namespace CardShopCoop
                         ApplyClientLightSwitchModels(data.m_IsShopLightOn);
                         // re-run the game's own lighting restore only when the sky
                         // phase actually differs (avoids music/blend churn)
-                        if (phaseDiffer || driftMin > 4)
+                        if (lightState.Environment != null)
+                        {
+                            if (!_clientDayResetInFlight && !_clientDayResetPending)
+                                EnvironmentSync.Apply(_lightManager, lightState.Environment);
+                        }
+                        else if (phaseDiffer || driftMin > 4)
                         {
                             FiFinishLoading?.SetValue(_lightManager, false);
                             MiLightInit?.Invoke(_lightManager, null);
                             CoopPlugin.Log.LogInfo($"lighting re-synced (phase {localIdx}->{data.m_TImeOfDayIndex}, drift {driftMin}min)");
                         }
-                        FiHasDayEnded?.SetValue(_lightManager, false);
+                        FiHasDayEnded?.SetValue(_lightManager, data.m_HasDayEnded);
+                        UpdateGuestDayPrompt(data.m_HasDayEnded);
                     }
                     catch (Exception e) { CoopPlugin.Log.LogWarning("light apply: " + e.Message); }
                 }
@@ -1129,6 +1151,14 @@ namespace CardShopCoop
                     return;
                 if (Role == CoopRole.Host)
                 {
+                    if (!ValidateSessionCurrency())
+                        return;
+                    var currency = CaptureCurrency();
+                    if (!CurrencyProfile.Matches(currency, message.Currency))
+                    {
+                        RejectConn(context.ConnectionId, CurrencyMismatch(currency));
+                        return;
+                    }
                     _register.HostApplyOp(message, context.ConnectionId);
                     return;
                 }

@@ -23,7 +23,7 @@ namespace CardShopCoop.Net
     /// artificial lag must not trip the peer-silence timeout, so those timers follow real
     /// wire receipt rather than delayed delivery.
     /// </summary>
-    public sealed class LagTransport : ICoopTransport
+    public sealed class LagTransport : ICoopTransport, ITransportQueueDiagnostics
     {
         private struct Pending
         {
@@ -103,6 +103,9 @@ namespace CardShopCoop.Net
         {
             _inner.Send(connId, message);
         }
+
+        public List<PeerQueueStatus> GetSendQueueStatus()
+            => (_inner as ITransportQueueDiagnostics)?.GetSendQueueStatus();
 
         public void Broadcast(INetMessage message)
         {
