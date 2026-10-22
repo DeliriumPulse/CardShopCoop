@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using CardShopCoop.Util;
 using UnityEngine;
 
 namespace CardShopCoop.Sync
@@ -85,6 +86,7 @@ namespace CardShopCoop.Sync
     {
         private const double CooldownSeconds = 5.0;
         private static readonly Dictionary<string, double> NextAt = new Dictionary<string, double>();
+        internal static readonly DiagnosticHistory RecentFailures = new DiagnosticHistory();
 
         public static void Run(string tag, Action action)
         {
@@ -106,6 +108,8 @@ namespace CardShopCoop.Sync
             if (NextAt.TryGetValue(tag, out double next) && now < next)
                 return;
             NextAt[tag] = now + CooldownSeconds;
+            RecentFailures.Add(DateTime.UtcNow.ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture)
+                + " UTC [" + tag + "] " + e.GetType().Name + ": " + e.Message);
             CoopPlugin.Log.LogError("[" + tag + "] " + e);
         }
     }

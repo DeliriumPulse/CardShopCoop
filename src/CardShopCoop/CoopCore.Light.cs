@@ -33,6 +33,7 @@ namespace CardShopCoop
             else if (_clientClockFrozen)
             {
                 FiTimerLerpSpeed.SetValue(manager, _clientClockOriginalSpeed);
+                manager.m_SkyboxBlender?.Resume();
                 _clientClockFrozen = false;
             }
         }

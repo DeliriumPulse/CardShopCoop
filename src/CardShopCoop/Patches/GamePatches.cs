@@ -71,6 +71,10 @@ namespace CardShopCoop.Patches
         private static readonly MethodInfo MiScannerTotals = AccessTools.Method(typeof(ScannerRestockScreen), "UpdateTotalCostAndBoxCount");
         public static void ApplyAll(Harmony h)
         {
+            Try(h, typeof(InteractablePackagingBox), "SetPhysicsEnabled",
+                postfix: new HarmonyMethod(typeof(BoxPhysicsStability), nameof(BoxPhysicsStability.Configure)));
+            Try(h, typeof(ShelfManager), "UpdatePlayTableSaveData",
+                prefix: new HarmonyMethod(typeof(PlayTableSaveRepair), nameof(PlayTableSaveRepair.UpdatePrefix)));
             // The CMF camera reads Mouse X/Y directly from its own CameraMouseInput
             // component. InteractionPlayerController.EnterUIMode disables the game's
             // secondary camera controller, but cannot stop this independent input path.
@@ -91,6 +95,19 @@ namespace CardShopCoop.Patches
             Try(h, typeof(Customer), "ActivateCustomer",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(CustomerActivatePrefix)));
 
+            // Co-op wardrobes call Initialize with the selected appearance before Unity's
+            // deferred Start runs. CharacterCustomization.Start calls Initialize again and
+            // reloads the preset, erasing the remote player's actual customized appearance.
+            Try(h, typeof(CC.CharacterCustomization), "Start",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(CoOpCharacterCustomizationStartPrefix)));
+
+            // The game's card UI ticks before Init has supplied its PlayCardSet.
+            // These two dereferences flooded the user's log every frame.
+            Try(h, typeof(PlayCardSetUI), "Update",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(PlayCardUiReadyPrefix)));
+            Try(h, typeof(PlayCardSetUI), "LateUpdate",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(PlayCardUiReadyPrefix)));
+
             // Customer.PopupText chooses and localizes the final phrase before calling
             // ShowTextPopup. Relay at that boundary so no extra Random calls are needed.
             Try(h, typeof(PricePopupSpawner), "ShowTextPopup",
@@ -108,6 +125,10 @@ namespace CardShopCoop.Patches
             // advance the local simulation or open a local recap.
             Try(h, typeof(CEventManager), "QueueEvent",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(DayEndBlockPrefix)));
+            Try(h, typeof(CEventManager), "QueueEventPrivate",
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(QueuedSpendPostfix)));
+            Try(h, typeof(CPlayerData), "CPlayer_OnReduceCoin",
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(AppliedSpendPostfix)));
 
             // Relay the exact deltas that the host's GameUIScreen accepted. Clients suppress
             // their local economy events, so they replay these values into the vanilla HUD
@@ -130,6 +151,8 @@ namespace CardShopCoop.Patches
             // that screen is ReportSync's open-screen mirror.
             Try(h, typeof(InteractionPlayerController), "ShowGoNextDayScreen",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(GoNextDayScreenBlockPrefix)));
+            Try(h, typeof(TutorialManager), "AddTaskValue",
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(TutorialTaskPostfix)));
 
             // Keep a taken item from being placed into a shelf, box, or machine before the host
             // confirms the transfer.
@@ -244,6 +267,12 @@ namespace CardShopCoop.Patches
             // cleaned state back automatically.
             Try(h, typeof(Customer), "DeodorantSprayCheck",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(DeodorantSprayPrefix)));
+            // A guest's client-side Customer puppets are intentionally stripped of AI, so
+            // their DeodorantSprayCheck calls cannot clean them. Forward the real handheld
+            // can's content-depletion event once per actual spray pulse instead.
+            Try(h, typeof(Item), "DepleteContent",
+                prefix: new HarmonyMethod(typeof(GamePatches), nameof(SprayDepletePrefix)),
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(SprayDepletePostfix)));
 
             // A joiner's forwarded furniture spawn runs BoxUpObject -> OnPlacedMovedObject,
             // whose interactive-move teardown DisableMoveObjectPreviewMode dereferences
@@ -304,14 +333,20 @@ namespace CardShopCoop.Patches
             Try(h, typeof(InteractablePackagingBox), "DropBox",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(AlignBoxBodyPrefix)));
             Try(h, typeof(InteractablePackagingBox_Item), "FillBoxWithItem",
-                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ItemBoxMutationPostfix)));
             Try(h, typeof(InteractablePackagingBox_Item), "DispenseItem",
-                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ItemBoxMutationPostfix)));
             Try(h, typeof(InteractablePackagingBox_Item), "RemoveItemFromShelf",
                 prefix: new HarmonyMethod(typeof(GamePatches), nameof(ShelfBoxPullPrefix)),
-                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ItemBoxMutationPostfix)));
             Try(h, typeof(InteractablePackagingBox_Item), "SetOpenCloseBox",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(BoxOpenClosePostfix)));
+            Try(h, typeof(InteractablePackagingBox_Item), "SetPriceTagVisibility",
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ItemBoxLabelPostfix)));
+            Try(h, typeof(ShelfCompartment), "SetPriceTagItemAmountText",
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ItemBoxCompartmentLabelPostfix)));
+            Try(h, typeof(ShelfCompartment), "SetPriceTagVisibility",
+                postfix: new HarmonyMethod(typeof(GamePatches), nameof(ItemBoxCompartmentLabelPostfix)));
             Try(h, typeof(ShelfCompartment), "AddBox",
                 postfix: new HarmonyMethod(typeof(GamePatches), nameof(ObjectMutationPostfix)));
             Try(h, typeof(ShelfCompartment), "RemoveBox",
@@ -419,6 +454,11 @@ namespace CardShopCoop.Patches
                     CoopCore.Instance?.ForwardCardDelta(card, reduceAmount, isAdd: false);
             }
             catch (System.Exception e) { Swallow.Log(e); }
+        }
+
+        public static bool PlayCardUiReadyPrefix(PlayCardSet ___m_PlayCardSet)
+        {
+            return ___m_PlayCardSet != null && ___m_PlayCardSet.m_PlayTableGame != null;
         }
 
         public static bool BoxDestroyedPrefix(InteractablePackagingBox_Item __instance)
@@ -554,9 +594,18 @@ namespace CardShopCoop.Patches
             if (CoopCore.Instance?.World?.ApplyingRemote == true || BoxShared.ApplyingRemote
                 || __instance == null || __result == null)
                 return;
+            var world = CoopCore.Instance?.World;
+            if (CoopCore.Role != CoopRole.Client)
+            {
+                world?.QueueTake(__instance, __state, __result);
+                return;
+            }
             HandEscrow.NoteTakenItem(__result);
-            CoopCore.Instance?.World?.QueueTake(__instance, __state, __result);
-            CoopCore.Instance?.Boxes?.MarkClientCompartmentDirty(__instance);
+            if (__instance.GetWarehouseShelf() == null
+                && world?.TryGetShelfKey(__instance, out _) == true)
+                world.QueueTake(__instance, __state, __result);
+            else if (CoopCore.Instance?.Boxes?.MarkClientCompartmentDirty(__instance) != true)
+                world?.QueueUntrackedTake(__result);
         }
 
         public static void RemoveItemPrefix(ShelfCompartment __instance, Item item, out ShelfMutationState __state)
@@ -600,10 +649,34 @@ namespace CardShopCoop.Patches
             catch (Exception e) { CoopPlugin.Log.LogWarning("CardPlacementPostfix: " + e.Message); }
         }
 
+        public static void ItemBoxMutationPostfix(InteractablePackagingBox_Item __instance)
+        {
+            // DispenseItem sets m_IsStored AFTER hiding the label. Refresh after the
+            // entire operation so its intermediate visibility callback cannot show a stored tag.
+            ItemBoxLabelPostfix(__instance);
+            ObjectMutationPostfix();
+        }
+
+        public static void ItemBoxLabelPostfix(InteractablePackagingBox_Item __instance)
+        {
+            if (CoopCore.Role != CoopRole.None)
+                ItemBoxLabel.Refresh(__instance);
+        }
+
+        public static void ItemBoxCompartmentLabelPostfix(ShelfCompartment __instance)
+        {
+            if (CoopCore.Role == CoopRole.None || __instance == null)
+                return;
+            var box = __instance.GetComponentInParent<InteractablePackagingBox_Item>(true);
+            if (box != null && box.m_ItemCompartment == __instance)
+                ItemBoxLabel.Refresh(box);
+        }
+
         public static void BoxOpenClosePostfix(InteractablePackagingBox_Item __instance)
         {
             if (CoopCore.Role == CoopRole.None || __instance == null)
                 return;
+            ItemBoxLabel.Refresh(__instance);
             CoopCore.Instance?.Boxes?.MarkBoxDirty(__instance);
             CoopCore.RequestImmediateObjectSync();
         }
@@ -995,6 +1068,33 @@ namespace CardShopCoop.Patches
         private static readonly System.Reflection.FieldInfo FiHoldingMouseDown =
             AccessTools.Field(typeof(InteractionPlayerController), "m_IsHoldingMouseDown");
 
+        public static void SprayDepletePrefix(Item __instance, ref float __state)
+        {
+            __state = __instance != null ? __instance.GetContentFill() : 0f;
+        }
+
+        public static void SprayDepletePostfix(Item __instance, float amount, float __state)
+        {
+            if (CoopCore.Role != CoopRole.Client || __instance == null || amount <= 0f
+                || __state <= 0f || __instance.GetContentFill() >= __state
+                || UnityEngine.Time.frameCount == _sprayForwardFrame)
+                return;
+            try
+            {
+                if (_sprayIpc == null)
+                    _sprayIpc = UnityEngine.Object.FindObjectOfType<InteractionPlayerController>();
+                var ipc = _sprayIpc;
+                bool isSprayInUse = ipc != null
+                    && ReferenceEquals(FiHoldSprayItem?.GetValue(ipc), __instance)
+                    && FiHoldingMouseDown?.GetValue(ipc) is bool held && held;
+                if (!isSprayInUse)
+                    return;
+                _sprayForwardFrame = UnityEngine.Time.frameCount;
+                CoopCore.Instance?.ForwardSprayHit(__instance.transform.position, 2.5f, 1);
+            }
+            catch (Exception e) { CoopPlugin.Log.LogWarning("spray-use forward: " + e.Message); }
+        }
+
         /// <summary>Client only: puppets are inert, so the local spray does nothing anyway -
         /// skip it and forward one op per spray tick to the host, whose real customers take
         /// the hit. The cleaned state echoes back through the NpcSync smelly mirror.</summary>
@@ -1002,21 +1102,9 @@ namespace CardShopCoop.Patches
         {
             if (CoopCore.Role != CoopRole.Client)
                 return true;
-            try
-            {
-                if (_sprayIpc == null)
-                    _sprayIpc = UnityEngine.Object.FindObjectOfType<InteractionPlayerController>();
-                var ipc = _sprayIpc;
-                bool handheld = ipc != null
-                    && FiHoldSprayItem?.GetValue(ipc) != null
-                    && FiHoldingMouseDown?.GetValue(ipc) is bool held && held;
-                if (handheld && UnityEngine.Time.frameCount != _sprayForwardFrame)
-                {
-                    _sprayForwardFrame = UnityEngine.Time.frameCount;
-                    CoopCore.Instance?.ForwardSprayHit(sprayPos, range, potency);
-                }
-            }
-            catch (Exception e) { CoopPlugin.Log.LogWarning("spray forward: " + e.Message); }
+            // Guest-side customer instances are inert visual puppets. Their spray callback
+            // is not proof of an actual can-use pulse; SprayDepletePostfix forwards from the
+            // handheld item after it really consumed deodorant.
             return false; // local puppets stay untouched either way
         }
 
@@ -1207,6 +1295,18 @@ namespace CardShopCoop.Patches
                 CoopCore.Instance?.BroadcastEconDelta(2, 0f - evt.m_CoinValue);
         }
 
+        public static void QueuedSpendPostfix(CEvent evt, bool __result)
+        {
+            if (__result && CoopCore.Role == CoopRole.Host && evt is CEventPlayer_ReduceCoin reduce)
+                CoopCore.Instance?.ObserveQueuedSpend(reduce);
+        }
+
+        public static void AppliedSpendPostfix(CEventPlayer_ReduceCoin evt)
+        {
+            if (CoopCore.Role == CoopRole.Host)
+                CoopCore.Instance?.ObserveAppliedSpend(evt);
+        }
+
         public static void EconAddShopExpPostfix(CEventPlayer_AddShopExp evt)
         {
             if (CoopCore.Role == CoopRole.Host && evt != null)
@@ -1257,17 +1357,17 @@ namespace CardShopCoop.Patches
 
         public static bool ReservedPutItemPrefix(InteractionPlayerController __instance)
         {
-            return !HandEscrow.IsFrontReserved(__instance);
+            return ExplainReservedInteraction(HandEscrow.IsFrontReserved(__instance));
         }
 
         public static bool ReservedOpenCardPackPrefix(InteractionPlayerController __instance)
         {
-            return !HandEscrow.HasReservedHeld(__instance);
+            return ExplainReservedInteraction(HandEscrow.HasReservedHeld(__instance));
         }
 
         public static bool ReservedSprayPrefix(InteractionPlayerController __instance, ref bool __result)
         {
-            if (!HandEscrow.IsFrontReserved(__instance))
+            if (ExplainReservedInteraction(HandEscrow.IsFrontReserved(__instance)))
                 return true;
             __result = false;
             return false;
@@ -1275,12 +1375,43 @@ namespace CardShopCoop.Patches
 
         public static bool ReservedRemoveHoldItemPrefix(Item currentItem)
         {
-            return !HandEscrow.IsReserved(currentItem);
+            return ExplainReservedInteraction(HandEscrow.IsReserved(currentItem));
         }
 
         public static bool ReservedDisableItemPrefix(Item __instance)
         {
-            return !HandEscrow.IsReserved(__instance) || !HandEscrow.IsInLocalHand(__instance);
+            return ExplainReservedInteraction(HandEscrow.IsReserved(__instance) && HandEscrow.IsInLocalHand(__instance));
+        }
+
+        public static bool CoOpCharacterCustomizationStartPrefix(CC.CharacterCustomization __instance)
+        {
+            if (__instance == null)
+                return true;
+            try
+            {
+                string root = __instance.transform.root.name ?? "";
+                bool coOpAppearance = root.StartsWith("CoopAvatar_", StringComparison.Ordinal)
+                    || root == "CoopCharacterPreview"
+                    || root == "CoopCharacterEditorTemplate";
+                return !coOpAppearance;
+            }
+            catch (Exception e)
+            {
+                CoopPlugin.Log.LogWarning("character appearance Start guard: " + e.Message);
+                return true;
+            }
+        }
+
+        public static void TutorialTaskPostfix(ETutorialTaskCondition tutorialTaskCondition, float valueAdd)
+        {
+            CoopCore.Instance?.ObserveTutorialAction(tutorialTaskCondition, valueAdd);
+        }
+
+        private static bool ExplainReservedInteraction(bool reserved)
+        {
+            if (reserved)
+                CoopCore.Instance?.ReportInteraction("Syncing this item with the shared shop. It will be ready automatically when the transfer finishes.");
+            return !reserved;
         }
 
         public static void NpcMoneyPopupPostfix(PricePopupSpawner __instance, float price,
@@ -1294,17 +1425,27 @@ namespace CardShopCoop.Patches
             CoopCore.Instance?.ForwardNpcMoneyPopup(index, identity, price, offsetUp);
         }
 
-        /// <summary>Client only: the joiner never opens his own end-of-day recap. Vanilla
-        /// InteractionPlayerController.Update reaches ShowGoNextDayScreen on any Enter press
-        /// while LightManager.GetHasDayEnded() is true - which on a mirrored 21:00 clock is
-        /// nearly every frame - and the body then runs ShelfManager.OnPressGoNextDay,
-        /// WorkerManager.OnPressGoNextDay and EndOfDayReportScreen.OpenScreen locally. The
-        /// recap is a HOST-driven broadcast here (ReportSync.TryOpenReportScreen); an
-        /// un-mirrored open shows numbers the host never sent and files them into the
-        /// joiner's report history on close. Same Role-check idiom as ClientBlockPrefix.</summary>
-        public static bool GoNextDayScreenBlockPrefix()
+        /// <summary>Either player can open the shared recap. Run world cleanup once
+        /// on the host, then open the authoritative report on both screens.</summary>
+        public static bool GoNextDayScreenBlockPrefix(InteractionPlayerController __instance)
         {
-            return CoopCore.Role != CoopRole.Client;
+            if (CoopCore.Role != CoopRole.Client)
+                return true;
+            bool confirmed = __instance.m_ConfirmGoNextDayScreen != null
+                && !__instance.m_ConfirmGoNextDayScreen.CanOpenScreen();
+            CoopCore.Instance?.RequestDayAction(false, confirmed);
+            // The vanilla confirmation closes before the network recap arrives.
+            // Release its UI lock in that gap; the shared recap will take its own lock.
+            if (confirmed)
+            {
+                // ExitUIMode schedules a delayed unlock which could undo a fast
+                // network recap's new lock. Release this confirmation synchronously.
+                AccessTools.Field(typeof(InteractionPlayerController), "m_IsInUIMode").SetValue(__instance, false);
+                __instance.HideCursor();
+                __instance.ResetMousePress();
+                __instance.m_WalkerCtrl.SetStopMovement(false);
+            }
+            return false;
         }
 
         public static bool ClientLightTogglePrefix()

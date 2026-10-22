@@ -131,6 +131,7 @@ namespace CardShopCoop.Net.Messages
     [NetworkMessage(MsgType.ReportState, Policy = MessagePolicy.ClientOnly)]
     public sealed class ReportStateMessage : INetMessage
     {
+        public int Day;
         public bool OpenScreen;
         public int CustomerVisited;
         public int CheckoutCount;
@@ -265,6 +266,7 @@ namespace CardShopCoop.Net.Messages
     public sealed class TableEntry
     {
         public byte Index;
+        public ushort ObjectId;
         public bool Occupied;
         public List<TableSeatEntry> Seats = new List<TableSeatEntry>();
     }

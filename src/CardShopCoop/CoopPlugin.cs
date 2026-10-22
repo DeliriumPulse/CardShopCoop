@@ -88,7 +88,7 @@ namespace CardShopCoop
             EmoteKey = Config.Bind("Keys", "EmoteKey", KeyCode.G,
                 "Sends a wave emote that pops above your avatar.");
             ClientWorldSlot = Config.Bind("Network", "ClientWorldSlot", 7,
-                "Save slot the co-op world uses when JOINING someone (your own slots 0-3 are never touched). On a PC dedicated to co-op you can set 0 for maximum mod-data fidelity.");
+                "Save slot used when JOINING someone. The default hidden slot 7 keeps solo slots 0-3 untouched. Choosing a solo slot replaces its existing save with the borrowed world; use that only on a PC dedicated to co-op.");
             AutoSyncCardDatabase = Config.Bind("Network", "AutoSyncCardDatabase", true,
                 "When your modded-card ID registry (EPL enum_values.json) differs from the host's, automatically install the host's copy (yours is backed up beside it) so you only need to restart and rejoin. Set false to handle the file yourself.");
             ServeReach = Config.Bind("Player", "ServeReach", 1.6f,

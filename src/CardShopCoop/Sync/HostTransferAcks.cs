@@ -7,11 +7,16 @@ namespace CardShopCoop.Sync
         private const int Capacity = 8192;
         private readonly Dictionary<long, int> _acks = new Dictionary<long, int>();
         private readonly Queue<long> _fifo = new Queue<long>();
+        private readonly Dictionary<int, uint> _expiredThrough = new Dictionary<int, uint>();
 
         private static long Key(int connId, uint seq) => ((long)connId << 32) | seq;
 
         public bool TryGet(int connId, uint seq, out int acceptedDelta)
             => _acks.TryGetValue(Key(connId, seq), out acceptedDelta);
+
+        public bool IsExpired(int connId, uint seq)
+            => seq != 0 && _expiredThrough.TryGetValue(connId, out uint floor) && seq <= floor
+                && !_acks.ContainsKey(Key(connId, seq));
 
         public void Store(int connId, uint seq, int acceptedDelta)
         {
@@ -22,11 +27,19 @@ namespace CardShopCoop.Sync
             _fifo.Enqueue(key);
             CoopPlugin.Log.LogDebug($"HostTransferAcks.Store: conn={connId} seq={seq} accepted={acceptedDelta}");
             while (_fifo.Count > Capacity)
-                _acks.Remove(_fifo.Dequeue());
+            {
+                long expired = _fifo.Dequeue();
+                _acks.Remove(expired);
+                int peer = (int)(expired >> 32);
+                uint sequence = (uint)expired;
+                if (!_expiredThrough.TryGetValue(peer, out uint floor) || sequence > floor)
+                    _expiredThrough[peer] = sequence;
+            }
         }
 
         public void ReleaseConn(int connId)
         {
+            _expiredThrough.Remove(connId);
             var keep = new Queue<long>();
             while (_fifo.Count > 0)
             {
@@ -44,6 +57,7 @@ namespace CardShopCoop.Sync
         {
             _acks.Clear();
             _fifo.Clear();
+            _expiredThrough.Clear();
         }
     }
 }

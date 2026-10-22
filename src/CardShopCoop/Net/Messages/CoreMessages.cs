@@ -59,6 +59,7 @@ namespace CardShopCoop.Net.Messages
         public int Day, Hour, Minute;
         public float MinuteFloat;
         public bool ShopOnceOpen;
+        public EnvironmentState Environment;
         public MsgType Type
         {
             get
@@ -66,6 +67,15 @@ namespace CardShopCoop.Net.Messages
                 return MsgType.DayTime;
             }
         }
+    }
+
+    public sealed class EnvironmentState
+    {
+        public int TimeOfDay, SkyFrom = -1, SkyTo = -1;
+        public float SunLerp, StartBrightness, SunRotation, SkyBlend, SkyRotation;
+        public bool Lerping, SunOn, NightOn, ShopOn;
+        public float[] SunIntensity, SunShadowStrength;
+        public int[] SunShadows;
     }
 
     [NetworkMessage(MsgType.ShopName, Policy = MessagePolicy.ClientOnly)]
@@ -176,6 +186,8 @@ namespace CardShopCoop.Net.Messages
         public Quaternion CameraRotation;
         public float Speed;
         public byte Hold;
+        public bool Crouching;
+        public bool Spraying;
         public System.Collections.Generic.List<int> HoldTypes;
         public System.Collections.Generic.List<CardData> HoldCards;
         public MsgType Type

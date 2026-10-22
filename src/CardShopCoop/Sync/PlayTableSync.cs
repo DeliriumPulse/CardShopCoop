@@ -65,6 +65,7 @@ namespace CardShopCoop.Sync
         // every call - reapplying unchanged data would make the props jump around)
         private readonly Dictionary<int, SeatState> _applied = new Dictionary<int, SeatState>();
         private readonly Dictionary<int, bool> _occupied = new Dictionary<int, bool>();
+        private readonly Dictionary<int, InteractablePlayTable> _mirrorTables = new Dictionary<int, InteractablePlayTable>();
 
         // TableState remains host->client-only. The kick is a separate single-shot intent;
         // the joiner never edits the local mirror or charges money.
@@ -102,6 +103,7 @@ namespace CardShopCoop.Sync
             ClearMirrors();
             _applied.Clear();
             _occupied.Clear();
+            _mirrorTables.Clear();
             _gate.Reset(-7.6f);
             _loggedDrop = false;
             _sm = null;
@@ -156,6 +158,7 @@ namespace CardShopCoop.Sync
                     hash = hash * 31 + (table == null ? 0 : 1);
                     if (table == null)
                         continue;
+                    hash = hash * 31 + PlacedObjectIdentity.AssignHost(table);
                     hash = hash * 31 + (table.GetCurrentPlayerCount() > 0 ? 1 : 0);
                     var sets = table.m_TableGameItemSetList;
                     int seats = sets != null ? Mathf.Min(sets.Count, MaxSeats) : 0;
@@ -201,7 +204,7 @@ namespace CardShopCoop.Sync
                 int seats = sets != null ? Mathf.Min(sets.Count, MaxSeats) : 0;
                 // fixed format: 2 + seats*(1|13) bytes - a vanilla 2-seat table is at
                 // most 28 bytes, far under the MaxTableBytes budget by construction
-                var entry = new TableEntry { Index = (byte)i };
+                var entry = new TableEntry { ObjectId = PlacedObjectIdentity.AssignHost(table) };
                 entry.Occupied = table != null && table.GetCurrentPlayerCount() > 0;
                 for (int s = 0; s < seats; s++)
                 {
@@ -233,19 +236,44 @@ namespace CardShopCoop.Sync
 
         private void ClientApplyInner(TableStateMessage message)
         {
+            if (message?.Tables == null)
+                return;
             var sm = Sm();
-            var tables = sm != null ? sm.m_PlayTableList : null;
+            var alive = new HashSet<int>();
+            foreach (var entry in message.Tables)
+                if (entry != null && entry.ObjectId != 0)
+                    alive.Add(entry.ObjectId);
+            var retired = new List<int>();
+            foreach (int id in _mirrorTables.Keys)
+                if (!alive.Contains(id))
+                    retired.Add(id);
+            foreach (int id in retired)
+            {
+                ClearTableMirror(id);
+                _mirrorTables.Remove(id);
+                _occupied.Remove(id);
+            }
             for (int i = 0; i < message.Tables.Count; i++)
             {
                 var entry = message.Tables[i];
-                int tableIdx = entry.Index;
+                if (entry == null)
+                    continue;
+                int tableIdx = entry.ObjectId;
+                if (!PlacedObjectIdentity.TryResolve(sm, 6, entry.ObjectId, out var rawTable)
+                    || !(rawTable is InteractablePlayTable table))
+                    continue;
                 _occupied[tableIdx] = entry.Occupied;
+                if (!_mirrorTables.TryGetValue(tableIdx, out var previous) || !ReferenceEquals(previous, table))
+                    for (int s = 0; s < MaxSeats; s++)
+                        _applied.Remove((tableIdx << 8) | s);
+                _mirrorTables[tableIdx] = table;
                 var seats = entry.Seats;
-                InteractablePlayTable table =
-                    (tables != null && tableIdx < tables.Count) ? tables[tableIdx] : null;
                 // the JOINER may be playing the minigame at this table right now -
                 // never stomp their own session's props (covers m_IsPlayerOccupied too)
                 bool skipTable = table == null || table.GetHasStartPlayerPlayCard();
+                if (skipTable)
+                    for (int s = 0; s < MaxSeats; s++)
+                        _applied.Remove((tableIdx << 8) | s);
                 var sets = (!skipTable) ? table.m_TableGameItemSetList : null;
                 for (int s = 0; s < seats.Count; s++)
                 {
@@ -277,12 +305,9 @@ namespace CardShopCoop.Sync
             if (!__instance.GetIsTournamentPlayTable() && Active != null
                 && Active.IsOccupied(__instance))
             {
-                var sm = Active.Sm();
-                int index = sm != null && sm.m_PlayTableList != null
-                    ? sm.m_PlayTableList.IndexOf(__instance) : -1;
-                if (index >= 0 && index <= 255)
+                if (PlacedObjectIdentity.TryMakeObjectKey(6, __instance, out int key))
                 {
-                    if (_intents != null && _intents.TrySend(IntentKindPlayTable, IntentKickTable, (byte)index))
+                    if (_intents != null && _intents.TrySend(IntentKindPlayTable, IntentKickTable, 0, key))
                         return false;
                 }
             }
@@ -291,10 +316,7 @@ namespace CardShopCoop.Sync
 
         private bool IsOccupied(InteractablePlayTable table)
         {
-            Sm();
-            int index = _sm != null && _sm.m_PlayTableList != null
-                ? _sm.m_PlayTableList.IndexOf(table) : -1;
-            if (index >= 0 && _occupied.TryGetValue(index, out var occupied))
+            if (PlacedObjectIdentity.TryGet(table, out ushort id) && _occupied.TryGetValue(id, out var occupied))
                 return occupied;
             return false;
         }
@@ -304,9 +326,10 @@ namespace CardShopCoop.Sync
             if (CoopCore.Role != CoopRole.Host)
                 return;
             var sm = Sm();
-            if (sm == null || sm.m_PlayTableList == null || message.Target >= sm.m_PlayTableList.Count)
+            if (message.ObjectKey >> 24 != 6 || !PlacedObjectIdentity.TryResolve(sm, 6,
+                PlacedObjectIdentity.ObjectIdFromObjectKey(message.ObjectKey), out var raw)
+                || !(raw is InteractablePlayTable table))
                 return;
-            var table = sm.m_PlayTableList[message.Target];
             if (table == null || table.GetIsTournamentPlayTable() || table.GetCurrentPlayerCount() <= 0)
                 return;
             if (StopTableGame == null)
@@ -314,7 +337,7 @@ namespace CardShopCoop.Sync
                 CoopPlugin.Log.LogError("PlayTableSync: InteractablePlayTable.StopTableGame was not found");
                 return;
             }
-            CoopPlugin.Log.LogInfo($"PlayTableSync: client requested kick for table {message.Target}");
+            CoopPlugin.Log.LogInfo($"PlayTableSync: client requested kick for table {message.ObjectKey:X}");
             StopTableGame.Invoke(table, null);
         }
 
@@ -364,30 +387,32 @@ namespace CardShopCoop.Sync
         /// live minigame table is never in _applied (skipped at apply time).</summary>
         private void ClearMirrors()
         {
-            if (_applied.Count == 0)
-                return;
-            var sm = _sm; // cached only - never FindObjectOfType during teardown
-            var tables = sm != null ? sm.m_PlayTableList : null;
-            if (tables != null)
-            {
-                foreach (var kv in _applied)
-                {
-                    if (!kv.Value.Active)
-                        continue;
-                    int tableIdx = kv.Key >> 8;
-                    int seat = kv.Key & 0xFF;
-                    try
-                    {
-                        if (tableIdx >= tables.Count || tables[tableIdx] == null)
-                            continue;
-                        var sets = tables[tableIdx].m_TableGameItemSetList;
-                        if (sets != null && seat < sets.Count && sets[seat] != null)
-                            sets[seat].gameObject.SetActive(false);
-                    }
-                    catch (System.Exception e) { Swallow.Log(e); }
-                }
-            }
+            foreach (int id in _mirrorTables.Keys)
+                ClearTableMirror(id);
             _applied.Clear();
+        }
+
+        private void ClearTableMirror(int id)
+        {
+            for (int seat = 0; seat < MaxSeats; seat++)
+            {
+                int key = (id << 8) | seat;
+                if (!_applied.TryGetValue(key, out var state))
+                    continue;
+                _applied.Remove(key);
+                if (!state.Active)
+                    continue;
+                try
+                {
+                    if (!_mirrorTables.TryGetValue(id, out var table) || table == null
+                        || table.GetHasStartPlayerPlayCard())
+                        continue;
+                    var sets = table.m_TableGameItemSetList;
+                    if (sets != null && seat < sets.Count && sets[seat] != null)
+                        sets[seat].gameObject.SetActive(false);
+                }
+                catch (System.Exception e) { Swallow.Log(e); }
+            }
         }
     }
 }

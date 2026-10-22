@@ -1,3 +1,4 @@
+using System;
 using UnityEngine;
 
 namespace CardShopCoop.UI
@@ -14,6 +15,29 @@ namespace CardShopCoop.UI
 
         private string _seen;
         private float _revertAt;
+        private bool _copyFailed;
+
+        // Reports change every frame. Generate only on click so confirmation persists
+        // and OnGUI's Layout/Repaint passes do not poll the world or build large strings.
+        public bool Draw(string label, Func<string> value, GUIStyle style, params GUILayoutOption[] options)
+        {
+            string caption = Time.realtimeSinceStartup < _revertAt
+                ? (_copyFailed ? "Copy failed - try again" : "Copied!") : label;
+            if (!GUILayout.Button(caption, style, options))
+                return false;
+            try
+            {
+                GUIUtility.systemCopyBuffer = value() ?? string.Empty;
+                _copyFailed = false;
+            }
+            catch (Exception e)
+            {
+                _copyFailed = true;
+                CoopPlugin.Log.LogWarning("Could not copy connection report: " + e.Message);
+            }
+            _revertAt = Time.realtimeSinceStartup + RevertSeconds;
+            return !_copyFailed;
+        }
 
         /// <summary>Draws the button; returns true on the frame it is clicked. The copied value
         /// is written to the system clipboard when that happens.</summary>

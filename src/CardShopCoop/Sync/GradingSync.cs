@@ -70,6 +70,7 @@ namespace CardShopCoop.Sync
 
         /// <summary>Set by CoopCore: host -> clients state (MsgType.GradingState).</summary>
         public Action<INetMessage> BroadcastState;
+        public Action<int> PurchaseAccepted;
 
         /// <summary>True while ClientApplyState rewrites the mirrored pending list, so
         /// no patch mistakes the authoritative copy for local player action.</summary>
@@ -535,8 +536,6 @@ namespace CardShopCoop.Sync
                 gradOp.Cards.Add(picked[i]);
             inst.SendOp(gradOp);
 
-            SoundManager.PlayAudio("SFX_CustomerBuy", 0.6f);
-
             // Reset the scratch set BEFORE CloseScreen, exactly like vanilla: the cards
             // belong to the host's pending set now, and OnCloseScreen AddCard-refunds
             // anything still sitting in the slots (which would duplicate them).
@@ -811,6 +810,7 @@ namespace CardShopCoop.Sync
             float reportSupplyCost = 0f;
             float permanentSupplyCost = 0f;
             float total = 0f;
+            bool accepted = false;
             try
             {
                 // ---- content-parity gate (before ANY charge, enrollment or set construction) ----
@@ -906,7 +906,7 @@ namespace CardShopCoop.Sync
                 // than losing them - AddCard mirrors to the joiner via CardDelta
                 if (CPlayerData.m_GradeCardInProgressList == null
                     || CPlayerData.m_GradeCardInProgressList.Count >= 4
-                    || CPlayerData.m_CoinAmountDouble < (double)total)
+                    || !(CoopCore.Instance?.TryReserveGuestSpend(total) ?? false))
                 {
                     CoopPlugin.Log.LogWarning("GradingSync: submission rejected (slots/wallet), returning cards to binder");
                     ReturnRejectedCards(cards, senderConn);
@@ -991,6 +991,7 @@ namespace CardShopCoop.Sync
                         _website.UpdateSubmissionProgressPanelUI();
                 }
                 catch (System.Exception e) { Swallow.Log(e); }
+                accepted = true;
             }
             catch (Exception e)
             {
@@ -999,6 +1000,15 @@ namespace CardShopCoop.Sync
                         reportSupplyCost, permanentSupplyCost, reportMutated, permanentReportMutated, senderConn, e);
                 else
                     CoopPlugin.Log.LogError($"coop: grading op failed outside host role (conn {senderConn}): {e}");
+            }
+            // Feedback cannot compensate or undo an already accepted submission if sending fails.
+            if (accepted)
+            {
+                try
+                {
+                    PurchaseAccepted?.Invoke(senderConn);
+                }
+                catch (Exception e) { CoopPlugin.Log.LogWarning("grading purchase sound: " + e.Message); }
             }
         }
 

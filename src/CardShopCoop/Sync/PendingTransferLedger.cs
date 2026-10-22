@@ -13,6 +13,7 @@ namespace CardShopCoop.Sync
         public int RequestedDelta;
         public int TransferType; // local EItemType id
         public int EscrowToken;  // > 0 for a take, 0 for an add
+        public double StartedAt;
     }
 
     /// <summary>
@@ -31,6 +32,17 @@ namespace CardShopCoop.Sync
         private uint _seq;
 
         public int Count => _entries.Count;
+        public double OldestPendingSeconds
+        {
+            get
+            {
+                double now = Time.realtimeSinceStartupAsDouble;
+                double oldest = now;
+                foreach (var entry in _entries.Values)
+                    oldest = Math.Min(oldest, entry.StartedAt);
+                return Math.Max(0, now - oldest);
+            }
+        }
 
         /// <summary>Record a new transfer. A negative delta escrows the just-taken items out
         /// of the hand; a positive delta reserves the target against authoritative content
@@ -39,6 +51,10 @@ namespace CardShopCoop.Sync
             => Begin(target, requestedDelta, transferType, out effectiveTransferType, true);
 
         public uint Begin(TKey target, int requestedDelta, int transferType, out int effectiveTransferType, bool escrowTake)
+            => Begin(target, requestedDelta, transferType, out effectiveTransferType, escrowTake, null);
+
+        public uint Begin(TKey target, int requestedDelta, int transferType, out int effectiveTransferType,
+            bool escrowTake, Item exactTakeItem)
         {
             effectiveTransferType = transferType;
             if (_entries.Count >= MaxOutstanding)
@@ -50,7 +66,9 @@ namespace CardShopCoop.Sync
             if (seq == 0)
                 seq = ++_seq; // 0 means "no transfer" on the wire
             int token = requestedDelta < 0 && escrowTake
-                ? HandEscrow.ReserveTake(transferType, -requestedDelta, out effectiveTransferType)
+                ? exactTakeItem != null && requestedDelta == -1
+                    ? HandEscrow.ReserveTake(exactTakeItem, out effectiveTransferType)
+                    : HandEscrow.ReserveTake(transferType, -requestedDelta, out effectiveTransferType)
                 : 0;
             if (requestedDelta < 0 && escrowTake && token == 0)
             {
@@ -70,6 +88,7 @@ namespace CardShopCoop.Sync
                 RequestedDelta = requestedDelta,
                 TransferType = effectiveTransferType,
                 EscrowToken = token,
+                StartedAt = Time.realtimeSinceStartupAsDouble,
             };
             return seq;
         }

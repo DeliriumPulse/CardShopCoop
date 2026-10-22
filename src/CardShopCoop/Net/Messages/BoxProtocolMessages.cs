@@ -58,6 +58,13 @@ namespace CardShopCoop.Net.Messages
         }
     }
 
+    [NetworkMessage(MsgType.BoxRepairRequest, Policy = MessagePolicy.HostOnlyInGame)]
+    public sealed class BoxRepairRequestMessage : INetMessage
+    {
+        public ushort BoxId;
+        public MsgType Type => MsgType.BoxRepairRequest;
+    }
+
     /// <summary>Host -> clients: the authoritative box state (all families in one list).</summary>
     [NetworkMessage(MsgType.BoxSnapshot, Policy = MessagePolicy.ClientOnlyInGame)]
     public sealed class BoxSnapshotMessage : INetMessage

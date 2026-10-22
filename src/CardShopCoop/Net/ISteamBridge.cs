@@ -128,6 +128,12 @@ namespace CardShopCoop.Net
             get; set;
         }
 
+        /// <summary>The current create/join request failed. Search errors use OnError.</summary>
+        Action<string> OnSessionStartFailed
+        {
+            get; set;
+        }
+
         /// <summary>Client: we entered a lobby and the transport is already wired to its
         /// owner. The ROLE CHECK IS THE SUBSCRIBER'S JOB - see CoopCore.</summary>
         Action OnConnectedToHost

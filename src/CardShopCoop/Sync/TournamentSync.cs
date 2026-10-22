@@ -41,6 +41,7 @@ namespace CardShopCoop.Sync
 
         private readonly SnapshotGate _gate = new SnapshotGate(1.5f, 15f, -6.1f);
         private int _clientHash;
+        private bool _clientHasApplied;
 
         // NEVER CSingleton<CustomerManager>.Instance: touched while no real manager
         // exists (client reload loading screen, host mid-session save load) the getter
@@ -71,6 +72,7 @@ namespace CardShopCoop.Sync
         {
             _gate.Reset(-6.1f);
             _clientHash = 0;
+            _clientHasApplied = false;
             _cm = null;
         }
 
@@ -173,8 +175,6 @@ namespace CardShopCoop.Sync
 
             byte flags = message.Flags;
             td.m_IsHostingTournament = (flags & 1) != 0;
-            bool wasDay = td.m_IsTournamentDay;
-            bool wasOver = td.m_IsTournamentDayOver;
             td.m_IsTournamentDay = (flags & 2) != 0;
             td.m_IsTournamentDayOver = (flags & 4) != 0;
             td.m_TournamentMaxPlayerCount = message.MaxPlayerCount;
@@ -249,45 +249,51 @@ namespace CardShopCoop.Sync
                 hash = hash * 31 + e.OMW;
                 hash = hash * 31 + e.OOMW;
             }
-            if (hash == _clientHash)
+            if (_clientHasApplied && hash == _clientHash)
                 return;
-            _clientHash = hash;
-
-            RefreshBoards(td, digest, wasDay != td.m_IsTournamentDay || wasOver != td.m_IsTournamentDayOver);
+            // Missing scene UI is not a successful apply. Leave the old hash so the
+            // next heartbeat retries after the real pairing screen becomes available.
+            if (RefreshBoards(td, digest))
+            {
+                _clientHash = hash;
+                _clientHasApplied = true;
+            }
         }
 
         /// <summary>Client: the pairing board and shelf screen mesh are normally driven
         /// by day-start events, which the mod suppresses on the joiner - so we gate them
         /// here, exactly the way TournamentPrizeShelf.CheckTournamentScreenVisibility does.</summary>
-        private void RefreshBoards(TournamentData td, List<PairingEntry> digest, bool visibilityChanged)
+        private bool RefreshBoards(TournamentData td, List<PairingEntry> digest)
         {
             var cm = Cm();
             if (cm == null || cm.m_TournamentPairingScreen == null)
-                return;
+                return false;
             var screen = cm.m_TournamentPairingScreen;
             bool showBoard = td.m_IsTournamentDay || td.m_IsTournamentDayOver;
 
-            if (visibilityChanged)
+            try
             {
-                try
-                {
+                if (screen.gameObject.activeSelf != showBoard)
                     screen.gameObject.SetActive(showBoard);
-                    var shelves = ShelfManager.GetTournamentPrizeShelfList();
-                    for (int i = 0; i < shelves.Count; i++)
-                    {
-                        if (shelves[i] == null || FiScreenMesh == null)
-                            continue;
-                        var mesh = FiScreenMesh.GetValue(shelves[i]) as GameObject;
-                        if (mesh != null)
-                            mesh.SetActive(showBoard);
-                    }
+                var shelves = ShelfManager.GetTournamentPrizeShelfList();
+                for (int i = 0; i < shelves.Count; i++)
+                {
+                    if (shelves[i] == null || FiScreenMesh == null)
+                        continue;
+                    var mesh = FiScreenMesh.GetValue(shelves[i]) as GameObject;
+                    if (mesh != null && mesh.activeSelf != showBoard)
+                        mesh.SetActive(showBoard);
                 }
-                catch (Exception e) { CoopPlugin.Log.LogWarning("TournamentSync board vis: " + e.Message); }
+            }
+            catch (Exception e)
+            {
+                CoopPlugin.Log.LogWarning("TournamentSync board vis: " + e.Message);
+                return false;
             }
             if (!showBoard)
             {
                 screen.ShowPairingScreen(isShow: false, 0);
-                return;
+                return true;
             }
 
             // full repaint: ShowPairingScreen resets the panels, then we repopulate from
@@ -314,6 +320,7 @@ namespace CardShopCoop.Sync
                 };
                 screen.m_TournamentPairingUIGrpList[e.SortedIndex / 2].UpdateCustomerData(ctd);
             }
+            return true;
         }
 
         private struct PairingEntry

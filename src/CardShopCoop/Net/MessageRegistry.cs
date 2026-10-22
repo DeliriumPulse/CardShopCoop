@@ -46,7 +46,10 @@ namespace CardShopCoop.Net
                     "network: no DTO registered for message type " + type + " - frame dropped");
                 throw new InvalidDataException("No DTO registered for " + type);
             }
-            return WireCodec.Deserialize(messageType, payload ?? new byte[0]);
+            INetMessage message = WireCodec.Deserialize(messageType, payload ?? new byte[0]);
+            CardShopCoop.Util.MessageTrafficDiagnostics.Record(false, type,
+                Msg.FrameHeaderSize + Msg.TypeSize + (payload == null ? 0 : payload.Length));
+            return message;
         }
 
         internal static bool IsKnown(MsgType type)

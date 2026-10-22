@@ -1131,7 +1131,7 @@ namespace CardShopCoop.Sync
                     return;
                 }
             }
-            else if (CPlayerData.m_CoinAmountDouble < (double)bid)
+            else if (!(CoopCore.Instance?.TryReserveGuestSpend(bid) ?? false))
             {
                 Result($"not enough money to pay {Price(bid)}", OutcomeInsufficientMoney, idx);
                 return;

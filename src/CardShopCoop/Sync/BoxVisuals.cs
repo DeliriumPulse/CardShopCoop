@@ -170,13 +170,15 @@ namespace CardShopCoop.Sync
                     box.gameObject.SetActive(visible);
             }
             catch { wasVisible = visible; }
+            // An empty/open box must not disable the UI parent: vanilla updates only
+            // child tags when the box is refilled, so a disabled parent stays invisible.
             BoxPlacement.SetLabelVisible(box, visible);
             try
             {
                 switch (box)
                 {
                     case InteractablePackagingBox_Item item:
-                        item.m_ItemCompartment?.SetPriceTagVisibility(visible);
+                        ItemBoxLabel.Refresh(item);
                         break;
                     case InteractablePackagingBox_Shelf shelf:
                         shelf.m_ItemCompartment?.SetPriceTagVisibility(visible);

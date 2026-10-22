@@ -5,6 +5,490 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 
 ---
 
+## 1.10.1.0 — Steam invite joins and friendlier mod checks
+
+- Accepting a Steam invite while the game was closed now actually joins the host's
+  shop once the main menu is up. Before, the invite was recognised but the join
+  never started, so the guest just sat at the menu. (Upstream issue #15.)
+- BepInEx Configuration Manager no longer counts as a "mod set differs" mismatch.
+  It only draws a local settings window and cannot affect the shared shop, so one
+  player having it installed no longer blocks the other from joining. Gameplay
+  mods still have to match exactly on both PCs.
+- The guest-coin fix from 1.10.0.1 (a 25¢ coin showing as $25 on the host, upstream
+  issue #13) is carried forward. It is still waiting on a two-PC cash checkout test.
+
+Validation: Release build with zero warnings/errors; 378 automated checks passed.
+Both of the fixes above touch the Steam startup and join handshake, which the
+checks do not cover — a live Steam invite and a join with Configuration Manager
+on one side still need to be tried. Wire stays 110. **Both players must update.**
+
+## 1.10.0.1 — stronger item syncing and session reliability
+
+- Guest shelf transfers now merge their requested amount with current host stock.
+  A customer's purchase between the guest's view and pickup no longer rejects a
+  valid pickup solely because the old count changed. Each reply also returns that
+  shelf's current contents, including when the first reply needed a retry.
+- Item replies must match the original object and requested amount before releasing
+  hand protection. Very old requests whose result history has expired end with a
+  clear rejoin message instead of potentially moving the same stock twice.
+- Box recovery can request just the affected box, repeating until a snapshot arrives.
+  Native box/shelf faults that changed stock before throwing use the measured result
+  where it belongs to the requested move.
+- Steam reliable messages now have a separate ordered queue and send budget for
+  each player. One blocked connection cannot stall the other players' reliable
+  messages. A persistent refusal or queue overflow ends only the affected connection.
+- Counter settings and play-table controls/props now follow shared object identities.
+  Removing furniture or different local list ordering cannot redirect those actions
+  to the object that inherited the old list position.
+- Shared spending keeps queued native debits reserved until the wallet applies them,
+  including across frames. A later guest purchase cannot spend that money again.
+  Commands without duplicate protection no longer automatically execute again after
+  a handler failure that may already have charged money or delivered items.
+- Connection help now describes stalled item replies and outgoing queues separately.
+  Reports include queue sizes/age, blocked-send duration, targeted repairs, invalid
+  replies and queued debits. Receiving movement is not presented as proof of good
+  item sync, and unavailable queue metrics are not reported as zero.
+
+Validation: Release build with zero warnings/errors; 378 automated checks passed,
+including production hand/transfer bookkeeping with simulated game boundaries,
+message round trips, native money-hook signatures, and per-peer queue failures.
+Native interactions, rendering, real Steam interruptions and busy-shop performance
+still require two-PC/three-PC testing. Automatic reconnect is not enabled: safely
+resuming uncertain transactions requires additional persistent operation history.
+Wire is now 110. **Both players must update.**
+
+## 1.9.2.9 — Steam startup and retry cleanup
+
+- Stopping hosting while Steam is still creating the lobby no longer lets a late
+  reply revive that lobby or attach it to a replacement session. Each request
+  retains its own shop name and password visibility setting.
+- Cancelled joins now leave any lobby that Steam finishes entering afterwards.
+  Retrying the same shop preserves membership needed by the current attempt,
+  including when the replies arrive out of order.
+- A failed lobby creation now ends the failed startup so the host can retry,
+  rather than remaining in a hosting session with no usable Steam lobby.
+- Lobby search errors no longer abort an unrelated join. A search that cannot
+  start also clears its busy indicator and displays an error so it can be retried.
+
+Validation: Release build and 304 regression checks passed, including 16 new
+lobby lifecycle checks and 25 checks of the shipped lobby handlers using a
+simulated Steam API. Live Steam callbacks and two-PC play still need
+verification. **Both players must update.**
+
+## 1.9.2.8 — worker interaction recovery and cleanup
+
+- Stopping a session resumes workers that a guest was interacting with, so they
+  do not stay paused in the host's shop. A guest's open worker screen is also
+  closed and its native movement/UI locks are released during teardown.
+- Repeated worker-interaction requests return the existing response, and duplicate
+  responses no longer reopen the guest's worker screen.
+- A delayed worker-screen release from an old session cannot release a worker in
+  the next session.
+- Guest worker bonuses now reserve their cost alongside other guest spending,
+  preventing overlapping requests from spending the same remaining balance.
+
+Validation: Release build with zero warnings/errors and 263 regression checks passed,
+including eight focused worker ownership/cleanup checks.
+Native worker UI and two-PC play still need verification. **Both players must update.**
+
+## 1.9.2.7 — shared bills and more reliable world loading
+
+- Guest bill payments now reserve their cost alongside other guest purchases.
+  A bill and another purchase arriving together cannot both spend the same money.
+- A truncated mod-data bundle is rejected before it can replace any destination
+  files. A host that cannot read the required mod files now reports a join error
+  instead of silently sending the shop without that data.
+- The downloaded shop and its mod files now use one captured co-op slot throughout
+  loading, even if the configured slot changes while the download is being applied.
+- Tournament board updates that arrive before the guest's pairing screen exists
+  are retried on the next state update instead of remaining blank indefinitely.
+
+Validation: Release build with zero warnings and errors; 255 checks passed, including
+an actual file-write regression showing a truncated bundle leaves existing files
+untouched. Rendering and two-PC play still need verification. **Both players must update.**
+
+## 1.9.2.6 — recover slow guest item transfers
+
+- A guest item pickup or placement that is still waiting after a connection hiccup
+  now repeats its original request every three seconds. The host recognizes the
+  same request and returns its first answer without moving stock twice.
+- Rapid pickups from one shelf keep each exact item protected while earlier
+  requests finish, so a delayed answer cannot unlock an unsent item. A queued
+  pickup that cannot be tracked is rolled back and refreshed instead of silently
+  remaining in the guest's hand.
+- Connection reports now show how many shelf and box requests needed a retry
+  during the current session.
+
+Validation: Release build with zero warnings and errors; 242 focused checks passed.
+Two-PC play still needs verification. **Both players must update.**
+
+## 1.9.2.5 — recover unmatched guest pickups
+
+- Guest pickups from a shelf or item box without a shared host identity now roll back
+  promptly and explain the problem, instead of leaving the item locked in hand until
+  its ten-second reservation expires. The client requests a fresh shelf and box state.
+- Two shelf pickups before the next co-op tick retain their individual one-item
+  counts. A later pickup no longer turns the first request into a larger transfer.
+- Structure changes no longer discard unsent or queued shelf pickups. Their existing
+  obligations are sent when possible or rolled back if the source is gone.
+
+Validation: Release build and focused regression suites. Two-PC play remains to be
+verified. Both players must install this version.
+
+## 1.9.2.4 — trace guest item failures from the host
+
+- The host's **Copy connection report** now includes accepted, partial, and rejected
+  guest shelf and box transfers, recent reasons for rejection, and box possession
+  failures. This makes it possible to see whether a guest's item action reached the
+  host without asking the guest to prepare another report.
+- A Steam timeout callback now leaves an existing peer connected only when Steam
+  reports an active, error-free session and the host received packets in the last
+  ten seconds. This protects a live reconnection from a late timeout callback.
+  Failed or silent sessions still disconnect normally.
+
+Validation: Release build, focused timeout-decision checks, formatting verification.
+Two-PC play still needs verification. **Both players must update.**
+
+## 1.9.2.3 — expand connection diagnostics
+
+- Expanded **Copy connection report** with join-stage timing, transport queue/timeout
+  state, runtime and shared-shop state, compatibility fingerprints, loaded plugin
+  GUID/version entries, and relevant diagnostic settings.
+- Added a rolling, payload-free 60-second view of encoded and decoded protocol message
+  counts and byte totals, plus recent contained module failures and performance spikes.
+- The report is bounded to 48 KB and redacts Steam IDs, IPv4 addresses, and Windows
+  user paths from free-text status and warning history. It excludes save contents and
+  message payloads; players should review recent error text before sharing.
+- Updated the connection-help text so players know what the report collects.
+
+Validation: Release build and formatting verification. No multiplayer runtime test.
+Both players must update.
+
+## 1.9.2.2 — protect shared money from same-frame purchases
+
+- Fixed a timing issue where several guest purchases arriving together could each
+  pass the host's wallet check against the same balance. The host now reserves the
+  cost as each request is accepted, preventing the shared wallet from being spent
+  below zero by near-simultaneous purchases.
+- Applies to guest-requested shop and room unlocks, decorations, staff hiring,
+  grading submissions and customer trade-card purchases. Normal shared-shop play
+  remains unrestricted; this only keeps concurrent purchases within available funds.
+- Connection reports now include live guest hand-sync guard counts. This helps tell
+  a completed pickup from an item that is still waiting for a transfer result.
+
+Validation: Release build and formatting verification. No multiplayer runtime test
+has been performed for this fix.
+
+Wire version remains 109. Both PCs need the exact same custom version to join.
+**Both players must update.**
+
+## 1.9.2.1 — keep guest appearances and spray actions
+
+- Guest sprays now reach the host's real customer simulation on each actual can-use
+  pulse. Previously the guest's spray check ran against visual NPC puppets that do not
+  run the game's customer logic, so nobody got cleaned.
+- Fixed customized player appearances being reset when Unity started the copied
+  character. The game reloaded its default preset after co-op had applied the guest's
+  selected appearance, leaving the host looking at the old character.
+- Item transfer messages now describe the brief sync as automatic. They no longer imply
+  that a guest needs permission or approval to use items. Transfers still reconcile
+  with shared stock before the same item can be spent twice.
+
+Validation: Release build and formatting verification. The patches match the installed
+game's spray-content and character-customization methods. In-game appearance rendering,
+customer cleaning and two-PC play still need verification.
+
+Wire version remains 109. Both PCs need the exact same custom version to join.
+**Both players must update.**
+
+## 1.9.1.1 — restore box quantity labels
+
+- Fixed a regression in our empty-box label fix: hiding the entire label container
+  could keep a filled box's quantity invisible, even when its packs were visible.
+- Nonempty boxes now show their current product and count while open or closed.
+  Returning packs restores the label immediately, without needing to place the box.
+  Taking the last pack still hides both the count and product icon.
+- Rack storage and hidden remote-held boxes keep their individual labels hidden;
+  retrieving or placing them restores the correct count. Delayed open/close callbacks
+  cannot leave a stale zero label behind. Thanks to Conna for reporting this.
+
+Validation: Release build with zero warnings/errors, formatting verification, and
+229 automated checks, including 22 new checks against the production label-refresh
+code with game/UI stubs. These verify visibility/count transitions and inventory
+preservation; Unity rendering and two-PC play still need an in-game check.
+
+Wire version remains 109. The exact-version join check requires both PCs to install
+1.9.1.1 together. **Both players must update.**
+
+## 1.9.0.1 — guest purchase sounds and audio recovery
+
+- Guests now hear the purchase confirmation after accepted wall/floor/ceiling
+  decorations, decoration items, and staff hires. Refused or already-owned
+  one-time purchases do not receive a success sound.
+- Grading submissions now play their purchase sound after the host accepts the
+  job, instead of confirming a submission that might still be refused.
+- Remote spray sound respects pause-menu muting and SFX volume. Stale spray
+  effects expire using real time, and disabling an avatar clears its old spray state.
+- Restoring checkout state no longer repeats scan/drawer/change sounds or sends
+  restored scans and payment actions back as new guest requests. Normal local
+  checkout sounds remain enabled.
+- A guest leaving or changing scenes during the day-report count-up now stops
+  the persistent money-counting sound and clears its enabled latch, including
+  when SFX volume is zero.
+
+Validation: Release build and formatting; 207 automated checks (165 custom logic,
+12 shelf/box conservation, 30 serialization/replay checks). The installed game
+assemblies match the patched sound method and mute field. Audio listening and
+two-PC acceptance tests remain required; these checks do not run Unity audio.
+
+Wire version is 109 because purchase-feedback routing changed. **Both players must update.**
+
+## 1.8.0.1 — follow-up host and guest bug audit
+
+- A guest with the phone or another menu open now receives the shared day recap
+  after closing it. If the host already advances, the pending recap is filed once
+  in history without reopening yesterday's screen or erasing today's received totals.
+- Guest end-of-day requests wait for the host's current menu to close before opening
+  the shared recap, avoiding overlapping menus and movement locks. This happens
+  automatically; there is no host approval step. Late checkout warnings cannot
+  toggle an existing warning closed or cover a received recap.
+- Checkout recovery now clears the host's bill/coin placement counts as well as
+  visible change on observing guests. Recovery messages identify the customer visit,
+  so an old rejection cannot reset a later sale, including a reused NPC.
+- Guest table-number Set, Clear, and Auto now each apply as one edit using the host's
+  current layout. Swapping occupied numbers and clearing/compacting numbers no
+  longer depend on several separate messages based on an outdated guest layout.
+  Existing tournament rules also apply to tables displaced by a swap.
+
+Validation: Release build, formatting, and 183 automated checks (147 custom logic,
+12 shelf/box conservation, 24 wire serialization). Audited against installed game
+1.02 assemblies. No new two-PC play session was available; menu timing, checkout
+recovery, and concurrent table edits still need the acceptance checks in README.
+
+Wire version is 108. **Both players must update.**
+
+## 1.7.0.1 — shared day controls, checkout and guest feedback
+
+- Fixed coin clicks using the bill row's display index. Change now identifies the
+  actual drawer control, so coins remain coins and matching guest denominations
+  no longer trigger the logged checkout reset. No-op clicks emit no money action.
+- Added right-click pickup from the placed change tray as well as the normal drawer
+  controls, using the same shared checkout action on both PCs.
+- Successful guest shelf-to-box returns now play a pop sound and a short item
+  flight. Inventory still changes once on the host. Empty item boxes no longer
+  have their product tag forced visible by box reconciliation.
+- Guests can use the end-of-day prompt, open the shared recap, and advance the
+  shared day. The game's unfinished-checkout warning goes to the player initiating
+  the action. Simultaneous or old-day requests cannot run the day/fee coroutine
+  twice. Delayed reports cannot reopen an earlier day's recap.
+- Guest lighting now receives the actual sky blend, sun direction, light levels,
+  and shadows, alongside the clock and light switches.
+- Active spray cans and spraying now reach remote avatars, including a raised-arm
+  pose, mist, and nearby spray audio. Spray effects expire if updates stop.
+- The play-table number Auto button now allocates the next number on the shared
+  shop. Table settings use stable identities, so changed registry order cannot
+  apply a number to another table.
+- Corrected a rack-placement reconciliation path that accepted a matching list
+  index even when it represented a different rack. Unbound rack identities now
+  wait for the matching rack instead of placing into an unrelated one.
+- Includes the held-box contents and collision changes from 1.6.2.1.
+
+Validation: Release build, formatting and 154 automated checks (119 custom logic,
+12 shelf/box conservation, 23 wire serialization). These checks do not run Unity
+visuals/audio or a live two-PC session. Use the README playtest before relying on
+this test build for a long session. Thanks to Conna and Rose for the reports.
+
+Wire version changes to 107. **Both players must update.**
+
+## 1.6.2.1 — held-box contents and collision stability
+
+- Guest-held item boxes now receive confirmed rack-to-box content changes while
+  still held. Previously those snapshots were skipped until the box was placed.
+  The refresh keeps the local grip/pose and preserves pending or unsent item edits.
+  Open held boxes also restore the visibility of their stored item meshes.
+- Limited remote push prediction to 0.1 seconds and removed speculative vertical
+  movement while collisions are disabled, reducing drift through floors after
+  delayed motion packets.
+- Co-op boxes use continuous speculative collision detection, more solver
+  iterations, and lower penetration-recovery/angular-speed limits to reduce violent
+  contacts. Gravity, pushing and throwing remain; boxes can still tip. Original
+  physics settings are restored when the co-op box system resets.
+
+Validation: clean Release build and formatting; 101 custom helper checks, 12
+shelf/box conservation checks and 9 wire checks passed (122 total). Held-box rendering
+and physical contacts still need the README two-PC playtest; this is not a guarantee
+against every collision or network-physics issue.
+
+Wire remains 106. Exact plugin versions must match. **Both players must update.**
+
+## 1.6.1.1 — end-of-day table-save fix
+
+- Fixed the logged error that interrupted Enter at closing time before the recap
+  opened. The game stayed running, but UpdatePlayTableSaveData indexed a save list
+  that no longer matched the live play-table list.
+- Host table-state updates now build complete records from the live tables before
+  publishing the replacement list. Placement, packaging, tournament state, seats,
+  fees, and play timers are retained. Loading a shop is excluded from this repair.
+- The normal end-of-day cleanup and shared report continue through their existing
+  flow. Guest-initiated day advancement is unchanged.
+
+Validation: clean Release build and formatting; 92 custom checks (including six
+new save-snapshot cases), 12 shelf/box checks and 9 wire checks passed. Advancing
+the day and save/reload in a live two-PC session still need verification.
+
+Wire remains 106; exact plugin versions must match. **Both players must update.**
+
+## 1.6.0.1 — NPC animation recovery, crouching, and guest purchase sounds
+
+- NPC snapshots now include the host's animation states and layer weights. Guest
+  NPCs can recover sitting/playing animations after spawning or being hidden,
+  instead of relying only on cached flags. Their own customer animator is selected
+  explicitly, and delayed older snapshots cannot roll their pose back.
+- Players now send their crouch state. Remote humanoid avatars bend their knees and
+  lower their body, including clothing following the pose. This is a procedural
+  pose because the customer avatar controller has no native crouch clip.
+- Restored the guest's purchase sound after accepted stock, scanner, furniture, and
+  license purchases. Successful bill payments and expansions also send a sound cue
+  to the guest who performed them; rejected actions and periodic snapshots do not.
+- Reviewed register scan, drawer, and completion paths, which still run their local
+  vanilla sounds. Broader environmental audio is not replicated by this change.
+- Includes the earlier hair-color and shared starting-task fixes.
+
+Validation: clean Release build, formatting check, 86 custom helper checks, 12
+shelf/box checks, and 9 new checks using the actual network converters. Visual
+animation and sound playback still require the README two-PC playtest; replacement
+non-humanoid avatar rigs do not support the procedural crouch pose.
+
+Wire version changes to 106. Thanks to Conna and Rose for the reports.
+
+**Both players must update.**
+
+## 1.5.0.1 — shared starting tasks
+
+- Guest stock purchases now credit the shared starting task, using the number of
+  boxes in successfully delivered stock lines. The co-op purchase path previously
+  skipped the vanilla tutorial credit.
+- Guest pickups, stocking, price changes, pack opening, card display changes, and
+  register entry now contribute to the host's starting checklist. Existing shop-state
+  snapshots share the totals with everyone. Contributions are sequence-checked so
+  a repeated message cannot increment a task twice.
+- Checkout, NPC activity, levels, purchases, and unlocks keep their existing host
+  gameplay paths instead of also being counted through the new contribution message.
+- Receiving shared task progress clears stale local tutorial completion state, so
+  a guest panel can resume following the shared checklist.
+- Includes the hair-color and picker fixes from 1.4.2.1.
+
+Validation: Release build with zero warnings/errors, formatting verification, 86
+custom regression checks and 12 shelf/box checks passed. Actual two-PC tutorial
+completion and hair rendering still need the README playtest. This change targets
+the new-shop starting checklist, not separate Steam-account achievement sharing.
+Earlier missed actions are not retroactively reconstructed; repeat an unfinished
+task's action after updating. Shared progress is saved with the host's shop.
+
+Wire version changes to 105. Thanks to Conna and Rose for reporting the missing
+guest purchase and pricing progress.
+
+**Both players must update.**
+
+## 1.4.2.1 — hair mesh colors and color picker
+
+- Targets the report that changing hair color only changed the scalp. Saved colors
+  are now reapplied to each hair slot's actual renderers after the game's character
+  setup, in the editor, preview, and remote avatars. This also prevents a later hair
+  slot's global tint from being the final color of every hair mesh.
+- The color picker retains hue through black/gray selections. Choosing a hue from
+  black, white, or gray now produces a visible color; the shade square still allows
+  neutral colors. This applies to hair and clothing color controls.
+
+Validation: Release build with zero warnings/errors; formatting verified; 75 custom
+checks and 12 shelf/box checks passed. These checks cover picker state and existing
+regressions, not Unity rendering. The scalp/hair result and host/guest visibility
+still need the README in-game tests. Thanks to Conna and Rose for narrowing the report.
+
+Wire version remains 104. Install the exact same custom version on both PCs.
+
+## 1.4.1.1 — guest interaction help and connection reports
+
+- Guest notices explain known box ownership conflicts, missing host identities,
+  rejected box/shelf transfers, and items waiting for host confirmation. Transfers
+  waiting over five seconds are highlighted without assuming they were lost.
+- F2 -> Session -> Connection help now has **Refresh guest objects**. It requests
+  fresh host state, limits repeated requests, and reports snapshot receipt or a
+  15-second timeout. Pending transfers and ownership protections remain in place.
+- **Copy connection report** collects versions, currency, join progress, pending
+  transfers, time since the last received message, and recent mod errors. Last-session
+  details survive disconnects. Reports are copied locally for you to review and share.
+
+Validation: Release build with zero warnings/errors, formatting verification,
+69 source-linked custom checks and 12 shelf/box checks. Live clipboard/UI behavior
+and two-PC recovery still require the README acceptance tests. This is a diagnostic
+and recovery aid, not a claim that every guest interaction bug is fixed.
+
+Wire version remains 104; exact plugin-version matching still requires installing
+1.4.1.1 on both PCs.
+
+## 1.4.0.1 — unofficial joining and currency update
+
+Includes the previous custom fixes, plus recommendations 1 and 2 from the review:
+
+- Joining now waits at most 30 seconds for Steam to enter the lobby. Steam failures
+  such as a full or missing lobby show an error immediately. A failed entry no longer
+  attempts to connect to an invalid host. Cancelled invitations cannot attach their
+  delayed response to a newer join attempt.
+- Both players must select the same currency before joining. A mismatch identifies
+  the host's currency before downloading the shop. This prevents the same change
+  button from meaning different amounts on the two PCs.
+- Changing currency during a connected session ends that session with an explanation;
+  match settings and rejoin. Your saved currency preference is not overwritten.
+- Guest register actions carry their currency settings, and the host checks the actual
+  value of each change button before applying it. Mismatched values are refused and
+  the guest register is reset through the existing recovery flow.
+
+Validation: Release build with zero warnings and errors; formatting verified;
+54 source-linked custom regression checks and 12 existing shelf/box checks passed.
+Steam callbacks, Unity gameplay, and two-PC checkout still need a live playtest.
+See README.md for the expanded acceptance procedure.
+
+The new currency fields change the wire version to 104. This custom version cannot
+join official 1.2.0 or custom 1.3.0.1 sessions.
+
+**Both players must update.**
+
+## 1.3.0.1 — unofficial custom test build
+
+Based on upstream v1.2.0 (b686204), built for Conna's reported guest issues.
+This is a personal fork, not an official DeliriumPulse release.
+
+- Joining retries the initial request every three seconds. A live connection no longer
+  hides a stalled handshake, download, or world load forever; failures identify the stage.
+  Repeated requests do not start overlapping world transfers. Host snapshot/send failures
+  are reported to the guest. Steam starts a fresh session on a new join attempt.
+- Reliable Steam messages are no longer silently dropped after 30 frames of backpressure.
+  They retry for up to 15 seconds, then disconnect the failed peer explicitly. Download
+  chunks must arrive at their advertised offsets.
+- Guest appearance edits survive older host replies, retry until acknowledged, and are
+  republished after loading. Host/peer appearances are resent with the post-load resync.
+- Checkout operations include a sequence number and customer visit identity. Duplicate
+  actions and old-customer actions cannot charge or scan a later customer's sale.
+- Delayed checkout snapshots no longer rewind a guest from giving change to taking cash,
+  zero their payment from a pre-payment snapshot, or overwrite unconfirmed scan totals.
+  Reused NPCs get a fresh register mirror. Card/cash completion checks the host's phase.
+- The co-op window closes after a successful join to release its item/phone input lock.
+- Uninitialized PlayCardSetUI updates are skipped until their card table exists, targeting
+  the repeated Update/LateUpdate null-reference exceptions observed in the local game log.
+
+Validation: Release compilation against the locally installed game/BepInEx assemblies;
+25 source-linked custom regression checks and the 12 existing shelf/box checks. These
+tests do not exercise Unity gameplay, Steam delivery, or a real two-player checkout.
+No claim is made that every Nexus report or every 50% loading hang is resolved.
+See README.md for installation, rollback, and the two-PC acceptance procedure.
+
+The checkout message contract changes the wire version to 103. Use this exact DLL
+on all players' PCs; it cannot join official 1.2.0 sessions. Thanks to DeliriumPulse,
+Meepen, and the upstream contributors for the original mod and prior fixes.
+
+**Both players must update.**
+
 ## 1.2.0
 **Boxes and furniture now stay in sync through pickups, throws, placement, and joining, cards no longer vanish when a guest sets them out to sell or is holding them, and registers, workers, and served customers no longer get stuck or vanish during co-op.**
 

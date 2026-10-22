@@ -28,6 +28,7 @@ namespace CardShopCoop.UI
         private string _inviteField = "";
         private readonly CopyButton _inviteCopy = new CopyButton();
         private readonly CopyButton _passwordCopy = new CopyButton();
+        private readonly CopyButton _reportCopy = new CopyButton();
         private string _lanPwField = "";
         private bool _characterOpen = true;
         private enum CoopTab
@@ -61,6 +62,7 @@ namespace CardShopCoop.UI
         private Texture2D _huePickerTexture;
         private float _pickerTextureHue = -1f;
         private int _colorDragTarget;
+        private readonly HsvPickerState _pickerState = new HsvPickerState();
         private readonly List<string> _floatNames = new List<string>();
         private readonly List<float> _floatValues = new List<float>();
 
@@ -174,6 +176,13 @@ namespace CardShopCoop.UI
             if (!Visible)
             {
                 core.SetCharacterPreview(false);
+                if (core.InteractionLine.Length > 0)
+                {
+                    var notice = new GUIContent(core.InteractionLine);
+                    Vector2 size = CoopTheme.PillSize(CoopTheme.HudPill, notice, 680f);
+                    GUI.Label(new Rect((Screen.width - size.x) / 2f, Screen.height * 0.73f, size.x, size.y),
+                        notice, CoopTheme.HudPill);
+                }
                 return;
             }
 
@@ -326,6 +335,24 @@ namespace CardShopCoop.UI
             // one call: the Steam host path returns early from DrawHost, and Role None simply has
             // no offers to draw.
             DrawGradedAdopt(core);
+            GUILayout.BeginVertical(CoopTheme.SectionBox);
+            GUILayout.Label("CONNECTION HELP", CoopTheme.SectionHeader);
+            GUILayout.Label(core.ConnectionHealthLine, CoopTheme.LabelDimWrap);
+            GUILayout.Label(core.InteractionLine.Length > 0 ? core.InteractionLine
+                : "No recent guest interaction notice.", CoopTheme.LabelDimWrap);
+            if (CoopCore.Role == CoopRole.Client)
+            {
+                bool wasEnabled = GUI.enabled;
+                GUI.enabled = wasEnabled && core.CanRefreshGuestObjects;
+                if (GUILayout.Button("Refresh guest objects", CoopTheme.ButtonSecondary))
+                    core.RefreshGuestObjects();
+                GUI.enabled = wasEnabled;
+                GUILayout.Label(core.RecoveryLine.Length > 0 ? core.RecoveryLine
+                    : "Available after the shop loads. Requests fresh host state; pending item transfers still need confirmation.", CoopTheme.LabelDimWrap);
+            }
+            _reportCopy.Draw("Copy connection report", core.BuildConnectionReport, CoopTheme.ButtonSecondary);
+            GUILayout.Label("Copies an advanced snapshot: join and transfer state, message traffic, item outcomes, mod fingerprints, recent errors, and performance. No save or packet contents. Review error text before sharing.", CoopTheme.LabelDimWrap);
+            GUILayout.EndVertical();
         }
 
         /// <summary>Shared footer for every tab: latch text-field focus, show the
@@ -676,6 +703,8 @@ namespace CardShopCoop.UI
             {
                 _colorEditorKind = expanded ? -1 : kind;
                 _colorEditorSlot = expanded ? -1 : slot;
+                Color.RGBToHSV(color, out float initialHue, out float initialSaturation, out float initialValue);
+                _pickerState.Reset(initialHue, initialSaturation, initialValue);
                 if (expanded)
                     _colorDragTarget = 0;
             }
@@ -685,6 +714,10 @@ namespace CardShopCoop.UI
                 return;
 
             Color.RGBToHSV(color, out float hue, out float saturation, out float value);
+            _pickerState.Observe(hue, saturation, value);
+            hue = _pickerState.Hue;
+            saturation = _pickerState.Saturation;
+            value = _pickerState.Value;
             DrawColorPicker(ref hue, ref saturation, ref value, applyColor);
         }
 
@@ -713,7 +746,7 @@ namespace CardShopCoop.UI
             Rect svScreenRect = new Rect(svScreenPosition.x, svScreenPosition.y, svRect.width, svRect.height);
             Rect hueScreenRect = new Rect(hueScreenPosition.x, hueScreenPosition.y, hueRect.width, hueRect.height);
             bool changed = false;
-            if (e.type == EventType.MouseDown)
+            if (e.type == EventType.MouseDown && e.button == 0)
             {
                 if (svScreenRect.Contains(mousePosition))
                 {
@@ -746,7 +779,16 @@ namespace CardShopCoop.UI
             else if (e.type == EventType.MouseUp)
                 _colorDragTarget = 0;
             if (changed)
+            {
+                _pickerState.Reset(hue, saturation, value);
+                if (_colorDragTarget == 2)
+                {
+                    _pickerState.SelectHue(hue);
+                    saturation = _pickerState.Saturation;
+                    value = _pickerState.Value;
+                }
                 applyColor(Color.HSVToRGB(hue, saturation, value));
+            }
         }
 
         private void EnsureColorPickerTextures()

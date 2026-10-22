@@ -14,6 +14,7 @@ namespace CardShopCoop.Util
         private static StreamWriter _writer;
         private static readonly object Lock = new object();
         private static int _lastFlushTick;
+        internal static readonly DiagnosticHistory RecentProblems = new DiagnosticHistory();
 
         public static string Path
         {
@@ -41,6 +42,9 @@ namespace CardShopCoop.Util
 
         public static void Write(string line)
         {
+            if (line != null && (line.StartsWith("Warning", StringComparison.Ordinal)
+                || line.StartsWith("Error", StringComparison.Ordinal) || line.StartsWith("Fatal", StringComparison.Ordinal)))
+                RecentProblems.Add(line);
             if (_writer == null)
                 return;
             lock (Lock)

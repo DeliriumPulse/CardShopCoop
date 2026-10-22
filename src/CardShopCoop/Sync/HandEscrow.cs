@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -18,6 +19,57 @@ namespace CardShopCoop.Sync
         private static int _nextToken;
         private static bool _resetting;
         private static int _suppressNoteDepth;
+        public static int RecentTakeCount => Recent.Count;
+        public static double OldestRecentTakeAgeSeconds
+        {
+            get
+            {
+                if (Recent.Count == 0)
+                    return 0.0;
+                float now = Time.realtimeSinceStartup;
+                float oldest = 0f;
+                foreach (var take in Recent.Values)
+                    oldest = Mathf.Max(oldest, now - take.At);
+                return Math.Max(0.0, oldest);
+            }
+        }
+        public static int PendingTakeItemCount
+        {
+            get
+            {
+                int count = 0;
+                foreach (var take in ReservedTakes.Values)
+                    count += take.Count;
+                return count;
+            }
+        }
+        public static int DeferredRejectedItemCount
+        {
+            get
+            {
+                int count = 0;
+                foreach (var take in RetainedRejected.Values)
+                    count += take.Count;
+                return count;
+            }
+        }
+        public static int QueuedToHandCount => ToHand.Count;
+
+        public static int ReservedHeldCount
+        {
+            get
+            {
+                var held = CoopCore.GetHeldItemList(CoopCore.PlayerIpc);
+                if (held == null)
+                    return 0;
+                int count = 0;
+                for (int i = 0; i < held.Count; i++)
+                    if (IsReserved(held[i]))
+                        count++;
+                return count;
+            }
+        }
+
         private struct RecentTake
         {
             public int Type; public float At;
@@ -52,6 +104,31 @@ namespace CardShopCoop.Sync
                 if (pair.Value.Type == localType)
                     return true;
             return false;
+        }
+
+        /// <summary>A shelf pickup may wait behind an earlier transfer from the same shelf.
+        /// Keep that exact hand item protected until its own request can be sent.</summary>
+        public static void KeepRecentTake(Item item)
+        {
+            if (CoopCore.Role != CoopRole.Client || item == null || !IsInLocalHand(item)
+                || !Recent.TryGetValue(item, out var take))
+                return;
+            take.At = Time.realtimeSinceStartup;
+            Recent[item] = take;
+        }
+
+        public static int ReserveTake(Item item, out int effectiveType)
+        {
+            effectiveType = item != null ? (int)item.GetItemType() : (int)EItemType.None;
+            if (CoopCore.Role != CoopRole.Client || item == null || !IsInLocalHand(item)
+                || !Recent.TryGetValue(item, out var take))
+                return 0;
+            effectiveType = take.Type;
+            int token = NextToken();
+            Recent.Remove(item);
+            Reserved.Add(item);
+            ReservedTakes.Add(token, new List<Item> { item });
+            return token;
         }
 
         public static bool IsInLocalHand(Item item)
@@ -173,6 +250,31 @@ namespace CardShopCoop.Sync
             if (rolledBack != count)
                 CoopPlugin.Log.LogWarning($"HandEscrow.RollbackUnreservedTake: rolled back {rolledBack} of {count} type {localType}");
             return rolledBack;
+        }
+
+        /// <summary>A pickup whose source has no shared identity cannot be reported to the
+        /// host. Remove that exact optimistic hand item after vanilla finishes putting it
+        /// there, rather than leaving it unusable until the recent-take note expires.</summary>
+        public static bool RejectUntrackedTake(Item item)
+        {
+            if (CoopCore.Role != CoopRole.Client || item == null || !Recent.Remove(item))
+                return false;
+            Reserved.Remove(item);
+            if (CoopCore.RemoveHeldItemFromHand(item))
+            {
+                CoopCore.DestroyDetachedItem(item);
+                return true;
+            }
+            // Never destroy an item still present in the hand. The ordinary deferred
+            // cleanup retries its removal and keeps interaction blocked meanwhile.
+            if (IsInLocalHand(item))
+            {
+                Reserved.Add(item);
+                int token = NextToken();
+                RetainedRejected[token] = new List<Item> { item };
+                CoopPlugin.Log.LogError($"HandEscrow: deferred cleanup armed for untracked pickup token {token}");
+            }
+            return false;
         }
 
         public static bool ResolveTake(int token, int acceptedMagnitude)

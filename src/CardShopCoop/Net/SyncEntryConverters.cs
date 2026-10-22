@@ -103,6 +103,10 @@ namespace CardShopCoop.Net
             w.WriteValue(m.Speed);
             w.WritePropertyName("Hold");
             w.WriteValue(m.Hold);
+            w.WritePropertyName("Crouching");
+            w.WriteValue(m.Crouching);
+            w.WritePropertyName("Spraying");
+            w.WriteValue(m.Spraying);
             w.WritePropertyName("HoldTypes");
             w.WriteStartArray();
             if (m.HoldTypes != null)
@@ -118,6 +122,8 @@ namespace CardShopCoop.Net
             var o = SyncJson.Start(r);
             var m = new Messages.PlayerStateMessage { Position = SyncJson.Vector(o, "Position", s), Yaw = o["Yaw"] == null ? 0 : o["Yaw"].Value<float>(), CameraPosition = SyncJson.Vector(o, "CameraPosition", s), CameraRotation = SyncJson.ReadQuaternion(o, "CameraRotation", s), Speed = o["Speed"] == null ? 0 : o["Speed"].Value<float>(), Hold = (byte)SyncJson.Int(o, "Hold") };
             var a = o["HoldTypes"] as JArray;
+            m.Crouching = SyncJson.Bool(o, "Crouching");
+            m.Spraying = SyncJson.Bool(o, "Spraying");
             if (a != null)
             {
                 m.HoldTypes = new System.Collections.Generic.List<int>();

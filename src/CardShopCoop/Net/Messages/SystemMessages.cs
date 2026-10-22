@@ -14,6 +14,7 @@ namespace CardShopCoop.Net.Messages
     [NetworkMessage(MsgType.Hello, Policy = MessagePolicy.HostOnly)]
     public sealed class HelloMessage : INetMessage
     {
+        public CurrencyProfile Currency;
         public int WireVersion;
         public string Version;
         public string PlayerName;
@@ -43,6 +44,7 @@ namespace CardShopCoop.Net.Messages
     [NetworkMessage(MsgType.Welcome, Policy = MessagePolicy.ClientOnly)]
     public sealed class WelcomeMessage : INetMessage
     {
+        public CurrencyProfile Currency;
         public int WireVersion;
         public string Version;
         public string HostName;

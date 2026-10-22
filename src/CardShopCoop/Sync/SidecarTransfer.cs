@@ -119,74 +119,71 @@ namespace CardShopCoop.Sync
 
         public static void ApplyBundle(byte[] bundle, int hostSlot, int clientSlot)
         {
-            if (bundle == null || bundle.Length < 4)
+            if (bundle == null || bundle.Length == 0)
                 return;
             ApplyBundle(bundle, hostSlot, clientSlot, Application.persistentDataPath);
         }
 
         private static void ApplyBundle(byte[] bundle, int hostSlot, int clientSlot, string root)
         {
-            if (bundle == null || bundle.Length < 4)
+            if (bundle == null || bundle.Length == 0)
                 return;
+            var entries = SidecarBundle.Read(bundle);
             var renameRx = new Regex($@"(?<=_|Release){hostSlot}(?=_|\.|$)");
             int applied = 0, skipped = 0;
 
-            using (var br = new NetReader(new MemoryStream(bundle, writable: false)))
+            foreach (var entry in entries)
             {
-                int count = br.ReadInt32();
-                for (int i = 0; i < count; i++)
+                string rel = entry.Path;
+                byte[] data = new byte[entry.Length];
+                Buffer.BlockCopy(bundle, entry.Offset, data, 0, entry.Length);
+
+                if (!TryGetSafePath(root, rel, out string originalPath))
                 {
-                    string rel = br.ReadString();
-                    int len = br.ReadInt32();
-                    byte[] data = br.ReadBytes(len);
-
-                    if (!TryGetSafePath(root, rel, out string originalPath))
-                    {
-                        RejectUnsafe(rel);
-                        skipped++;
-                        continue;
-                    }
-                    string dir = Path.GetDirectoryName(rel) ?? "";
-                    string name = Path.GetFileName(rel);
-
-                    if (name == "enum_values.json")
-                    {
-                        // EPL's machine-global custom-item ID registry. Overwriting a
-                        // DIFFERENT existing registry would scramble the modded items in the
-                        // client's own solo saves, so only install it where none exists yet
-                        // (the fresh second-PC case, which is the one that matters).
-                        string target = originalPath;
-                        if (!File.Exists(target))
-                        {
-                            Directory.CreateDirectory(Path.GetDirectoryName(target));
-                            AtomicWrite(target, data);
-                            applied++;
-                        }
-                        else if (!BytesEqual(File.ReadAllBytes(target), data))
-                        {
-                            skipped++;
-                            CoopPlugin.Log.LogWarning(
-                                "enum_values.json differs from the host's. Modded item IDs may not line up. " +
-                                "For perfect fidelity on a dedicated co-op PC, delete LocalLow/OPNeonGames/" +
-                                "Card Shop Simulator/PrefabLoader/enum_values.json once (while not using solo modded saves) and rejoin.");
-                        }
-                        continue;
-                    }
-
-                    string newName = renameRx.Replace(name, clientSlot.ToString());
-                    string rewrittenRel = string.IsNullOrEmpty(dir) ? newName : Path.Combine(dir, newName);
-                    if (!TryGetSafePath(root, rewrittenRel, out string path))
-                    {
-                        RejectUnsafe(rel);
-                        skipped++;
-                        continue;
-                    }
-                    Directory.CreateDirectory(Path.GetDirectoryName(path));
-                    if (File.Exists(path) && !File.Exists(path + ".coopbak"))
-                        File.Copy(path, path + ".coopbak"); // one-time backup of whatever was there
-                    AtomicWrite(path, data);
-                    applied++;
+                    RejectUnsafe(rel);
+                    skipped++;
+                    continue;
                 }
+                string dir = Path.GetDirectoryName(rel) ?? "";
+                string name = Path.GetFileName(rel);
+
+                if (name == "enum_values.json")
+                {
+                    // EPL's machine-global custom-item ID registry. Overwriting a
+                    // DIFFERENT existing registry would scramble the modded items in the
+                    // client's own solo saves, so only install it where none exists yet
+                    // (the fresh second-PC case, which is the one that matters).
+                    string target = originalPath;
+                    if (!File.Exists(target))
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(target));
+                        AtomicWrite(target, data);
+                        applied++;
+                    }
+                    else if (!BytesEqual(File.ReadAllBytes(target), data))
+                    {
+                        skipped++;
+                        CoopPlugin.Log.LogWarning(
+                            "enum_values.json differs from the host's. Modded item IDs may not line up. " +
+                            "For perfect fidelity on a dedicated co-op PC, delete LocalLow/OPNeonGames/" +
+                            "Card Shop Simulator/PrefabLoader/enum_values.json once (while not using solo modded saves) and rejoin.");
+                    }
+                    continue;
+                }
+
+                string newName = renameRx.Replace(name, clientSlot.ToString());
+                string rewrittenRel = string.IsNullOrEmpty(dir) ? newName : Path.Combine(dir, newName);
+                if (!TryGetSafePath(root, rewrittenRel, out string path))
+                {
+                    RejectUnsafe(rel);
+                    skipped++;
+                    continue;
+                }
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                if (File.Exists(path) && !File.Exists(path + ".coopbak"))
+                    File.Copy(path, path + ".coopbak"); // one-time backup of whatever was there
+                AtomicWrite(path, data);
+                applied++;
             }
             CoopPlugin.Log.LogInfo($"Sidecar bundle applied: {applied} files (slot {hostSlot} -> {clientSlot}), {skipped} skipped");
         }
