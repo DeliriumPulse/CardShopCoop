@@ -1,8 +1,13 @@
 # CardShopCoop
 
-## Community-maintained fork — current build 1.10.1.0
+> **Superseded — use [CardShopCoopCommunity](https://github.com/meepen/CardShopCoop) instead.**
+> meepen's fork is the actively maintained line (v2.1.2 as of 2026-10-21, Discord, mod API,
+> Game Pass support) and already covers most of what this fork fixed. This repository is kept
+> for reference; its 1.10.x builds are **not** compatible with CardShopCoopCommunity.
 
-This is a continuation of [DeliriumPulse/CardShopCoop](https://github.com/DeliriumPulse/CardShopCoop),
+## Archived fork — last build 1.10.1.0
+
+This was a continuation of [DeliriumPulse/CardShopCoop](https://github.com/DeliriumPulse/CardShopCoop),
 which has been inactive since v1.2.0. It carries fixes for guest joining (including Steam
 invites accepted while the game is closed), guest item handling, checkout and change,
 character appearance, and session reliability. Builds here are not upstream releases;
