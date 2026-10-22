@@ -1,12 +1,19 @@
 # CardShopCoop
 
-## Unofficial custom build 1.10.1.0
+## Community-maintained fork — current build 1.10.1.0
 
-This workspace contains a personal test build based on DeliriumPulse/CardShopCoop
-v1.2.0, with fixes for guest joining, character appearance, checkout, and input after
-joining. This version number identifies this fork; it is not an upstream release.
-The exact changes and validation limits are in [CHANGELOG.md](CHANGELOG.md).
-Planned reliability work is tracked in the [multiplayer improvement queue](docs/MULTIPLAYER-QUEUE.md).
+This is a continuation of [DeliriumPulse/CardShopCoop](https://github.com/DeliriumPulse/CardShopCoop),
+which has been inactive since v1.2.0. It carries fixes for guest joining (including Steam
+invites accepted while the game is closed), guest item handling, checkout and change,
+character appearance, and session reliability. Builds here are not upstream releases;
+the handshake requires both players to run the **same** build.
+
+- **Download:** [Releases](https://github.com/NotBrendan/CardShopCoop/releases) — grab
+  `CardShopCoop-Custom-<version>.zip`.
+- **Report a bug:** [Issues](https://github.com/NotBrendan/CardShopCoop/issues). Include
+  the F2 connection report if an item or checkout stalls.
+- **What changed and what is still untested:** [CHANGELOG.md](CHANGELOG.md).
+- **Planned work:** [multiplayer improvement queue](docs/MULTIPLAYER-QUEUE.md).
 
 ### Install on both PCs
 
